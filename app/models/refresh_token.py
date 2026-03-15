@@ -13,9 +13,7 @@ class RefreshToken(Base):
 
     # ── Composite & extra indexes ─────────────────────────────────────────────
     __table_args__ = (
-        # logout: WHERE token_hash=? AND revoked_at IS NULL
         Index("ix_rt_user_revoked", "user_id", "revoked_at"),
-        # expiry sweep / cleanup jobs
         Index("ix_rt_expires_at", "expires_at"),
     )
 
@@ -36,3 +34,9 @@ class RefreshToken(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
+
+    # ── Device / session metadata ─────────────────────────────────────────────
+    device_name: Mapped[str | None] = mapped_column(String(255), nullable=True)   # e.g. "iPhone 16 Pro"
+    device_os: Mapped[str | None]   = mapped_column(String(128), nullable=True)   # e.g. "iOS 18.2"
+    ip_address: Mapped[str | None]  = mapped_column(String(64),  nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

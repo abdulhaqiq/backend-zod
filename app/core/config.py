@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     OTP_BLOCK_MINUTES: int = 30
     OTP_MAX_SENDS_PER_HOUR: int = 3
 
+    # LinkedIn OAuth
+    LINKEDIN_CLIENT_ID: str = ""
+    LINKEDIN_CLIENT_SECRET: str = ""
+
     # RevenueCat
     REVENUECAT_PUBLIC_KEY: str = ""        # iOS SDK public key (appl_... or test_...)
     REVENUECAT_SECRET_KEY: str = ""        # V1 secret key from RevenueCat dashboard
@@ -70,7 +74,6 @@ class Settings(BaseSettings):
         return (
             f"postgresql+asyncpg://{self.DB_USERNAME}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-            f"?ssl={self.DB_SSLMODE}"
         )
 
     @property

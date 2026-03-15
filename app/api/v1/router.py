@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import auth, location, lookup, profile, subscription, upload, users
+from app.api.v1.endpoints import admin, auth, cards, chat, discover, explore, linkedin, location, lookup, mini_games, pickup_lines, profile, score, subscription, upload, users, verification_ws
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
@@ -10,3 +10,14 @@ api_router.include_router(lookup.router)
 api_router.include_router(upload.router)
 api_router.include_router(subscription.router)
 api_router.include_router(location.router)
+api_router.include_router(admin.router)
+api_router.include_router(verification_ws.router)
+api_router.include_router(linkedin.router)
+api_router.include_router(explore.router)
+api_router.include_router(discover.router)
+api_router.include_router(chat.router)
+api_router.include_router(chat.ws_router)
+api_router.include_router(score.router)
+api_router.include_router(cards.cards_router)
+api_router.include_router(mini_games.mini_games_router)
+api_router.include_router(pickup_lines.pickup_lines_router)

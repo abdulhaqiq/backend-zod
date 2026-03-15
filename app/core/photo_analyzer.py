@@ -1,11 +1,11 @@
 """
-Photo analysis pipeline — 4 layers:
-  1. Quality check   (Pillow / NumPy)   — blur detection (hard reject if blurry)
-  2. Watermark check (EasyOCR)          — text overlay detection (hard reject if found)
-  3. NSFW check      (NudeNet)          — explicit content detection (hard reject)
-  4. Face check      (DeepFace)         — must have ≥1 clear face + age ≥ 18 (hard reject if missing/under-18)
+Photo analysis pipeline — 4 layers (all hard rejects):
+  1. Quality check   (Pillow / NumPy)   — blur/brightness
+  2. Watermark check (EasyOCR)          — stock/copyright keywords only
+  3. NSFW check      (NudeNet)          — explicit/nude content
+  4. Face check      (DeepFace)         — must contain a visible human face; under-18 rejected
 
-All hard-rejection rules are enforced — photo must pass every layer to be accepted.
+A photo is uploaded only if it passes all 4 layers.
 Heavy models are lazily loaded and cached at module level.
 """
 
@@ -23,12 +23,11 @@ logger = logging.getLogger(__name__)
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
-BLUR_THRESHOLD       = 80     # Laplacian variance below this → blurry (hard reject)
-BRIGHTNESS_MIN       = 30     # Mean pixel below this → too dark
-BRIGHTNESS_MAX       = 225    # Mean pixel above this → overexposed
-NSFW_CONFIDENCE      = 0.50   # NudeNet label confidence threshold
+BLUR_THRESHOLD       = 30     # Laplacian variance below this → blurry (relaxed)
+BRIGHTNESS_MIN       = 20     # Mean pixel below this → too dark
+BRIGHTNESS_MAX       = 250    # Mean pixel above this → overexposed
+NSFW_CONFIDENCE      = 0.75   # NudeNet label confidence threshold (raised to reduce false positives)
 MIN_AGE_ALLOWED      = 18     # DeepFace age estimate below this → rejected
-WATERMARK_MIN_CHARS  = 4      # Minimum OCR text chars in a corner to flag as watermark
 
 # Image corner region fraction (top-left, top-right, bottom-left, bottom-right)
 CORNER_FRACTION = 0.25
@@ -42,11 +41,11 @@ NSFW_EXPLICIT_LABELS = {
     "MALE_BREAST_EXPOSED",
 }
 
-# Known watermark / copyright keywords (case-insensitive)
+# Only well-known stock/copyright watermarks trigger rejection (not generic text)
 WATERMARK_KEYWORDS = {
     "shutterstock", "getty", "istock", "dreamstime", "alamy",
-    "depositphotos", "123rf", "adobe stock", "stock", "©", "copyright",
-    "watermark", "preview", "sample",
+    "depositphotos", "123rf", "adobe stock", "©", "copyright",
+    "watermark",
 }
 
 # ── Cached model instances ────────────────────────────────────────────────────
@@ -134,11 +133,7 @@ def _check_quality(img_bytes: bytes):
 def _check_watermark(img_bytes: bytes):
     """
     Returns (has_watermark, detected_text).
-    Strategy:
-      1. Crop the four corners (each CORNER_FRACTION of W/H).
-      2. Run EasyOCR on each corner.
-      3. Flag if any corner has ≥ WATERMARK_MIN_CHARS of text, or if a
-         known watermark keyword is found anywhere in the full-image OCR.
+    Only rejects photos that contain known stock/copyright watermark keywords.
     """
     try:
         reader = _get_ocr_reader()
@@ -160,20 +155,15 @@ def _check_watermark(img_bytes: bytes):
             results = reader.readtext(arr, detail=0, paragraph=False)
             for text in results:
                 text = text.strip()
-                if len(text) >= WATERMARK_MIN_CHARS:
+                if text:
                     all_text_parts.append(text)
 
         combined = " ".join(all_text_parts).lower()
 
-        # Check for known watermark keywords
+        # Only reject on known stock/copyright watermark keywords
         for kw in WATERMARK_KEYWORDS:
             if kw in combined:
                 return True, combined[:120]
-
-        # Even without a keyword, too much text in corners = likely watermark
-        total_chars = sum(len(t) for t in all_text_parts)
-        if total_chars >= 15:
-            return True, combined[:120]
 
         return False, ""
 
@@ -229,31 +219,46 @@ def _check_face(img_bytes: bytes):
         img       = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_array = np.array(img)
 
-        results = DeepFace.analyze(
-            img_path=img_array,
-            actions=["age"],
-            enforce_detection=True,
-            silent=True,
-        )
+        # Pass 1: strict detection — fastest and most reliable when face is clear
+        try:
+            results = DeepFace.analyze(
+                img_path=img_array,
+                actions=["age"],
+                enforce_detection=True,
+                silent=True,
+            )
+        except Exception:
+            # Pass 2: lenient detection — catches tilted/small/partially visible faces
+            results = DeepFace.analyze(
+                img_path=img_array,
+                actions=["age"],
+                enforce_detection=False,
+                silent=True,
+            )
 
         if isinstance(results, dict):
             results = [results]
 
-        face_count  = len(results)
-        ages        = [int(r["age"]) for r in results]
-        avg_age     = int(sum(ages) / face_count) if ages else None
-        min_age     = min(ages) if ages else None
-        under_18    = min_age is not None and min_age < MIN_AGE_ALLOWED
+        # Accept any result with meaningful face confidence (> 0.15 covers partial faces)
+        face_results = [r for r in results if r.get("face_confidence", 1.0) > 0.15]
 
+        if not face_results:
+            return False, 0, None, False
+
+        face_count = len(face_results)
+        ages       = [int(r["age"]) for r in face_results]
+        avg_age    = int(sum(ages) / face_count) if ages else None
+        min_age    = min(ages) if ages else None
+        under_18   = min_age is not None and min_age < MIN_AGE_ALLOWED
+
+        logger.info("Face check | found=%d ages=%s under18=%s", face_count, ages, under_18)
         return True, face_count, avg_age, under_18
 
     except Exception as exc:
         msg = str(exc).lower()
-        # DeepFace raises ValueError/AttributeError when no face found
-        if any(kw in msg for kw in ("face", "detector", "detected", "keras", "tensorflow", "could not")):
-            logger.info("Face check: no face detected (%s)", str(exc)[:120])
+        if any(kw in msg for kw in ("face", "detector", "detected", "keras", "tensorflow", "could not", "no face")):
+            logger.info("Face check: no face detected — %s", str(exc)[:120])
             return False, 0, None, False
-        # Any other exception — still no face confirmed, log it fully
         logger.warning("Face check failed unexpectedly: %s", exc, exc_info=True)
         return False, 0, None, False
 
@@ -274,7 +279,7 @@ def analyze_photo(img_bytes: bytes) -> PhotoAnalysis:
     nsfw, nsfw_score, nsfw_labels                                    = _check_nsfw(img_bytes)
     has_face, face_count, age_estimate, under_18_risk                = _check_face(img_bytes)
 
-    # ── Verdict (first failing rule wins) ─────────────────────────────────────
+    # ── Verdict — all 4 checks are hard rejects ───────────────────────────────
     rejection_reason: Optional[str] = None
 
     if is_blurry:
@@ -284,11 +289,11 @@ def analyze_photo(img_bytes: bytes) -> PhotoAnalysis:
         )
     elif has_watermark:
         rejection_reason = (
-            "Photo appears to have a watermark or text overlay. "
-            "Please upload an original photo without watermarks."
+            "Photo appears to contain a stock photo watermark. "
+            "Please upload an original photo."
         )
     elif nsfw:
-        rejection_reason = "Photo contains explicit content and cannot be uploaded."
+        rejection_reason = "Photo contains explicit or adult content and cannot be uploaded."
     elif not has_face:
         rejection_reason = (
             "No face detected in the photo. "

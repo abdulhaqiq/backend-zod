@@ -13,10 +13,11 @@ from app.models.user import User
 bearer_scheme = HTTPBearer()
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
+async def _resolve_user(
+    credentials: HTTPAuthorizationCredentials,
+    db: AsyncSession,
 ) -> User:
+    """Decode the JWT and return the User row, raising 401 if invalid."""
     token = credentials.credentials
 
     credentials_exception = HTTPException(
@@ -39,6 +40,19 @@ async def get_current_user(
     if user is None:
         raise credentials_exception
 
+    return user
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Resolve the JWT and enforce that the account is active (not admin-disabled)."""
+    user = await _resolve_user(credentials, db)
+
+    # is_active=False via admin ban — block access.
+    # Note: snooze mode also sets is_active=False, but that endpoint uses
+    # get_current_user_allow_inactive so snoozed users can still toggle themselves back.
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -46,3 +60,15 @@ async def get_current_user(
         )
 
     return user
+
+
+async def get_current_user_allow_inactive(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Resolve the JWT without enforcing is_active.
+
+    Use this for endpoints that snoozed users must still be able to reach
+    (e.g. the snooze toggle itself, so they can turn snooze back off).
+    """
+    return await _resolve_user(credentials, db)

@@ -129,3 +129,159 @@ async def update_location(
         "country": country,
         "location_updated_at": current_user.location_updated_at,
     }
+
+
+# ─── City search (Places Autocomplete) ───────────────────────────────────────
+
+# country_code → flag emoji  (ISO 3166-1 alpha-2)
+def _flag(code: str) -> str:
+    code = (code or "").upper().strip()
+    if len(code) != 2:
+        return "🌍"
+    return chr(0x1F1E6 + ord(code[0]) - ord('A')) + chr(0x1F1E6 + ord(code[1]) - ord('A'))
+
+
+@router.get("/city-search", summary="Search cities via Google Places Autocomplete")
+async def city_search(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Returns up to 8 matching cities with country name and flag emoji.
+    When q is empty, returns a curated list of top world cities.
+    Uses Google Places Autocomplete (types=cities) when GOOGLE_MAPS_API_KEY is set.
+    Falls back to a curated static list for offline/dev use.
+    """
+    q = q.strip()
+
+    # ── Static list (always available) ────────────────────────────────────────
+    static = [
+        {"city": "Abu Dhabi",       "country": "UAE",              "flag": "🇦🇪"},
+        {"city": "Accra",           "country": "Ghana",            "flag": "🇬🇭"},
+        {"city": "Amsterdam",       "country": "Netherlands",      "flag": "🇳🇱"},
+        {"city": "Atlanta",         "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Auckland",        "country": "New Zealand",      "flag": "🇳🇿"},
+        {"city": "Bangkok",         "country": "Thailand",         "flag": "🇹🇭"},
+        {"city": "Barcelona",       "country": "Spain",            "flag": "🇪🇸"},
+        {"city": "Beijing",         "country": "China",            "flag": "🇨🇳"},
+        {"city": "Berlin",          "country": "Germany",          "flag": "🇩🇪"},
+        {"city": "Boston",          "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Brussels",        "country": "Belgium",          "flag": "🇧🇪"},
+        {"city": "Buenos Aires",    "country": "Argentina",        "flag": "🇦🇷"},
+        {"city": "Cairo",           "country": "Egypt",            "flag": "🇪🇬"},
+        {"city": "Cape Town",       "country": "South Africa",     "flag": "🇿🇦"},
+        {"city": "Chicago",         "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Copenhagen",      "country": "Denmark",          "flag": "🇩🇰"},
+        {"city": "Dallas",          "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Delhi",           "country": "India",            "flag": "🇮🇳"},
+        {"city": "Doha",            "country": "Qatar",            "flag": "🇶🇦"},
+        {"city": "Dubai",           "country": "UAE",              "flag": "🇦🇪"},
+        {"city": "Dublin",          "country": "Ireland",          "flag": "🇮🇪"},
+        {"city": "Frankfurt",       "country": "Germany",          "flag": "🇩🇪"},
+        {"city": "Geneva",          "country": "Switzerland",      "flag": "🇨🇭"},
+        {"city": "Hong Kong",       "country": "Hong Kong",        "flag": "🇭🇰"},
+        {"city": "Houston",         "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Istanbul",        "country": "Turkey",           "flag": "🇹🇷"},
+        {"city": "Jakarta",         "country": "Indonesia",        "flag": "🇮🇩"},
+        {"city": "Johannesburg",    "country": "South Africa",     "flag": "🇿🇦"},
+        {"city": "Karachi",         "country": "Pakistan",         "flag": "🇵🇰"},
+        {"city": "Kuala Lumpur",    "country": "Malaysia",         "flag": "🇲🇾"},
+        {"city": "Lagos",           "country": "Nigeria",          "flag": "🇳🇬"},
+        {"city": "Lahore",          "country": "Pakistan",         "flag": "🇵🇰"},
+        {"city": "Lima",            "country": "Peru",             "flag": "🇵🇪"},
+        {"city": "Lisbon",          "country": "Portugal",         "flag": "🇵🇹"},
+        {"city": "London",          "country": "United Kingdom",   "flag": "🇬🇧"},
+        {"city": "Los Angeles",     "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Madrid",          "country": "Spain",            "flag": "🇪🇸"},
+        {"city": "Manchester",      "country": "United Kingdom",   "flag": "🇬🇧"},
+        {"city": "Manila",          "country": "Philippines",      "flag": "🇵🇭"},
+        {"city": "Melbourne",       "country": "Australia",        "flag": "🇦🇺"},
+        {"city": "Mexico City",     "country": "Mexico",           "flag": "🇲🇽"},
+        {"city": "Miami",           "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Milan",           "country": "Italy",            "flag": "🇮🇹"},
+        {"city": "Montreal",        "country": "Canada",           "flag": "🇨🇦"},
+        {"city": "Moscow",          "country": "Russia",           "flag": "🇷🇺"},
+        {"city": "Mumbai",          "country": "India",            "flag": "🇮🇳"},
+        {"city": "Munich",          "country": "Germany",          "flag": "🇩🇪"},
+        {"city": "Nairobi",         "country": "Kenya",            "flag": "🇰🇪"},
+        {"city": "New York",        "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Osaka",           "country": "Japan",            "flag": "🇯🇵"},
+        {"city": "Oslo",            "country": "Norway",           "flag": "🇳🇴"},
+        {"city": "Paris",           "country": "France",           "flag": "🇫🇷"},
+        {"city": "Riyadh",          "country": "Saudi Arabia",     "flag": "🇸🇦"},
+        {"city": "Rome",            "country": "Italy",            "flag": "🇮🇹"},
+        {"city": "San Francisco",   "country": "United States",    "flag": "🇺🇸"},
+        {"city": "Santiago",        "country": "Chile",            "flag": "🇨🇱"},
+        {"city": "São Paulo",       "country": "Brazil",           "flag": "🇧🇷"},
+        {"city": "Seoul",           "country": "South Korea",      "flag": "🇰🇷"},
+        {"city": "Shanghai",        "country": "China",            "flag": "🇨🇳"},
+        {"city": "Singapore",       "country": "Singapore",        "flag": "🇸🇬"},
+        {"city": "Stockholm",       "country": "Sweden",           "flag": "🇸🇪"},
+        {"city": "Sydney",          "country": "Australia",        "flag": "🇦🇺"},
+        {"city": "Taipei",          "country": "Taiwan",           "flag": "🇹🇼"},
+        {"city": "Tehran",          "country": "Iran",             "flag": "🇮🇷"},
+        {"city": "Tel Aviv",        "country": "Israel",           "flag": "🇮🇱"},
+        {"city": "Tokyo",           "country": "Japan",            "flag": "🇯🇵"},
+        {"city": "Toronto",         "country": "Canada",           "flag": "🇨🇦"},
+        {"city": "Vancouver",       "country": "Canada",           "flag": "🇨🇦"},
+        {"city": "Vienna",          "country": "Austria",          "flag": "🇦🇹"},
+        {"city": "Warsaw",          "country": "Poland",           "flag": "🇵🇱"},
+        {"city": "Zurich",          "country": "Switzerland",      "flag": "🇨🇭"},
+    ]
+
+    # ── Empty query → return popular cities ───────────────────────────────────
+    if not q:
+        popular = [
+            "London", "New York", "Dubai", "Paris", "Tokyo",
+            "Los Angeles", "Singapore", "Sydney", "Toronto", "Berlin",
+            "Amsterdam", "Barcelona", "Istanbul", "Bangkok", "Mumbai",
+        ]
+        top = [c for c in static if c["city"] in popular]
+        # Sort by the popular order
+        order = {city: i for i, city in enumerate(popular)}
+        top.sort(key=lambda c: order.get(c["city"], 99))
+        return {"results": top}
+
+    # ── Google Places Autocomplete ─────────────────────────────────────────────
+    key = settings.GOOGLE_MAPS_API_KEY
+    if key:
+        url = (
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json"
+            f"?input={q}&types=(cities)&key={key}&language=en"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(url)
+            data = r.json()
+            if data.get("status") == "OK":
+                results = []
+                for pred in data.get("predictions", [])[:8]:
+                    terms = pred.get("terms", [])
+                    city    = terms[0]["value"] if len(terms) >= 1 else pred["description"]
+                    country = terms[-1]["value"] if len(terms) >= 2 else ""
+                    place_id = pred.get("place_id", "")
+                    flag = "🌍"
+                    if place_id:
+                        try:
+                            det_url = (
+                                "https://maps.googleapis.com/maps/api/place/details/json"
+                                f"?place_id={place_id}&fields=address_components&key={key}"
+                            )
+                            async with httpx.AsyncClient(timeout=3) as dc:
+                                dr = await dc.get(det_url)
+                            det = dr.json()
+                            for comp in det.get("result", {}).get("address_components", []):
+                                if "country" in comp.get("types", []):
+                                    flag = _flag(comp.get("short_name", ""))
+                                    break
+                        except Exception:
+                            pass
+                    results.append({"city": city, "country": country, "flag": flag})
+                return {"results": results}
+        except Exception as exc:
+            logger.warning("Places Autocomplete failed: %s", exc)
+
+    # ── Static fallback ────────────────────────────────────────────────────────
+    ql = q.lower()
+    matches = [c for c in static if ql in c["city"].lower() or ql in c["country"].lower()]
+    return {"results": matches[:8]}

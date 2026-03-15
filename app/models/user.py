@@ -43,30 +43,31 @@ class User(Base):
     # ── Core profile ──────────────────────────────────────────────────────────
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
-    gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gender_id: Mapped[int | None] = mapped_column(Integer, nullable=True)     # FK → lookup_options (category=gender)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Onboarding steps ─────────────────────────────────────────────────────
-    purpose: Mapped[list | None] = mapped_column(JSONB, nullable=True)         # ["relationship", "friends", ...]
+    purpose: Mapped[list | None] = mapped_column(JSONB, nullable=True)        # [relationship_types.id, ...]
     height_cm: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    interests: Mapped[list | None] = mapped_column(JSONB, nullable=True)      # ["hiking", "cooking", ...]
-    lifestyle: Mapped[dict | None] = mapped_column(JSONB, nullable=True)      # {exercise, drinking, smoking, ...}
-    values_list: Mapped[list | None] = mapped_column(JSONB, nullable=True)    # ["loyalty", "ambition", ...]
+    interests: Mapped[list | None] = mapped_column(JSONB, nullable=True)      # [lookup_options.id, ...] (category=interests)
+    lifestyle: Mapped[dict | None] = mapped_column(JSONB, nullable=True)      # {drinking: id, smoking: id, exercise: id, diet: id}
+    values_list: Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id, ...] (category=values_list)
     prompts: Mapped[list | None] = mapped_column(JSONB, nullable=True)        # [{question, answer}, ...]
     photos: Mapped[list | None] = mapped_column(JSONB, nullable=True)         # [url, ...]
 
     # ── Extended profile (About You section) ─────────────────────────────────
-    education_level: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    looking_for: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    family_plans: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    have_kids: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    star_sign: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    religion: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    languages: Mapped[list | None] = mapped_column(JSONB, nullable=True)      # ["English", "Spanish"]
+    education_level_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # FK → lookup_options (category=education_level)
+    looking_for_id: Mapped[int | None] = mapped_column(Integer, nullable=True)      # FK → lookup_options (category=looking_for)
+    family_plans_id: Mapped[int | None] = mapped_column(Integer, nullable=True)     # FK → lookup_options (category=family_plans)
+    have_kids_id: Mapped[int | None] = mapped_column(Integer, nullable=True)        # FK → lookup_options (category=have_kids)
+    star_sign_id: Mapped[int | None] = mapped_column(Integer, nullable=True)        # FK → lookup_options (category=star_sign)
+    religion_id: Mapped[int | None] = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=religion)
+    ethnicity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)        # FK → lookup_options (category=ethnicity)
+    languages: Mapped[list | None] = mapped_column(JSONB, nullable=True)            # [lookup_options.id, ...] (category=language)
 
     # ── Edit profile sections ─────────────────────────────────────────────────
-    voice_prompts: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{topic, url, duration_sec}, ...]
-    causes: Mapped[list | None] = mapped_column(JSONB, nullable=True)         # ["Environment", "Education"]
+    voice_prompts: Mapped[list | None] = mapped_column(JSONB, nullable=True)   # [{topic, url, duration_sec}, ...]
+    causes: Mapped[list | None] = mapped_column(JSONB, nullable=True)          # [lookup_options.id, ...] (category=causes)
     work_experience: Mapped[list | None] = mapped_column(JSONB, nullable=True) # [{job_title, company, start_year, end_year, current}]
     education: Mapped[list | None] = mapped_column(JSONB, nullable=True)      # [{institution, course, degree, grad_year}]
     city: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -86,11 +87,61 @@ class User(Base):
 
     # ── Preferences ───────────────────────────────────────────────────────────
     dark_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    best_photo_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # ── Zod Work profile ──────────────────────────────────────────────────────
+    work_photos: Mapped[list | None] = mapped_column(JSONB, nullable=True)                   # [url, ...]
+    work_prompts: Mapped[list | None] = mapped_column(JSONB, nullable=True)                  # [{question, answer}, ...]
+    work_matching_goals: Mapped[list | None] = mapped_column(JSONB, nullable=True)           # [lookup_options.id, ...] (category=work_matching_goals)
+    work_are_you_hiring: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    work_commitment_level_id: Mapped[int | None] = mapped_column(Integer, nullable=True)     # FK → lookup_options (category=work_commitment_level)
+    work_skills: Mapped[list | None] = mapped_column(JSONB, nullable=True)                   # [lookup_options.id, ...] (category=work_skills)
+    work_equity_split_id: Mapped[int | None] = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=work_equity_split)
+    work_industries: Mapped[list | None] = mapped_column(JSONB, nullable=True)               # [lookup_options.id, ...] (category=work_industries)
+    work_scheduling_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    work_who_to_show_id: Mapped[int | None] = mapped_column(Integer, nullable=True)          # FK → lookup_options (category=work_who_to_show)
+    work_priority_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # ── Push notifications ────────────────────────────────────────────────────
+    push_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # ── Discover filter preferences ───────────────────────────────────────────
+    filter_age_min:         Mapped[int | None]  = mapped_column(Integer, nullable=True)
+    filter_age_max:         Mapped[int | None]  = mapped_column(Integer, nullable=True)
+    filter_max_distance_km: Mapped[int | None]  = mapped_column(Integer, nullable=True)  # null = no limit
+    filter_verified_only:   Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    filter_star_signs:      Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_interests:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_languages:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    # Pro-only filters
+    filter_purpose:         Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [relationship_types.id]
+    filter_looking_for:     Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_education_level: Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_family_plans:    Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_have_kids:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_ethnicities:     Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_exercise:        Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_drinking:        Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_smoking:         Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_height_min:      Mapped[int | None]  = mapped_column(Integer, nullable=True)  # cm
+    filter_height_max:      Mapped[int | None]  = mapped_column(Integer, nullable=True)  # cm
+
+    # ── Mood / vibe status ────────────────────────────────────────────────────
+    mood_emoji:  Mapped[str | None] = mapped_column(String(8),   nullable=True)  # e.g. "🎉"
+    mood_text:   Mapped[str | None] = mapped_column(String(60),  nullable=True)  # e.g. "Up for a coffee chat"
+
+    # ── Verification ──────────────────────────────────────────────────────────
+    face_match_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0.0–100.0 %
+    # unverified | pending | verified | rejected
+    verification_status: Mapped[str] = mapped_column(
+        String(16), default="unverified", nullable=False
+    )
 
     # ── Status flags ─────────────────────────────────────────────────────────
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_onboarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

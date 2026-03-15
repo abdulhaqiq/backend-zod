@@ -1,6 +1,15 @@
+import ssl
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+
+# asyncpg requires SSL to be passed via connect_args, not the URL query string
+_ssl_ctx: ssl.SSLContext | bool = False
+if settings.DB_SSLMODE == "require":
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
 
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -8,6 +17,7 @@ engine = create_async_engine(
     pool_size=10,
     max_overflow=20,
     echo=settings.DEBUG,
+    connect_args={"ssl": _ssl_ctx} if _ssl_ctx else {},
 )
 
 AsyncSessionLocal = async_sessionmaker(
