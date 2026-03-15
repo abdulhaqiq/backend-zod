@@ -16,19 +16,19 @@ import random
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
-import os
-
 import asyncpg
 
+from app.core.config import settings
+
 # ── DB config ──────────────────────────────────────────────────────────────────
-# Set DB_PASSWORD in your environment or a local .env file before running.
+# Credentials are loaded from .env via app/core/config.py (pydantic-settings).
 DB = {
-    "host": os.environ.get("DB_HOST", "db-postgresql-nyc3-22944-do-user-23814271-0.g.db.ondigitalocean.com"),
-    "port": int(os.environ.get("DB_PORT", "25060")),
-    "database": os.environ.get("DB_NAME", "defaultdb"),
-    "user": os.environ.get("DB_USER", "doadmin"),
-    "password": os.environ["DB_PASSWORD"],
-    "ssl": "require",
+    "host":     settings.DB_HOST,
+    "port":     settings.DB_PORT,
+    "database": settings.DB_NAME,
+    "user":     settings.DB_USERNAME,
+    "password": settings.DB_PASSWORD,
+    "ssl":      settings.DB_SSLMODE,
 }
 
 # ── Base coords: London ────────────────────────────────────────────────────────
