@@ -1,0 +1,35 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: SSH deploy to droplet
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            set -e
+
+            # ── Pull latest code ──────────────────────────────────────────
+            cd /opt/backend
+            git pull origin main
+
+            # ── Install any new dependencies ─────────────────────────────
+            source venv/bin/activate
+            pip install -r requirements.txt --quiet
+
+            # ── Restart the service ───────────────────────────────────────
+            systemctl restart mil-backend
+
+            # ── Confirm it is running ─────────────────────────────────────
+            systemctl is-active --quiet mil-backend && echo "✅ mil-backend is running" || (echo "❌ mil-backend failed to start" && journalctl -u mil-backend -n 30 && exit 1)
