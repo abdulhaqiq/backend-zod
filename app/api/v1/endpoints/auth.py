@@ -302,6 +302,8 @@ async def apple_sign_in(payload: AppleAuthRequest, db: AsyncSession = Depends(ge
     try:
         apple_data = await verify_apple_token(payload.identity_token)
     except ValueError as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("Apple sign-in rejected: %s", exc)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
 
     apple_id = apple_data["apple_id"]

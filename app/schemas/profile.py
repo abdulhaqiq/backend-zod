@@ -107,6 +107,7 @@ class MeResponse(BaseModel):
     id: uuid.UUID
     phone: str | None
     email: str | None
+    apple_id: str | None
     full_name: str | None
     date_of_birth: date | None
     gender_id: int | None
