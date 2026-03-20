@@ -1,0 +1,30 @@
+[Unit]
+Description=Mil API (FastAPI / uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=milapi
+Group=milapi
+WorkingDirectory=/opt/milapi
+EnvironmentFile=/opt/milapi/.env
+
+ExecStart=/opt/milapi/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 4 \
+    --log-level info
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Logging — view with: journalctl -u mil-api -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mil-api
+
+[Install]
+WantedBy=multi-user.target

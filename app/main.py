@@ -21,6 +21,7 @@ import app.models.subscription_plan  # noqa: F401
 import app.models.user_score  # noqa: F401
 import app.models.user_compatibility  # noqa: F401
 import app.models.gift_card  # noqa: F401
+import app.models.user_report  # noqa: F401
 
 
 @asynccontextmanager

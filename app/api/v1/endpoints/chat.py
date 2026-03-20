@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +28,7 @@ from app.core.push import send_push_notification
 from app.db.session import AsyncSessionLocal, get_db
 from app.models.message import Message
 from app.models.user import User
+from app.models.user_report import UserReport
 
 _log = logging.getLogger(__name__)
 
@@ -960,5 +962,152 @@ async def mark_read(
 
     # Notify the sender that messages were read
     await manager.send_to(str(other_uuid), {"type": "read", "reader_id": str(current_user.id)})
+
+    return {"ok": True}
+
+
+# ── Unmatch ───────────────────────────────────────────────────────────────────
+
+class UnmatchBody(BaseModel):
+    reason: str | None = None
+    custom_reason: str | None = None
+
+
+@router.post("/chat/{other_user_id}/unmatch", summary="Unmatch and remove a conversation")
+async def unmatch(
+    other_user_id: str,
+    body: UnmatchBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Removes the match between the current user and other_user_id, deletes all
+    messages in the shared room, and pushes a real-time 'unmatch' event to the
+    other party via the notify WebSocket.
+    """
+    from sqlalchemy import text, delete as sa_delete
+
+    try:
+        other_uuid = uuid.UUID(other_user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    uid = str(current_user.id)
+
+    # Delete match row (stable ordering — smaller uuid is always user1_id)
+    await db.execute(
+        text("""
+            DELETE FROM matches
+            WHERE (user1_id = CAST(:a AS uuid) AND user2_id = CAST(:b AS uuid))
+               OR (user1_id = CAST(:b AS uuid) AND user2_id = CAST(:a AS uuid))
+        """).bindparams(a=uid, b=str(other_uuid))
+    )
+
+    # Delete all messages in the shared room
+    room_id = Message.make_room_id(current_user.id, other_uuid)
+    await db.execute(sa_delete(Message).where(Message.room_id == room_id))
+
+    await db.commit()
+
+    # Notify the other user in real time
+    await notify_manager.send_to(
+        str(other_uuid),
+        {"type": "unmatch", "user_id": uid},
+    )
+
+    return {"ok": True}
+
+
+# ── Block ─────────────────────────────────────────────────────────────────────
+
+@router.post("/chat/{other_user_id}/block", summary="Block a user and remove the match")
+async def block_user(
+    other_user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Blocks other_user_id:
+      • Removes any existing match + all shared messages (same as unmatch)
+      • Inserts a 'block' direction swipe for every mode so neither profile
+        appears in the other's feed again
+    """
+    from sqlalchemy import text, delete as sa_delete
+
+    try:
+        other_uuid = uuid.UUID(other_user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    uid = str(current_user.id)
+    other_str = str(other_uuid)
+
+    # Remove match (if any)
+    await db.execute(
+        text("""
+            DELETE FROM matches
+            WHERE (user1_id = CAST(:a AS uuid) AND user2_id = CAST(:b AS uuid))
+               OR (user1_id = CAST(:b AS uuid) AND user2_id = CAST(:a AS uuid))
+        """).bindparams(a=uid, b=other_str)
+    )
+
+    # Delete shared messages
+    room_id = Message.make_room_id(current_user.id, other_uuid)
+    await db.execute(sa_delete(Message).where(Message.room_id == room_id))
+
+    # Insert block swipes for all feed modes so neither appears in the other's feed
+    for mode in ("date", "work"):
+        await db.execute(
+            text("""
+                INSERT INTO swipes (swiper_id, swiped_id, direction, mode)
+                VALUES (CAST(:swiper AS uuid), CAST(:swiped AS uuid), 'block', :mode)
+                ON CONFLICT (swiper_id, swiped_id, mode) DO UPDATE SET direction = 'block'
+            """).bindparams(swiper=uid, swiped=other_str, mode=mode)
+        )
+        # Reverse so the blocked user also won't see the blocker
+        await db.execute(
+            text("""
+                INSERT INTO swipes (swiper_id, swiped_id, direction, mode)
+                VALUES (CAST(:swiper AS uuid), CAST(:swiped AS uuid), 'block', :mode)
+                ON CONFLICT (swiper_id, swiped_id, mode) DO UPDATE SET direction = 'block'
+            """).bindparams(swiper=other_str, swiped=uid, mode=mode)
+        )
+
+    await db.commit()
+
+    return {"ok": True}
+
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+class ReportBody(BaseModel):
+    reason: str = "user_report"
+    custom_reason: str | None = None
+
+
+@router.post("/chat/{other_user_id}/report", summary="Report a user")
+async def report_user(
+    other_user_id: str,
+    body: ReportBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Stores a user report. The report is reviewed by the trust & safety team.
+    Does NOT automatically remove the match — use /block or /unmatch for that.
+    """
+    try:
+        other_uuid = uuid.UUID(other_user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    report = UserReport(
+        reporter_id=current_user.id,
+        reported_id=other_uuid,
+        reason=body.reason,
+        custom_reason=body.custom_reason,
+    )
+    db.add(report)
+    await db.commit()
 
     return {"ok": True}
