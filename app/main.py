@@ -158,7 +158,11 @@ app.add_middleware(
 # Requests from the mobile app must carry:  X-App-Key: <APP_API_KEY>
 # Docs, health, and openapi schema are always public.
 
-_APP_KEY_PUBLIC = ("/health", "/", "/openapi.json", "/docs", "/redoc")
+_APP_KEY_PUBLIC = (
+    "/health", "/", "/openapi.json", "/docs", "/redoc",
+    # LinkedIn OAuth callback — LinkedIn redirects here directly (no app key)
+    "/api/v1/linkedin/callback",
+)
 
 
 @app.middleware("http")

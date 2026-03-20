@@ -24,6 +24,7 @@ import re
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -31,6 +32,32 @@ from app.core.deps import get_current_user
 from app.models.user import User
 
 router = APIRouter(prefix="/linkedin", tags=["linkedin"])
+
+# ─── OAuth callback ────────────────────────────────────────────────────────────
+
+@router.get("/callback")
+async def linkedin_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    """
+    LinkedIn redirects here after the user authorises the app.
+
+    We immediately redirect back into the mobile app via the 'zod://' deep-link
+    scheme so that expo-web-browser / ASWebAuthenticationSession can intercept
+    it and hand the auth code back to the JavaScript layer.
+
+    Register https://dev.zod.ailoo.co/api/v1/linkedin/callback
+    as an Authorised Redirect URL in your LinkedIn Developer Portal.
+    """
+    if error or not code:
+        desc = error_description or error or "access_denied"
+        return RedirectResponse(f"zod://linkedin?error={desc}")
+    state_part = f"&state={state}" if state else ""
+    return RedirectResponse(f"zod://linkedin?code={code}{state_part}")
+
 
 # ─── Shared helpers ────────────────────────────────────────────────────────────
 
