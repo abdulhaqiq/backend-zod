@@ -10,7 +10,7 @@ Authentication endpoints:
 """
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +42,8 @@ from app.services.twilio_service import send_otp as twilio_send_otp
 
 import random
 import string
+
+from app.core.limiter import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -189,7 +191,8 @@ async def _send_otp_to_phone(
     response_model=OtpSentResponse,
     summary="Send OTP via SMS or WhatsApp",
 )
-async def send_otp(payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute;20/hour")
+async def send_otp(request: Request, payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
     return await _send_otp_to_phone(
         phone=payload.phone, channel=payload.channel, db=db, device=payload.device
     )
@@ -200,7 +203,8 @@ async def send_otp(payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_
     response_model=OtpSentResponse,
     summary="Resend OTP (same rate limits as send)",
 )
-async def resend_otp(payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute;20/hour")
+async def resend_otp(request: Request, payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
     return await _send_otp_to_phone(
         phone=payload.phone, channel=payload.channel, db=db, device=payload.device
     )
@@ -211,7 +215,9 @@ async def resend_otp(payload: PhoneSendOtpRequest, db: AsyncSession = Depends(ge
     response_model=TokenResponse,
     summary="Verify OTP and receive token pair",
 )
+@limiter.limit("10/minute")
 async def verify_otp_endpoint(
+    request: Request,
     payload: PhoneVerifyOtpRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -300,7 +306,8 @@ async def verify_otp_endpoint(
     response_model=TokenResponse,
     summary="Sign in with Apple",
 )
-async def apple_sign_in(payload: AppleAuthRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("20/minute")
+async def apple_sign_in(request: Request, payload: AppleAuthRequest, db: AsyncSession = Depends(get_db)):
     try:
         apple_data = await verify_apple_token(payload.identity_token)
     except ValueError as exc:
@@ -343,7 +350,8 @@ async def apple_sign_in(payload: AppleAuthRequest, db: AsyncSession = Depends(ge
     response_model=TokenResponse,
     summary="Sign in with Facebook",
 )
-async def facebook_sign_in(payload: FacebookAuthRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("20/minute")
+async def facebook_sign_in(request: Request, payload: FacebookAuthRequest, db: AsyncSession = Depends(get_db)):
     try:
         fb_data = await verify_facebook_token(payload.access_token)
     except ValueError as exc:
@@ -384,7 +392,8 @@ async def facebook_sign_in(payload: FacebookAuthRequest, db: AsyncSession = Depe
     response_model=TokenResponse,
     summary="Refresh access token using a refresh token",
 )
-async def refresh_token(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("30/minute")
+async def refresh_token(request: Request, payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
     token_hash = hash_refresh_token(payload.refresh_token)
     now = _now()
 

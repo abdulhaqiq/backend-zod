@@ -127,13 +127,24 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+from app.core.limiter import limiter
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    docs_url=settings.DOCS_PATH or None,
-    redoc_url=settings.REDOC_PATH or None,
+    docs_url="/docs",
+    redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# Attach rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -144,36 +155,44 @@ app.add_middleware(
 )
 
 # ── X-App-Key gate ────────────────────────────────────────────────────────────
-# All requests must carry the header:  X-App-Key: <APP_API_KEY>
-# This prevents anyone who finds the URL from calling the API directly.
-# Exempt paths: health checks and the (secret) docs URL.
+# Requests from the mobile app must carry:  X-App-Key: <APP_API_KEY>
+# Docs, health, and openapi schema are always public.
 
-_APP_KEY_EXEMPT = ("/health", "/", "/openapi.json")
+_APP_KEY_PUBLIC = ("/health", "/", "/openapi.json", "/docs", "/redoc")
 
 
 @app.middleware("http")
 async def app_key_gate(request: Request, call_next):
     _key = settings.APP_API_KEY
     if not _key:
-        # Key not configured — gate is disabled (dev convenience)
         return await call_next(request)
 
     path = request.url.path
-
-    # Always allow health, root, and the docs paths (already at a secret URL)
-    exempt_docs = [settings.DOCS_PATH, settings.REDOC_PATH] if settings.DOCS_PATH else []
-    exempt = list(_APP_KEY_EXEMPT) + exempt_docs
-    if any(path == p or path.startswith(p + "/") for p in exempt if p):
+    if any(path == p or path.startswith(p + "/") for p in _APP_KEY_PUBLIC):
         return await call_next(request)
 
     provided = request.headers.get("X-App-Key", "")
     if provided != _key:
         return JSONResponse(
             status_code=401,
-            content={"detail": "Missing or invalid app key."},
+            content={"detail": "Invalid or missing app key."},
+            headers={"WWW-Authenticate": "ApiKey"},
         )
 
     return await call_next(request)
+
+# ── Security headers ──────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+    if not settings.DEBUG:
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
 
 # ── Scan-required API gate ────────────────────────────────────────────────────
 # When a user has face_scan_required=True or id_scan_required=True, every API

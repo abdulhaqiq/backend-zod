@@ -18,10 +18,11 @@ class Settings(BaseSettings):
     # Leave empty ("") to disable the check (not recommended in production).
     APP_API_KEY: str = ""
 
-    # Optional: move /docs to a secret path in production (e.g. "/dev-docs-abc123")
-    # Set to "" to disable docs entirely.
-    DOCS_PATH: str = "/docs"
-    REDOC_PATH: str = "/redoc"
+    # Rate limiting (requests per minute, per IP)
+    RATE_LIMIT_OTP: str = "5/minute"        # send-otp / resend-otp
+    RATE_LIMIT_AUTH: str = "20/minute"      # login / refresh / verify
+    RATE_LIMIT_WRITE: str = "60/minute"     # POST/PATCH/DELETE general
+    RATE_LIMIT_READ: str = "120/minute"     # GET general
 
     # JWT
     SECRET_KEY: str
