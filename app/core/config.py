@@ -13,6 +13,16 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
+    # Mobile-app shared secret — every request from the app must include:
+    #   X-App-Key: <APP_API_KEY>
+    # Leave empty ("") to disable the check (not recommended in production).
+    APP_API_KEY: str = ""
+
+    # Optional: move /docs to a secret path in production (e.g. "/dev-docs-abc123")
+    # Set to "" to disable docs entirely.
+    DOCS_PATH: str = "/docs"
+    REDOC_PATH: str = "/redoc"
+
     # JWT
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
