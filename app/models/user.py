@@ -36,6 +36,13 @@ class User(Base):
     facebook_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    linkedin_id: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
+
+    # LinkedIn verification
+    linkedin_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    linkedin_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Password only for email/password accounts
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)

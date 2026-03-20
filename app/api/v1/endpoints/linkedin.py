@@ -26,9 +26,11 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_current_user
+from app.db.session import get_db
 from app.models.user import User
 
 router = APIRouter(prefix="/linkedin", tags=["linkedin"])
@@ -132,6 +134,63 @@ class EduEntry(BaseModel):
     course: str
     degree: str
     grad_year: str
+
+
+class LinkedInVerifyResponse(BaseModel):
+    linkedin_verified: bool
+    linkedin_url: str | None
+
+
+# ─── Account verification ────────────────────────────────────────────────────
+
+@router.post("/verify", response_model=LinkedInVerifyResponse)
+async def verify_linkedin(
+    body: LinkedInCodeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify the user's identity via LinkedIn OAuth.
+
+    Exchanges the auth code for an access token, retrieves the LinkedIn member
+    ID (sub) and attempts to get the vanity profile URL, then stores
+    linkedin_id, linkedin_url, and linkedin_verified=True on the user record.
+    """
+    _check_credentials()
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        access_token = await _exchange_code(client, body.code, body.redirect_uri)
+
+        # OIDC userInfo gives us the stable member ID (sub)
+        userinfo_res = await client.get(
+            "https://api.linkedin.com/v2/userInfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if userinfo_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to retrieve LinkedIn profile.")
+
+        userinfo = userinfo_res.json()
+        linkedin_id: str = userinfo.get("sub", "")
+
+        # Try to get vanityName for a proper profile URL
+        linkedin_url: str | None = None
+        me_res = await client.get(
+            "https://api.linkedin.com/v2/me?projection=(id,vanityName)",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if me_res.status_code == 200:
+            vanity = me_res.json().get("vanityName")
+            if vanity:
+                linkedin_url = f"https://www.linkedin.com/in/{vanity}"
+
+    # Persist to DB
+    current_user.linkedin_id = linkedin_id
+    current_user.linkedin_url = linkedin_url
+    current_user.linkedin_verified = True
+    db.add(current_user)
+    await db.commit()
+
+    return LinkedInVerifyResponse(linkedin_verified=True, linkedin_url=linkedin_url)
 
 
 # ─── Work experience import ─────────────────────────────────────────────────────

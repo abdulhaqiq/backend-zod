@@ -223,6 +223,9 @@ class MeResponse(BaseModel):
     university_email:         str | None
     university_email_verified: bool
 
+    linkedin_url:      str | None
+    linkedin_verified: bool
+
     hide_age: bool
     hide_distance: bool
     require_verified_to_chat: bool
