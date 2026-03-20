@@ -193,8 +193,7 @@ async def import_linkedin_work(
             if entries:
                 return entries
 
-        # ── Attempt 2: OpenID userInfo headline fallback ────────────────────
-        # Try /v2/userInfo (openid + profile scopes) for headline
+        # ── Attempt 2: headline from /v2/userInfo (OIDC) ───────────────────
         userinfo_res = await client.get(
             "https://api.linkedin.com/v2/userInfo",
             headers={"Authorization": f"Bearer {access_token}"},
@@ -203,17 +202,28 @@ async def import_linkedin_work(
         headline = ""
         if userinfo_res.status_code == 200:
             ui = userinfo_res.json()
-            headline = ui.get("headline", "") or ""
+            # `headline` is a LinkedIn extension; standard OIDC doesn't include it
+            headline = ui.get("headline", "") or ui.get("localizedHeadline", "") or ""
 
-        # ── Attempt 3: /v2/me with projection (r_liteprofile) ──────────────
+        # ── Attempt 3: /v2/me projection (r_liteprofile legacy scope) ──────
         if not headline:
             me_res = await client.get(
                 "https://api.linkedin.com/v2/me"
-                "?projection=(id,localizedFirstName,localizedLastName,headline)",
+                "?projection=(id,localizedFirstName,localizedLastName,"
+                "headline,localizedHeadline)",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if me_res.status_code == 200:
-                headline = me_res.json().get("headline", "") or ""
+                me = me_res.json()
+                headline = (
+                    me.get("localizedHeadline", "")
+                    or me.get("headline", {}).get(
+                        "localized", {}
+                    ).get(
+                        next(iter(me.get("headline", {}).get("localized", {})), ""), ""
+                    )
+                    or ""
+                )
 
         if headline:
             job_title, company = _parse_headline(headline)
@@ -226,8 +236,13 @@ async def import_linkedin_work(
                     current=True,
                 )]
 
-    # Nothing was found
-    return []
+    # LinkedIn connected successfully but API doesn't expose positions without
+    # LinkedIn Partner Program access. Signal this to the frontend with a
+    # specific error code so it can show a helpful message instead of crashing.
+    raise HTTPException(
+        status_code=422,
+        detail="linkedin_no_data",
+    )
 
 
 # ─── Education import ───────────────────────────────────────────────────────────
@@ -259,9 +274,12 @@ async def import_linkedin_education(
         )
 
         if edu_res.status_code != 200:
-            # r_fullprofile not available — return empty list so frontend shows
-            # a "no data found" message instead of an error crash.
-            return []
+            # Education requires LinkedIn Partner Program (r_fullprofile scope).
+            # Signal this clearly to the frontend.
+            raise HTTPException(
+                status_code=422,
+                detail="linkedin_no_data",
+            )
 
         entries: list[EduEntry] = []
         for edu in edu_res.json().get("elements", []):
