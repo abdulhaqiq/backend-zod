@@ -2,6 +2,7 @@
 Seed test profiles:
   • 50 near London  (25 date + 25 work) — original batch
   • 20 near Riyadh  (15 date + 5 work)  — added for Riyadh testing
+  • 15 near Western US (date profiles)  — added for US testing
 
 All coords are within 80 km of the respective city centre.
 Also creates ~30 mutual likes (matches) between the seeded users.
@@ -209,6 +210,63 @@ RIYADH_DATE_BIOS = [
     "Startup founder, marathon runner, eternal optimist 🏃‍♂️💡",
     "Interior designer obsessed with blending Saudi tradition and Scandinavian minimalism 🏡",
 ]
+# ── Western US seed data ──────────────────────────────────────────────────────
+US_BASE_LAT   = 34.0522   # Los Angeles
+US_BASE_LNG   = -118.2437
+US_MAX_RADIUS = 200  # km — covers LA, San Diego, Santa Barbara, etc.
+
+US_FEMALE_NAMES = [
+    "Hailey", "Madison", "Savannah", "Brittany", "Kylie",
+    "Brooke", "Tiffany", "Ashley", "Whitney", "Amber",
+    "Cassidy", "Shelby", "Kayla", "Sierra", "Kelsey",
+    "Brenna", "Paige", "Lacey", "Alexis", "Taylor",
+]
+US_MALE_NAMES = [
+    "Abdul Kumshey", "Cody", "Tyler", "Chase", "Bryce",
+    "Garrett", "Trevor", "Blake", "Colton", "Tanner",
+    "Dakota", "Jared", "Kyle", "Dustin", "Austin",
+]
+US_LAST_NAMES = [
+    "Mitchell", "Campbell", "Parker", "Evans", "Edwards",
+    "Collins", "Stewart", "Morris", "Rogers", "Reed",
+    "Cook", "Morgan", "Bell", "Murphy", "Bailey",
+    "Rivera", "Cooper", "Richardson", "Cox", "Howard",
+]
+US_DATE_BIOS = [
+    "SoCal native, beach volleyball addict, and avocado toast enthusiast 🏐🥑",
+    "Hiking Runyon Canyon every morning before the city wakes up 🌄",
+    "Golden hour chaser — camera in one hand, cold brew in the other ☕📸",
+    "Surfer by soul, software engineer by day 🏄‍♀️💻",
+    "Farmers market Saturday, live music Sunday — that's my whole personality 🎶🌽",
+    "Pilates, puppy playdates, and Pacific sunsets 🐾🌅",
+    "Plant mom with 37 succulents and counting 🌵",
+    "Weekend road tripper — I've done PCH three times and I'm not stopping 🚗🌊",
+    "Yoga retreat veteran who still eats In-N-Out after 🧘‍♀️🍔",
+    "Film student turned UX designer — I think in storyboards 🎬",
+    "Desert hiker, city dreamer. Joshua Tree is my happy place 🪨⛺",
+    "Marathoner, taco connoisseur, and aspiring van-lifer 🌮🚐",
+    "Barista by morning, pottery student by evening — living my best life 🏺☕",
+    "Marine mammal biologist who cries at dolphin documentaries 🐬",
+    "Startup life by week, ski trips to Mammoth by weekend ⛷️🚀",
+]
+US_CITIES = [
+    ("Los Angeles", "USA"),
+    ("Los Angeles, Silver Lake", "USA"),
+    ("Los Angeles, Venice Beach", "USA"),
+    ("Los Angeles, Echo Park", "USA"),
+    ("Santa Monica", "USA"),
+    ("Malibu", "USA"),
+    ("Pasadena", "USA"),
+    ("Long Beach", "USA"),
+    ("San Diego", "USA"),
+    ("San Diego, North Park", "USA"),
+    ("Irvine", "USA"),
+    ("Santa Barbara", "USA"),
+    ("San Francisco", "USA"),
+    ("Oakland", "USA"),
+    ("Palm Springs", "USA"),
+]
+
 RIYADH_CITIES = [
     ("Riyadh", "Saudi Arabia"),
     ("Riyadh, Al Olaya", "Saudi Arabia"),
@@ -531,6 +589,72 @@ def make_riyadh_work_profile(idx: int):
     }
 
 
+def make_us_date_profile(idx: int):
+    # First profile is always Abdul Kumshey (male); rest alternate female/male
+    if idx == 0:
+        first_name, last_name = "Abdul", "Kumshey"
+        is_male = True
+    else:
+        is_male = idx % 3 != 0  # ~2/3 female for variety
+        first_name = random.choice(US_MALE_NAMES if is_male else US_FEMALE_NAMES)
+        last_name = random.choice(US_LAST_NAMES)
+
+    gender_id = random.choice([223] if is_male else [224, 225])
+    photos_pool = MALE_PHOTOS if is_male else FEMALE_PHOTOS
+    photos = random.sample(photos_pool, random.randint(2, 4))
+
+    lat, lng = random_coords_near(US_BASE_LAT, US_BASE_LNG, US_MAX_RADIUS)
+    city_name, country = random.choice(US_CITIES)
+    dob = random_dob(21, 35)
+
+    interests = pick(INTEREST_IDS, random.randint(3, 7))
+    languages = pick(LANGUAGE_IDS, random.randint(1, 2))
+    lifestyle = {
+        "exercise": random.choice(EXERCISE_IDS),
+        "drinking": random.choice(DRINKING_IDS),
+        "smoking":  random.choice(SMOKING_IDS),
+        "diet":     random.choice(DIET_IDS),
+    }
+
+    return {
+        "id":                 str(uuid.uuid4()),
+        "full_name":          f"{first_name} {last_name}",
+        "bio":                random.choice(US_DATE_BIOS),
+        "is_active":          True,
+        "is_verified":        random.random() < 0.70,
+        "is_onboarded":       True,
+        "created_at":         datetime.now(timezone.utc) - timedelta(days=random.randint(1, 90)),
+        "updated_at":         datetime.now(timezone.utc),
+        "date_of_birth":      dob,
+        "latitude":           lat,
+        "longitude":          lng,
+        "city":               city_name,
+        "country":            country,
+        "address":            f"{city_name}, {country}",
+        "height_cm":          random.randint(155, 192),
+        "gender_id":          gender_id,
+        "education_level_id": random.choice(EDUCATION_IDS),
+        "looking_for_id":     random.choice(LOOKING_FOR_IDS),
+        "family_plans_id":    random.choice(FAMILY_PLANS_IDS),
+        "have_kids_id":       random.choice(HAVE_KIDS_IDS),
+        "star_sign_id":       random.choice(STAR_SIGN_IDS),
+        "religion_id":        random.choice(RELIGION_IDS),
+        "subscription_tier":  random.choices(["free", "pro"], weights=[65, 35])[0],
+        "verification_status": random.choices(["unverified", "verified"], weights=[30, 70])[0],
+        "photos":             json.dumps(photos),
+        "interests":          json.dumps([{"id": i} for i in interests]),
+        "languages":          json.dumps([{"id": i} for i in languages]),
+        "lifestyle":          json.dumps(lifestyle),
+        "prompts":            json.dumps(random.choice(PROMPT_POOLS)),
+        "purpose":            json.dumps([{"id": random.choice(LOOKING_FOR_IDS)}]),
+        "filter_max_distance_km": random.choice([50, 80, None]),
+        "filter_age_min":     None,
+        "filter_age_max":     None,
+        "filter_verified_only": False,
+        "_mode": "date",
+    }
+
+
 async def seed():
     print("Connecting to database…")
     conn = await asyncpg.connect(**DB)
@@ -550,10 +674,11 @@ async def seed():
     work_profiles  = [make_work_profile(i) for i in range(25)]
     ryd_date       = [make_riyadh_date_profile(i) for i in range(15)]
     ryd_work       = [make_riyadh_work_profile(i) for i in range(5)]
-    all_profiles   = date_profiles + work_profiles + ryd_date + ryd_work
+    us_date        = [make_us_date_profile(i) for i in range(15)]
+    all_profiles   = date_profiles + work_profiles + ryd_date + ryd_work + us_date
 
     print(f"Inserting {len(all_profiles)} profiles  "
-          f"(25 London date + 25 London work + 15 Riyadh date + 5 Riyadh work)…")
+          f"(25 London date + 25 London work + 15 Riyadh date + 5 Riyadh work + 15 Western US date)…")
 
     insert_sql = """
     INSERT INTO users (
@@ -685,6 +810,7 @@ async def seed():
     print(f"   • 25 work profiles  (London)")
     print(f"   • 15 date profiles  (Riyadh)")
     print(f"   • 5  work profiles  (Riyadh)")
+    print(f"   • 15 date profiles  (Western US — incl. Abdul Kumshey + western female names)")
     print(f"   • ~30 mutual likes seeded (where likes table exists)")
 
 

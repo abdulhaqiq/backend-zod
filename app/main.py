@@ -1,25 +1,44 @@
 from contextlib import asynccontextmanager
+import uuid as _uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from jose import JWTError
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.security import decode_access_token
 from app.db.base import Base
-from app.db.session import engine
+from app.db.session import engine, AsyncSessionLocal
 
 # Import all models so Base.metadata knows about every table
 import app.models.user  # noqa: F401
 import app.models.otp  # noqa: F401
 import app.models.refresh_token  # noqa: F401
 import app.models.pickup_line  # noqa: F401
+import app.models.subscription_plan  # noqa: F401
+import app.models.user_score  # noqa: F401
+import app.models.user_compatibility  # noqa: F401
+import app.models.gift_card  # noqa: F401
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create all tables on startup
+    # Create all tables on startup (no-op for existing tables)
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+
+    # Incremental column migrations (safe to run on every restart)
+    from sqlalchemy import text as _text
+    async with engine.begin() as conn:
+        await conn.execute(_text(
+            "ALTER TABLE user_scores ADD COLUMN IF NOT EXISTS profile_hash VARCHAR(32)"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS id_scan_required BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # user_compatibility is created by create_all above; nothing to backfill
     
     import asyncio
     import logging
@@ -122,6 +141,78 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Scan-required API gate ────────────────────────────────────────────────────
+# When a user has face_scan_required=True or id_scan_required=True, every API
+# call is blocked with HTTP 423 EXCEPT the allowlisted paths below.
+# This enforces compliance server-side — the frontend cannot bypass it.
+
+_SCAN_GATE_ALLOW = (
+    "/api/v1/auth/",          # login, refresh, OTP
+    "/api/v1/upload/verify-face",  # face scan submit + status + history
+    "/api/v1/upload/verify-id",    # ID scan submit + status
+    "/api/v1/profile/me",     # read/update profile (needed to clear the flag)
+    "/api/v1/ws/",            # WebSockets (face-scan-required push)
+    "/ws/",
+    "/docs", "/redoc", "/openapi.json", "/health", "/",
+)
+
+
+@app.middleware("http")
+async def scan_required_gate(request: Request, call_next):
+    path = request.url.path
+
+    # Fast-path: always allow exempt routes without touching the DB
+    if any(path.startswith(p) for p in _SCAN_GATE_ALLOW):
+        return await call_next(request)
+
+    # Extract Bearer token (no-op if missing — other middleware handles 401)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return await call_next(request)
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    try:
+        payload = decode_access_token(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            return await call_next(request)
+        uid = _uuid.UUID(user_id)
+    except (JWTError, ValueError):
+        return await call_next(request)
+
+    # Single lightweight query — only fetch the two flag columns
+    from sqlalchemy import select, text as _text2
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(
+            _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
+            {"uid": str(uid)},
+        )).fetchone()
+
+    if row is None:
+        return await call_next(request)
+
+    face_req, id_req = bool(row[0]), bool(row[1])
+
+    if face_req:
+        return JSONResponse(
+            status_code=423,
+            content={
+                "detail": "Face verification required before accessing this feature.",
+                "code": "face_scan_required",
+            },
+        )
+    if id_req:
+        return JSONResponse(
+            status_code=423,
+            content={
+                "detail": "ID verification required before accessing this feature.",
+                "code": "id_scan_required",
+            },
+        )
+
+    return await call_next(request)
+
 
 app.include_router(api_router)
 

@@ -26,20 +26,29 @@ logger = logging.getLogger(__name__)
 BLUR_THRESHOLD       = 30     # Laplacian variance below this → blurry (relaxed)
 BRIGHTNESS_MIN       = 20     # Mean pixel below this → too dark
 BRIGHTNESS_MAX       = 250    # Mean pixel above this → overexposed
-NSFW_CONFIDENCE      = 0.75   # NudeNet label confidence threshold (raised to reduce false positives)
+NSFW_CONFIDENCE      = 0.40   # NudeNet confidence threshold for explicit (exposed) labels
+NSFW_LINGERIE_CONF   = 0.55   # Threshold for lingerie combination check
 MIN_AGE_ALLOWED      = 18     # DeepFace age estimate below this → rejected
 
 # Image corner region fraction (top-left, top-right, bottom-left, bottom-right)
 CORNER_FRACTION = 0.25
 
-# NudeNet labels that constitute explicit content
+# Hard reject — any exposure of intimate body parts
 NSFW_EXPLICIT_LABELS = {
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
-    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_BREAST_EXPOSED",       # nipple / bare breast
     "ANUS_EXPOSED",
     "MALE_BREAST_EXPOSED",
+    "BUTTOCKS_EXPOSED",            # bare buttocks / thong
 }
+
+# Lingerie rule: reject only when BOTH top AND bottom lingerie are detected together.
+# A dress with cleavage alone (FEMALE_BREAST_COVERED) is fine.
+# Panties alone from a wide shot may be fine.
+# But bra + panties together = underwear/lingerie shoot = reject.
+NSFW_LINGERIE_TOP    = "FEMALE_BREAST_COVERED"      # bra / bikini top
+NSFW_LINGERIE_BOTTOM = "FEMALE_GENITALIA_COVERED"   # panties / bikini bottom
 
 # Only well-known stock/copyright watermarks trigger rejection (not generic text)
 WATERMARK_KEYWORDS = {
@@ -186,19 +195,28 @@ def _check_nsfw(img_bytes: bytes):
 
         detections = detector.detect(tmp_path)
 
+        # Hard reject: explicit exposed content
         explicit_hits = [
             d for d in detections
             if d.get("class") in NSFW_EXPLICIT_LABELS
             and d.get("score", 0) >= NSFW_CONFIDENCE
         ]
 
-        if explicit_hits:
-            max_score = max(d["score"] for d in explicit_hits)
-            labels    = [d["class"] for d in explicit_hits]
+        # Combination rule: bra/bikini-top AND panties/bikini-bottom both detected = lingerie
+        # A dress showing cleavage alone is fine; panties alone in a wide shot may be fine.
+        # Only reject when BOTH are present at the same time (underwear/lingerie outfit).
+        top_score    = max((d["score"] for d in detections if d.get("class") == NSFW_LINGERIE_TOP), default=0)
+        bottom_score = max((d["score"] for d in detections if d.get("class") == NSFW_LINGERIE_BOTTOM), default=0)
+        lingerie_hit = top_score >= NSFW_LINGERIE_CONF and bottom_score >= NSFW_LINGERIE_CONF
+
+        if explicit_hits or lingerie_hit:
+            all_hits  = explicit_hits + ([{"class": "LINGERIE_SET", "score": max(top_score, bottom_score)}] if lingerie_hit else [])
+            max_score = max(d["score"] for d in all_hits)
+            labels    = [d["class"] for d in all_hits]
             return True, round(max_score, 4), labels
 
-        all_explicit = [d["score"] for d in detections if d.get("class") in NSFW_EXPLICIT_LABELS]
-        max_score    = round(max(all_explicit), 4) if all_explicit else 0.0
+        all_scored = [d["score"] for d in detections if d.get("class") in NSFW_EXPLICIT_LABELS]
+        max_score  = round(max(all_scored), 4) if all_scored else 0.0
         return False, max_score, []
 
     except Exception as exc:
@@ -219,47 +237,50 @@ def _check_face(img_bytes: bytes):
         img       = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_array = np.array(img)
 
-        # Pass 1: strict detection — fastest and most reliable when face is clear
-        try:
-            results = DeepFace.analyze(
-                img_path=img_array,
-                actions=["age"],
-                enforce_detection=True,
-                silent=True,
-            )
-        except Exception:
-            # Pass 2: lenient detection — catches tilted/small/partially visible faces
-            results = DeepFace.analyze(
-                img_path=img_array,
-                actions=["age"],
-                enforce_detection=False,
-                silent=True,
-            )
+        # Try each backend — move to next if current finds no face OR confidence is too low
+        DETECTOR_CHAIN = ["retinaface", "opencv", "mtcnn"]
+        CONF_THRESHOLD = 0.55  # accept face if any backend reaches this confidence
 
-        if isinstance(results, dict):
-            results = [results]
+        best_face_results = None
+        best_backend      = None
 
-        # Accept any result with meaningful face confidence (> 0.15 covers partial faces)
-        face_results = [r for r in results if r.get("face_confidence", 1.0) > 0.15]
+        for backend in DETECTOR_CHAIN:
+            try:
+                raw = DeepFace.analyze(
+                    img_path=img_array,
+                    actions=["age"],
+                    detector_backend=backend,
+                    enforce_detection=True,
+                    silent=True,
+                )
+                if isinstance(raw, dict):
+                    raw = [raw]
+                hits = [r for r in raw if r.get("face_confidence", 0.0) >= CONF_THRESHOLD]
+                if hits:
+                    best_face_results = hits
+                    best_backend      = backend
+                    break  # good enough — stop trying further backends
+                else:
+                    logger.info("Face check: backend=%s returned low confidence — trying next", backend)
+            except Exception as exc:
+                logger.info("Face check: backend=%s no face detected — %s", backend, str(exc)[:80])
 
-        if not face_results:
+        if not best_face_results:
+            logger.info("Face check: all backends failed or low confidence — rejecting")
             return False, 0, None, False
 
-        face_count = len(face_results)
-        ages       = [int(r["age"]) for r in face_results]
+        face_count = len(best_face_results)
+        ages       = [int(r["age"]) for r in best_face_results]
         avg_age    = int(sum(ages) / face_count) if ages else None
         min_age    = min(ages) if ages else None
         under_18   = min_age is not None and min_age < MIN_AGE_ALLOWED
-
-        logger.info("Face check | found=%d ages=%s under18=%s", face_count, ages, under_18)
+        logger.info("Face check | backend=%s found=%d ages=%s under18=%s conf=%s",
+                    best_backend, face_count, ages, under_18,
+                    [round(r.get("face_confidence", 0), 2) for r in best_face_results])
         return True, face_count, avg_age, under_18
 
     except Exception as exc:
-        msg = str(exc).lower()
-        if any(kw in msg for kw in ("face", "detector", "detected", "keras", "tensorflow", "could not", "no face")):
-            logger.info("Face check: no face detected — %s", str(exc)[:120])
-            return False, 0, None, False
-        logger.warning("Face check failed unexpectedly: %s", exc, exc_info=True)
+        logger.warning("Face check pipeline failed: %s", exc, exc_info=True)
         return False, 0, None, False
 
 

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_pro_user
 from app.db.session import get_db
 from app.models.user import User
 
@@ -36,8 +36,7 @@ class LocationUpdateRequest(BaseModel):
 
 
 class LocationResponse(BaseModel):
-    latitude: float
-    longitude: float
+    # Coordinates are intentionally omitted — never sent back to the client
     city: str | None
     address: str | None
     country: str | None
@@ -99,7 +98,18 @@ async def update_location(
     """
     Called automatically every time the app opens (if location permission granted).
     Stores GPS coordinates and reverse-geocoded address data.
+    Skipped when the user has travel mode enabled — the manually chosen city is
+    preserved until they explicitly change or disable it.
     """
+    # Guard: never overwrite a manually set travel location with real GPS
+    if current_user.travel_mode_enabled:
+        return {
+            "city":    current_user.city,
+            "address": current_user.address,
+            "country": current_user.country,
+            "location_updated_at": current_user.location_updated_at,
+        }
+
     # Try Google Maps first; fall back to client-supplied values
     geo = await _google_reverse_geocode(body.latitude, body.longitude)
 
@@ -122,12 +132,85 @@ async def update_location(
     )
 
     return {
-        "latitude": body.latitude,
-        "longitude": body.longitude,
         "city": city,
         "address": address,
         "country": country,
         "location_updated_at": current_user.location_updated_at,
+    }
+
+
+# ─── Geocode a place_id / city name to lat/lon ────────────────────────────────
+
+async def _geocode_place(place_id: str | None, city: str, country: str) -> tuple[float, float] | None:
+    """
+    Returns (latitude, longitude) for the given place_id or city+country string.
+    Uses Google Geocoding API when GOOGLE_MAPS_API_KEY is set, otherwise None.
+    """
+    key = settings.GOOGLE_MAPS_API_KEY
+    if not key:
+        return None
+
+    # Prefer place_id geocoding — most accurate
+    if place_id:
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?place_id={place_id}&key={key}"
+    else:
+        q = f"{city}, {country}"
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={q}&key={key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(url)
+        data = r.json()
+        if data.get("status") == "OK" and data.get("results"):
+            loc = data["results"][0]["geometry"]["location"]
+            return float(loc["lat"]), float(loc["lng"])
+    except Exception as exc:
+        logger.warning("Geocode failed for place_id=%s city=%s: %s", place_id, city, exc)
+    return None
+
+
+class ChangeCityRequest(BaseModel):
+    city: str
+    country: str
+    place_id: str | None = None
+
+
+@router.post("/change-city", summary="Manually set discovery location (travel mode) — Pro only")
+async def change_city(
+    body: ChangeCityRequest,
+    current_user: User = Depends(get_pro_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Updates the user's discovery latitude/longitude to the selected city.
+    Also sets city, country, travel_mode_enabled=True, travel_city, travel_country.
+    This is exactly how Bumble's travel mode works — the feed will now show
+    profiles from the new city.
+    """
+    coords = await _geocode_place(body.place_id, body.city, body.country)
+
+    current_user.city               = body.city
+    current_user.country            = body.country
+    current_user.travel_mode_enabled = True
+    current_user.travel_city        = body.city
+    current_user.travel_country     = body.country
+
+    if coords:
+        current_user.latitude  = coords[0]
+        current_user.longitude = coords[1]
+        current_user.location_updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+
+    logger.info(
+        "Travel mode set for user %s → %s, %s (coords=%s)",
+        current_user.id, body.city, body.country, coords,
+    )
+
+    return {
+        "city":    body.city,
+        "country": body.country,
+        "travel_mode_enabled": True,
     }
 
 
@@ -255,10 +338,17 @@ async def city_search(
             data = r.json()
             if data.get("status") == "OK":
                 results = []
+                seen = set()
                 for pred in data.get("predictions", [])[:8]:
                     terms = pred.get("terms", [])
                     city    = terms[0]["value"] if len(terms) >= 1 else pred["description"]
+                    # Use full description for country to avoid "USA" collisions
+                    # e.g. "London, Kentucky, United States" → country="United States"
                     country = terms[-1]["value"] if len(terms) >= 2 else ""
+                    # If only 2 terms (city, country) that's fine; if 3+ use last
+                    # For "London, Ontario, Canada" → terms = [London, Ontario, Canada]
+                    if len(terms) >= 3:
+                        country = terms[-1]["value"]
                     place_id = pred.get("place_id", "")
                     flag = "🌍"
                     if place_id:
@@ -273,10 +363,17 @@ async def city_search(
                             for comp in det.get("result", {}).get("address_components", []):
                                 if "country" in comp.get("types", []):
                                     flag = _flag(comp.get("short_name", ""))
+                                    # Use full country name from geocode details
+                                    country = comp.get("long_name", country)
                                     break
                         except Exception:
                             pass
-                    results.append({"city": city, "country": country, "flag": flag})
+                    # Use full description as dedup key to handle same-name cities
+                    dedup_key = pred.get("description", f"{city}-{country}")
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+                    results.append({"city": city, "country": country, "flag": flag, "place_id": place_id})
                 return {"results": results}
         except Exception as exc:
             logger.warning("Places Autocomplete failed: %s", exc)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -24,12 +24,41 @@ from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
 from app.models.user_score import UserScore
-from app.services.scoring import compatibility_between, get_or_create_score
+from app.models.subscription_plan import SubscriptionPlan
+from app.services.scoring import compatibility_between, get_or_create_score, get_or_compute_compatibility, heuristic_score_obj
+
+# ─── Plan feature helpers ──────────────────────────────────────────────────────
+
+async def _get_feature_limit(tier: str, feature_key: str, db: AsyncSession, fallback: int = 5) -> int:
+    """
+    Look up a quantity-type feature limit from the canonical monthly plan
+    for the given tier. Falls back to `fallback` if the plan or feature is
+    not found.
+
+    tier: "pro" | "premium_plus"
+    feature_key: e.g. "super_likes", "profile_boosts"
+    """
+    tier_keyword = "Premium+" if tier == "premium_plus" else "Pro"
+    result = await db.execute(
+        select(SubscriptionPlan).where(
+            SubscriptionPlan.is_active.is_(True),
+            SubscriptionPlan.name.icontains(tier_keyword),
+            SubscriptionPlan.interval == "monthly",
+        ).limit(1)
+    )
+    plan = result.scalar_one_or_none()
+    if plan and plan.features:
+        for feat in plan.features:
+            if isinstance(feat, dict) and feat.get("key") == feature_key:
+                return int(feat.get("limit", fallback))
+    return fallback
 
 # Lazy import to avoid circular — resolved at call time
 def _get_notify_manager():
     from app.api.v1.endpoints.chat import notify_manager
     return notify_manager
+
+from app.core.push import send_push_notification
 
 _log = logging.getLogger(__name__)
 
@@ -140,12 +169,12 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
     return {
         "id":         str(u.id),
         "name":       u.full_name,
-        "age":        age,
-        "verified":   u.is_verified,
+        "age":        None if u.hide_age else age,
+        "verified":   u.verification_status == "verified",
         "premium":    u.subscription_tier == "pro",
         "location":   u.city,
-        "distance":   dist_str,
-        "distance_km": distance_km,
+        "distance":   None if u.hide_distance else dist_str,
+        "university": u.university,
         "about":      u.bio,
         "images":     list(u.photos or []),
         "interests":  _labels(u.interests, emoji_prefix=False),
@@ -183,6 +212,27 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
 
 
 # ── Query builder ─────────────────────────────────────────────────────────────
+
+def _resolve_origin_coords(me: User) -> tuple[float | None, float | None]:
+    """
+    Return the (lat, lon) that should be used as THIS user's origin for all
+    distance calculations and distance-filter SQL.
+
+    Priority:
+      1. Travel city coordinates  — when travel_mode_enabled is True AND
+         latitude/longitude are set (they are set by /location/change-city).
+      2. Real GPS coordinates     — latitude/longitude from /location/update.
+      3. None, None               — no location available at all.
+
+    This guarantees the discover feed always filters from the correct origin
+    regardless of whether real GPS was updated after travel mode was set.
+    """
+    if me.travel_mode_enabled and me.latitude is not None and me.longitude is not None:
+        return float(me.latitude), float(me.longitude)
+    if not me.travel_mode_enabled and me.latitude is not None and me.longitude is not None:
+        return float(me.latitude), float(me.longitude)
+    return None, None
+
 
 async def _fetch_discover_profiles(
     me: User,
@@ -233,13 +283,33 @@ async def _fetch_discover_profiles(
     if swiped_ids:
         stmt = stmt.where(User.id.not_in(swiped_ids))
 
+    # ── Exclude already-matched profiles ─────────────────────────────────────
+    # Matches are stored with stable ordering (smaller UUID first), so we need
+    # to check both columns.
+    matched_result = await db.execute(
+        text("""
+            SELECT CASE
+                WHEN user1_id = CAST(:uid AS uuid) THEN user2_id
+                ELSE user1_id
+            END AS other_id
+            FROM matches
+            WHERE user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid)
+        """).bindparams(uid=str(me.id))
+    )
+    matched_ids = [row[0] for row in matched_result.fetchall()]
+    if matched_ids:
+        stmt = stmt.where(User.id.not_in(matched_ids))
+
+    # ── Resolve origin: travel city (if active) or real GPS ──────────────────
+    # This is the single source of truth for ALL distance filtering below.
+    _origin_lat, _origin_lon = _resolve_origin_coords(me)
+
     # ── Distance filter pushed into SQL (Haversine bounding-box + exact check) ─
-    # When we have the current user's location and a max_km cap, filter in SQL so
-    # we don't fetch thousands of far-away rows only to drop them in Python.
-    if me.latitude is not None and me.longitude is not None and me.filter_max_distance_km:
+    # When we have an origin and a max_km cap is set, filter in SQL so we don't
+    # fetch thousands of far-away rows only to drop them in Python.
+    # null filter_max_distance_km means "any distance" — no SQL filter.
+    if _origin_lat is not None and _origin_lon is not None and me.filter_max_distance_km is not None:
         _max_km = float(me.filter_max_distance_km)
-        _lat    = float(me.latitude)
-        _lon    = float(me.longitude)
         stmt = stmt.where(
             text(
                 # Haversine entirely in SQL — no PostGIS required.
@@ -249,7 +319,7 @@ async def _fetch_discover_profiles(
                 "  COS(RADIANS(:lat)) * COS(RADIANS(latitude)) * "
                 "  POWER(SIN(RADIANS(longitude - :lon) / 2), 2)"
                 ")) <= :max_km"
-            ).bindparams(lat=_lat, lon=_lon, max_km=_max_km)
+            ).bindparams(lat=_origin_lat, lon=_origin_lon, max_km=_max_km)
         )
 
     # Work mode: only show users who have a work profile set up
@@ -258,9 +328,12 @@ async def _fetch_discover_profiles(
             User.work_matching_goals.isnot(None) | User.work_commitment_level_id.isnot(None)
         )
 
-    # ── Verified-only filter ──────────────────────────────────────────────────
+    # ── Verified-only filter (face-verified profiles only) ───────────────────
+    # is_verified=True is given to ALL phone-signed-in users so it can't be
+    # used here.  verification_status='verified' means the user passed face
+    # verification and is the correct signal for the "Verified only" filter.
     if me.filter_verified_only:
-        stmt = stmt.where(User.is_verified.is_(True))
+        stmt = stmt.where(User.verification_status == "verified")
 
     # ── Age filter ────────────────────────────────────────────────────────────
     if me.filter_age_min or me.filter_age_max:
@@ -357,15 +430,19 @@ async def _fetch_discover_profiles(
 
     # ── Distance calculation (Python-side, for display only) ─────────────────
     # SQL already excluded out-of-range profiles when coordinates are available.
-    # Here we only compute the display string and handle any edge cases.
-    me_lat = me.latitude
-    me_lon = me.longitude
+    # me_lat / me_lon come from _resolve_origin_coords above so they always
+    # reflect travel city when travel_mode_enabled, otherwise real GPS.
+    me_lat = _origin_lat
+    me_lon = _origin_lon
     max_km = me.filter_max_distance_km
 
     has_my_location = me_lat is not None and me_lon is not None
 
     # ── Compatibility scores ──────────────────────────────────────────────────
-    my_score = await get_or_create_score(me, db)
+    try:
+        my_score = await get_or_create_score(me, db)
+    except Exception:
+        my_score = heuristic_score_obj(me)  # type: ignore[assignment]
 
     # Bulk-fetch scores for all candidates in one query
     candidate_ids = [u.id for u in candidates]
@@ -387,8 +464,8 @@ async def _fetch_discover_profiles(
         elif max_km is not None and has_my_location and (u.latitude is None or u.longitude is None):
             continue
 
-        their_score = score_rows.get(u.id)
-        compat = compatibility_between(my_score, their_score) if their_score else None
+        their_score = score_rows.get(u.id) or heuristic_score_obj(u)
+        compat = compatibility_between(my_score, their_score)
 
         profiles.append(_build_profile(u, dist_km, compat))
         if len(profiles) >= limit:
@@ -420,6 +497,52 @@ async def record_swipe(
     if body.mode not in ("date", "work"):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="mode must be 'date' or 'work'")
+
+    # ── Super-like gate: Pro subscribers only, 10 per calendar month ─────────
+    if body.direction == "super":
+        if current_user.subscription_tier not in ("pro", "premium_plus"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Super likes are a Pro feature. Upgrade to send super likes.",
+            )
+
+        now      = datetime.now(timezone.utc)
+        reset_at = current_user.super_likes_reset_at
+
+        # Get limit from the subscription plan in DB (weekly period)
+        sl_limit = await _get_feature_limit(
+            current_user.subscription_tier, "super_likes", db, fallback=5
+        )
+
+        # Reset every 7 days (weekly)
+        need_reset = (
+            reset_at is None
+            or (now - reset_at).total_seconds() >= 7 * 24 * 3600
+        )
+        if need_reset:
+            current_user.super_likes_remaining = sl_limit
+            current_user.super_likes_reset_at  = now
+
+        if current_user.super_likes_remaining <= 0:
+            next_reset  = (reset_at + timedelta(days=7)) if reset_at else now
+            next_str    = next_reset.strftime("%-d %b")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"No super likes remaining. Your next {sl_limit} drop on {next_str}.",
+            )
+
+        current_user.super_likes_remaining -= 1
+        db.add(current_user)
+
+    # Verify the swiped profile still exists — it may have been deleted while
+    # the card was on-screen (or the client has a stale local cache).
+    target_exists = await db.execute(
+        select(User.id).where(User.id == body.swiped_id)
+    )
+    if target_exists.scalar_one_or_none() is None:
+        # Profile no longer exists — silently accept so the client can clear
+        # its local cache without crashing.
+        return {"match": False, "swiped_id": body.swiped_id, "stale": True}
 
     # Upsert — if they somehow swipe twice, update direction without error
     await db.execute(
@@ -486,13 +609,49 @@ async def record_swipe(
         liker_profile = _build_profile(current_user, None)
 
         if is_match:
-            # Push match event to both users
-            match_payload = {"type": "match", "profile": liker_profile}
-            await nm.send_to(body.swiped_id, match_payload)
+            # Fetch the swiped user once — needed for WS + push
             swiped_result = await db.execute(select(User).where(User.id == body.swiped_id))
             swiped_user = swiped_result.scalar_one_or_none()
+
+            # ── WebSocket: real-time match event to both users ────────────────
+            match_payload = {"type": "match", "profile": liker_profile}
+            await nm.send_to(body.swiped_id, match_payload)
             if swiped_user:
-                await nm.send_to(str(current_user.id), {"type": "match", "profile": _build_profile(swiped_user, None)})
+                await nm.send_to(
+                    str(current_user.id),
+                    {"type": "match", "profile": _build_profile(swiped_user, None)},
+                )
+
+            # ── Push notification: for users not on the WS (background/killed) ─
+            liker_name   = current_user.full_name or "Someone"
+            liker_image  = (current_user.photos or [None])[0] if current_user.photos else None
+            swiped_name  = swiped_user.full_name if swiped_user else "Someone"
+            swiped_image = (swiped_user.photos or [None])[0] if (swiped_user and swiped_user.photos) else None
+
+            # Notify the person who was swiped on
+            await send_push_notification(
+                swiped_user.push_token if swiped_user else None,
+                title="It's a Match! 🎉",
+                body=f"You and {liker_name} liked each other. Say hi!",
+                data={
+                    "type":          "match",
+                    "other_user_id": str(current_user.id),
+                    "other_name":    liker_name,
+                    "other_image":   liker_image,
+                },
+            )
+            # Notify the swiper (may have already left the app)
+            await send_push_notification(
+                current_user.push_token,
+                title="It's a Match! 🎉",
+                body=f"You and {swiped_name} liked each other. Say hi!",
+                data={
+                    "type":          "match",
+                    "other_user_id": body.swiped_id,
+                    "other_name":    swiped_name,
+                    "other_image":   swiped_image,
+                },
+            )
         else:
             # Push liked_you (or super_like) event to the person being liked
             event_type = "super_like" if is_super else "liked_you"
@@ -501,7 +660,70 @@ async def record_swipe(
                 payload["ice_breaker"] = body.ice_breaker
             await nm.send_to(body.swiped_id, payload)
 
-    return {"recorded": True, "match": is_match, "super": is_super}
+            # Push notification for liked_you / super_like (backgrounded user)
+            liker_name = current_user.full_name or "Someone"
+            swiped_result = await db.execute(select(User).where(User.id == body.swiped_id))
+            swiped_user   = swiped_result.scalar_one_or_none()
+            if is_super:
+                await send_push_notification(
+                    swiped_user.push_token if swiped_user else None,
+                    title=f"⭐ {liker_name} super-liked you!",
+                    body="Open the app to see who it is.",
+                    data={"type": "super_like", "other_user_id": str(current_user.id)},
+                )
+            else:
+                await send_push_notification(
+                    swiped_user.push_token if swiped_user else None,
+                    title=f"❤️ {liker_name} liked you!",
+                    body="Open the app to see who it is.",
+                    data={"type": "liked_you", "other_user_id": str(current_user.id)},
+                )
+
+    return {
+        "recorded": True,
+        "match": is_match,
+        "super": is_super,
+        "super_likes_remaining": current_user.super_likes_remaining if is_super else None,
+    }
+
+
+@router.get("/profile/{user_id}", summary="View a matched user's public profile")
+async def get_match_profile(
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the discover-style profile dict for a matched user, including compatibility."""
+    import uuid as _uuid
+    await _ensure_cache(db)
+    try:
+        uid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user id")
+
+    result = await db.execute(select(User).where(User.id == uid))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Distance
+    distance_km: float | None = None
+    if (current_user.latitude is not None and current_user.longitude is not None
+            and target.latitude is not None and target.longitude is not None):
+        distance_km = _haversine_km(
+            float(current_user.latitude), float(current_user.longitude),
+            float(target.latitude),       float(target.longitude),
+        )
+
+    # Compatibility — cached in user_compatibility table, only recomputed when
+    # either user's profile has changed (detected by profile_hash comparison).
+    compat: dict | None = None
+    try:
+        compat = await get_or_compute_compatibility(current_user, target, db)
+    except Exception:
+        _log.warning("Could not compute compatibility for %s ↔ %s", current_user.id, uid)
+
+    return _build_profile(target, distance_km, compat)
 
 
 @router.get("/counts", summary="Get badge counts for the current user")
@@ -513,7 +735,15 @@ async def get_counts(
     uid = str(current_user.id)
 
     liked_row = await db.execute(
-        text("SELECT COUNT(*) FROM likes WHERE liked_id = CAST(:uid AS uuid)").bindparams(uid=uid)
+        text("""
+            SELECT COUNT(*) FROM likes l
+            WHERE l.liked_id = CAST(:uid AS uuid)
+              AND NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE (m.user1_id = l.liker_id AND m.user2_id = CAST(:uid AS uuid))
+                     OR (m.user2_id = l.liker_id AND m.user1_id = CAST(:uid AS uuid))
+              )
+        """).bindparams(uid=uid)
     )
     liked_count = liked_row.scalar() or 0
 
@@ -558,6 +788,11 @@ async def get_liked_you(
                                AND s.direction = 'super'
                                AND s.mode = 'date'
             WHERE l.liked_id = CAST(:uid AS uuid)
+              AND NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE (m.user1_id = l.liker_id AND m.user2_id = CAST(:uid AS uuid))
+                     OR (m.user2_id = l.liker_id AND m.user1_id = CAST(:uid AS uuid))
+              )
             ORDER BY l.created_at DESC
             LIMIT 50
         """).bindparams(uid=uid)
@@ -605,6 +840,48 @@ async def reset_swipes(
     )
     await db.commit()
     return {"reset": True, "deleted": result.rowcount}
+
+
+@router.get("/ai-picks", summary="Top 10 profiles sorted by real compatibility score, using current filters")
+async def get_ai_picks(
+    mode: str = Query("date", description="Feed mode: 'date' or 'work'"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Returns the top 10 profiles from the user's filtered discovery pool,
+    ranked by their real pairwise compatibility score (highest first).
+    Each profile includes:
+      - compatibility.percent  – the real match score (0-100)
+      - compatibility.brief    – AI-generated match reason
+      - compatibility.insights – top matching categories
+      - shared_interests       – interests in common with the current user
+    """
+    await _ensure_cache(db)
+
+    # Over-fetch so we have enough to sort after distance filtering
+    pool = await _fetch_discover_profiles(current_user, db, page=0, limit=50, mode=mode)
+
+    # Sort by real compatibility score descending; profiles without a score go last
+    pool.sort(key=lambda p: (p.get("compatibility") or {}).get("percent", 0), reverse=True)
+    top10 = pool[:10]
+
+    # Compute shared interests (server-side) for each pick
+    my_interest_labels: set[str] = {
+        item["label"].lower()
+        for item in _labels(current_user.interests)
+        if item.get("label")
+    }
+
+    for p in top10:
+        their_interests = p.get("interests") or []
+        shared = [
+            item for item in their_interests
+            if isinstance(item, dict) and item.get("label", "").lower() in my_interest_labels
+        ]
+        p["shared_interests"] = shared
+
+    return {"profiles": top10, "total": len(top10)}
 
 
 @router.get("/feed", summary="Get paginated discovery feed based on saved filters")

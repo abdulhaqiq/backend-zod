@@ -72,3 +72,21 @@ async def get_current_user_allow_inactive(
     (e.g. the snooze toggle itself, so they can turn snooze back off).
     """
     return await _resolve_user(credentials, db)
+
+
+async def get_pro_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Dependency that requires a valid Bearer token AND an active Pro subscription.
+
+    Raises HTTP 403 for any authenticated user whose subscription_tier is not 'pro'.
+    Use this on every endpoint that is a Pro-only feature so that backend
+    enforcement is independent of any frontend checks.
+    """
+    if current_user.subscription_tier != "pro":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This feature requires a Pro subscription. Upgrade to unlock it.",
+        )
+    return current_user

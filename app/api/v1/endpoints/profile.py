@@ -15,16 +15,25 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_current_user_allow_inactive
+from app.core.deps import get_current_user, get_current_user_allow_inactive, get_pro_user
 from app.core.photo_analyzer import _check_quality
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.profile import MeResponse, ProfileUpdateRequest
+from app.schemas.profile import FilterUpdateRequest, MeResponse, ProfileUpdateRequest
 from app.services.scoring import compute_and_save_score
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+
+# ── Fields that can NEVER be changed through any user-facing endpoint ─────────
+# Even if they somehow appear in the request body (e.g. via raw API tweaks),
+# the update handler will silently strip them and log a warning.
+_IMMUTABLE_FIELDS: frozenset[str] = frozenset({
+    "phone",       # identity credential — must go through OTP re-verification
+    "apple_id",    # identity credential — set at sign-in only
+    "id",          # primary key — never writable
+})
 
 # ── Allowlist: fields a user may set on their own profile ─────────────────────
 # Sensitive fields (subscription_tier, is_active, is_verified, verification_status,
@@ -39,7 +48,10 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "education_level_id", "looking_for_id", "family_plans_id",
     "have_kids_id", "star_sign_id", "religion_id", "ethnicity_id",
     "is_onboarded", "dark_mode", "best_photo_enabled",
-    "city", "hometown", "address", "country", "latitude", "longitude",
+    "city", "hometown", "address", "country",
+    # NOTE: latitude/longitude are intentionally excluded — coordinates must be
+    # set only through POST /location/update (GPS) or POST /location/change-city
+    # (travel mode). Direct coordinate injection via PATCH is not permitted.
     "voice_prompts", "work_experience", "education",
     "work_photos", "work_prompts", "work_matching_goals",
     "work_are_you_hiring", "work_commitment_level_id", "work_skills",
@@ -54,9 +66,31 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "filter_height_min", "filter_height_max",
     # Mood status
     "mood_emoji", "mood_text",
+    # Privacy + university
+    "hide_age", "hide_distance", "university", "require_verified_to_chat",
+    # Pro features
+    "is_incognito", "travel_mode_enabled", "auto_zod_enabled",
+    "travel_city", "travel_country",
 })
 
 _LIFESTYLE_KEYS: frozenset[str] = frozenset({"drinking", "smoking", "exercise", "diet"})
+
+# ── Pro-only filter fields — hard-rejected for free users on PATCH ────────────
+_PRO_ONLY_FILTER_FIELDS: frozenset[str] = frozenset({
+    "filter_purpose", "filter_looking_for", "filter_education_level",
+    "filter_family_plans", "filter_have_kids",
+})
+
+# ── Pro-only profile/feature fields — hard-rejected for free users on PATCH ───
+# These control features that are exclusively part of the Pro tier.
+# A free user posting these fields receives a 403 so the response is explicit.
+_PRO_ONLY_PROFILE_FIELDS: frozenset[str] = frozenset({
+    "is_incognito",
+    "travel_mode_enabled",
+    "travel_city",
+    "travel_country",
+    "auto_zod_enabled",
+})
 
 
 @router.get("/me", response_model=MeResponse, summary="Get current user profile")
@@ -72,6 +106,43 @@ async def update_me(
     db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
     update_data = payload.model_dump(exclude_unset=True)
+
+    # Hard-strip immutable identity fields — phone, apple_id, id can never be
+    # changed via this endpoint, regardless of what the request body contains.
+    attempted_immutable = _IMMUTABLE_FIELDS & update_data.keys()
+    if attempted_immutable:
+        _log.warning(
+            "User %s attempted to update immutable field(s) %s — silently ignored.",
+            current_user.id,
+            attempted_immutable,
+        )
+        for f in attempted_immutable:
+            del update_data[f]
+
+    # Enforce Pro subscription for Pro-gated feature and filter fields.
+    # Return explicit 403 so free users (and anyone bypassing the frontend)
+    # receive a clear error rather than a silent no-op.
+    if current_user.subscription_tier != "pro":
+        # Feature fields — hard reject
+        pro_feature_attempted = _PRO_ONLY_PROFILE_FIELDS & update_data.keys()
+        if pro_feature_attempted:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Field(s) {sorted(pro_feature_attempted)} require a Pro subscription. "
+                    "Upgrade to unlock these features."
+                ),
+            )
+        # Filter fields — hard reject
+        pro_filter_attempted = _PRO_ONLY_FILTER_FIELDS & update_data.keys()
+        if pro_filter_attempted:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Filter(s) {sorted(pro_filter_attempted)} require a Pro subscription. "
+                    "Upgrade to unlock advanced filters."
+                ),
+            )
 
     if not update_data:
         raise HTTPException(
@@ -106,6 +177,15 @@ async def update_me(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="gender_id must be 223 (Male) or 224 (Female).",
             )
+        # Photo minimum enforcement — must keep at least 2 photos at all times
+        if field == "photos" and value is not None:
+            filled = [u for u in value if u]
+            if current_user.is_onboarded and len(filled) < 2:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Your profile must have at least 2 photos.",
+                )
+
         # Email uniqueness check — skip if same as current
         if field == "email" and value and value != current_user.email:
             existing = await db.execute(
@@ -162,24 +242,23 @@ async def select_best_photo(
         # Nothing to reorder — return as-is
         return MeResponse.model_validate(current_user)
 
-    scored: list[tuple[str, float]] = []
+    async def _score_photo(client: httpx.AsyncClient, url: str) -> tuple[str, float]:
+        try:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                _log.warning("best-photo: could not fetch %s (status %s)", url, resp.status_code)
+                return (url, 0.0)
+            _, _, _, _, quality_score = await asyncio.to_thread(_check_quality, resp.content)
+            _log.info("best-photo: %s → quality %.3f", url, quality_score)
+            return (url, quality_score)
+        except Exception as exc:
+            _log.warning("best-photo: error scoring %s: %s", url, exc)
+            return (url, 0.0)
 
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for url in photos:
-            try:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    _log.warning("best-photo: could not fetch %s (status %s)", url, resp.status_code)
-                    scored.append((url, 0.0))
-                    continue
-
-                _, _, _, _, quality_score = await asyncio.to_thread(_check_quality, resp.content)
-                _log.info("best-photo: %s → quality %.3f", url, quality_score)
-                scored.append((url, quality_score))
-
-            except Exception as exc:
-                _log.warning("best-photo: error scoring %s: %s", url, exc)
-                scored.append((url, 0.0))
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        scored: list[tuple[str, float]] = list(
+            await asyncio.gather(*[_score_photo(client, url) for url in photos])
+        )
 
     scored.sort(key=lambda x: x[1], reverse=True)
     reordered = [url for url, _ in scored]
@@ -237,6 +316,60 @@ async def check_email(
     )
     taken = result.scalar_one_or_none() is not None
     return {"available": not taken}
+
+
+_FILTER_FIELDS: frozenset[str] = frozenset({
+    "filter_age_min", "filter_age_max", "filter_max_distance_km",
+    "filter_verified_only", "filter_star_signs", "filter_interests", "filter_languages",
+    "filter_purpose", "filter_looking_for", "filter_education_level",
+    "filter_family_plans", "filter_have_kids", "filter_ethnicities",
+    "filter_exercise", "filter_drinking", "filter_smoking",
+    "filter_height_min", "filter_height_max",
+})
+
+_PRO_FILTER_FIELDS: frozenset[str] = frozenset({
+    "filter_purpose", "filter_looking_for", "filter_education_level",
+    "filter_family_plans", "filter_have_kids",
+})
+
+
+@router.patch("/me/filters", response_model=MeResponse, summary="Save discover filter preferences")
+async def update_filters(
+    payload: FilterUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MeResponse:
+    """
+    Dedicated endpoint for saving discover filter preferences.
+    Only filter_* fields are accepted. Pro-only filters are silently
+    ignored for free users.
+    """
+    data = payload.model_dump(exclude_unset=True)
+
+    if not data:
+        # Nothing sent — just return the current profile unchanged
+        return MeResponse.model_validate(current_user)
+
+    # Reject Pro-only filters for free users — explicit 403 so any client
+    # attempting to bypass frontend checks gets a clear error.
+    if current_user.subscription_tier != "pro":
+        pro_attempted = _PRO_FILTER_FIELDS & data.keys()
+        if pro_attempted:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Filter(s) {sorted(pro_attempted)} require a Pro subscription. "
+                    "Upgrade to unlock advanced filters."
+                ),
+            )
+
+    for field, value in data.items():
+        if field in _FILTER_FIELDS:
+            setattr(current_user, field, value)
+
+    await db.commit()
+    await db.refresh(current_user)
+    return MeResponse.model_validate(current_user)
 
 
 @router.patch("/me/snooze", summary="Toggle snooze mode — hides profile from discovery")

@@ -2,30 +2,40 @@
 Subscription endpoints — Apple IAP via RevenueCat.
 
 Flow:
-  1. App purchases via Apple IAP (react-native-purchases / RevenueCat SDK)
-  2. RevenueCat validates receipt with Apple, grants entitlement
-  3. App POSTs to  /subscription/verify  with RevenueCat customer_id
-  4. Backend calls RevenueCat REST API to confirm entitlement, updates DB
-  5. RevenueCat POSTs to /subscription/webhook on renewals / expirations
+  1. App fetches  GET /subscription/plans  to display available plans
+  2. App purchases via Apple IAP (react-native-purchases / RevenueCat SDK)
+     using the plan's apple_product_id
+  3. RevenueCat validates receipt with Apple, grants entitlement
+  4. App POSTs to  /subscription/verify  with RevenueCat customer_id
+  5. Backend calls RevenueCat REST API to confirm entitlement, updates DB
+  6. RevenueCat POSTs to /subscription/webhook on renewals / expirations
+
+Note: Apple controls all billing, renewals, and refunds — this API cannot
+      charge or cancel through Apple directly. What we CAN do:
+        • Serve plan metadata from DB (price, features, apple_product_id)
+        • Manually grant/revoke Pro access for any user (admin only)
+        • Update plan metadata without shipping an app update
 
 Required env vars:
   REVENUECAT_SECRET_KEY   — RevenueCat secret (V1) API key
   REVENUECAT_WEBHOOK_AUTH — webhook authorization header value (optional)
 """
 
-import hashlib
-import hmac
 import logging
-from datetime import datetime, timezone
+import uuid as _uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.subscription_plan import SubscriptionPlan
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -78,6 +88,62 @@ class StatusResponse(BaseModel):
     expires_at: datetime | None
 
 
+class PlanResponse(BaseModel):
+    id: str
+    name: str
+    tier: str                # "pro" | "premium_plus"
+    apple_product_id: str
+    interval: str            # "weekly" | "monthly" | "sixmonth" | "annual"
+    price_display: str       # e.g. "$9.99/mo"
+    price_usd: float
+    badge: str | None        # e.g. "Best Value"
+    description: str | None
+    features: list[Any]      # structured dicts or legacy strings
+    sort_order: int
+
+    model_config = {"from_attributes": True}
+
+
+class PlanCreateRequest(BaseModel):
+    name: str = Field(..., max_length=64)
+    apple_product_id: str = Field(..., max_length=128)
+    interval: str = Field(..., pattern="^(weekly|monthly|sixmonth|annual)$")
+    price_display: str = Field(..., max_length=32)
+    price_usd: float = Field(..., gt=0)
+    badge: str | None = Field(None, max_length=32)
+    description: str | None = None
+    features: list[Any] = []
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class PlanUpdateRequest(BaseModel):
+    name: str | None = Field(None, max_length=64)
+    apple_product_id: str | None = Field(None, max_length=128)
+    interval: str | None = Field(None, pattern="^(weekly|monthly|sixmonth|annual)$")
+    price_display: str | None = Field(None, max_length=32)
+    price_usd: float | None = Field(None, gt=0)
+    badge: str | None = None
+    description: str | None = None
+    features: list[Any] | None = None
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
+class GrantRequest(BaseModel):
+    user_id: str
+    tier: str = Field("pro", pattern="^(free|pro)$")
+    note: str | None = None  # internal reason (e.g. "comp account", "support ticket")
+
+
+# ─── Admin dependency ──────────────────────────────────────────────────────────
+
+async def _require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    return current_user
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/config", summary="Return public RevenueCat SDK key for the client")
@@ -91,10 +157,74 @@ async def get_config(_: User = Depends(get_current_user)):
     return {"sdk_key": settings.REVENUECAT_PUBLIC_KEY}
 
 
+class MyFeaturesResponse(BaseModel):
+    tier: str
+    super_likes_limit: int
+    super_likes_remaining: int
+    super_likes_reset_at: datetime | None
+    super_likes_resets_in_days: int | None
+    profile_boosts_limit: int
+    features: list[dict]   # full structured feature list from the canonical plan
+
+
+@router.get("/my-features", response_model=MyFeaturesResponse, summary="Get the current user's plan limits and remaining quotas")
+async def get_my_features(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """
+    Returns the active plan's structured features for the current user,
+    combined with live quota state (super_likes_remaining, reset date).
+    """
+    tier = current_user.subscription_tier  # "free" | "pro" | "premium_plus"
+
+    # Look up the canonical monthly plan for this tier
+    tier_keyword = "Premium+" if tier == "premium_plus" else "Pro"
+    result = await db.execute(
+        select(SubscriptionPlan).where(
+            SubscriptionPlan.is_active.is_(True),
+            SubscriptionPlan.name.icontains(tier_keyword),
+            SubscriptionPlan.interval == "monthly",
+        ).limit(1)
+    )
+    plan = result.scalar_one_or_none()
+
+    # Only keep structured dict features (discard legacy plain strings)
+    raw_features: list[Any] = list(plan.features) if plan and plan.features else []
+    features: list[dict] = [f for f in raw_features if isinstance(f, dict)]
+
+    # Extract key limits from structured features
+    sl_limit    = next((int(f["limit"]) for f in features if f.get("key") == "super_likes"),    0)
+    boost_limit = next((int(f["limit"]) for f in features if f.get("key") == "profile_boosts"), 0)
+
+    # Compute days until super like reset
+    now      = datetime.now(timezone.utc)
+    reset_at = current_user.super_likes_reset_at
+    resets_in_days: int | None = None
+    if reset_at is not None:
+        reset_at_aware = reset_at if reset_at.tzinfo else reset_at.replace(tzinfo=timezone.utc)
+        next_reset     = reset_at_aware + timedelta(days=7)
+        delta          = (next_reset - now).total_seconds()
+        resets_in_days = max(0, int(delta / 86400))
+
+    return {
+        "tier":                      tier,
+        "super_likes_limit":         sl_limit,
+        "super_likes_remaining":     current_user.super_likes_remaining,
+        "super_likes_reset_at":      current_user.super_likes_reset_at,
+        "super_likes_resets_in_days": resets_in_days,
+        "profile_boosts_limit":      boost_limit,
+        "features":                  features,
+    }
+
+
 @router.get("/status", response_model=StatusResponse, summary="Get current subscription status")
 async def get_status(current_user: User = Depends(get_current_user)):
     now = datetime.now(timezone.utc)
     expires = current_user.subscription_expires_at
+    # Normalise to timezone-aware so comparison never throws
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
     # Expire pro if past date
     if current_user.subscription_tier == "pro" and expires and expires < now:
         tier = "free"
@@ -103,7 +233,7 @@ async def get_status(current_user: User = Depends(get_current_user)):
     return {
         "tier": tier,
         "is_pro": tier == "pro",
-        "expires_at": expires,
+        "expires_at": current_user.subscription_expires_at,
     }
 
 
@@ -186,3 +316,131 @@ async def revenuecat_webhook(
     await db.commit()
     logger.info("User %s subscription → %s", user.id, user.subscription_tier)
     return {"ok": True}
+
+
+# ─── Plan endpoints (public read, admin write) ────────────────────────────────
+
+@router.get("/plans", response_model=list[PlanResponse], summary="List active subscription plans")
+async def list_plans(
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[Any]:
+    """
+    Returns all active plans ordered by sort_order.
+    The frontend uses apple_product_id to initiate the purchase via RevenueCat.
+    """
+    result = await db.execute(
+        select(SubscriptionPlan)
+        .where(SubscriptionPlan.is_active.is_(True))
+        .order_by(SubscriptionPlan.sort_order)
+    )
+    plans = result.scalars().all()
+    return [
+        {
+            "id": str(p.id),
+            "name": p.name,
+            "tier": "premium_plus" if "Premium+" in p.name else "pro",
+            "apple_product_id": p.apple_product_id,
+            "interval": p.interval,
+            "price_display": p.price_display,
+            "price_usd": float(p.price_usd),
+            "badge": p.badge,
+            "description": p.description,
+            "features": list(p.features or []),
+            "sort_order": p.sort_order,
+        }
+        for p in plans
+    ]
+
+
+@router.post("/plans", summary="[Admin] Create a new subscription plan")
+async def create_plan(
+    body: PlanCreateRequest,
+    _: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    plan = SubscriptionPlan(
+        name=body.name,
+        apple_product_id=body.apple_product_id,
+        interval=body.interval,
+        price_display=body.price_display,
+        price_usd=body.price_usd,
+        badge=body.badge,
+        description=body.description,
+        features=body.features,
+        sort_order=body.sort_order,
+        is_active=body.is_active,
+    )
+    db.add(plan)
+    await db.commit()
+    await db.refresh(plan)
+    logger.info("Admin created subscription plan: %s (%s)", plan.name, plan.apple_product_id)
+    return {"id": str(plan.id), "name": plan.name, "apple_product_id": plan.apple_product_id}
+
+
+@router.patch("/plans/{plan_id}", summary="[Admin] Update a subscription plan")
+async def update_plan(
+    plan_id: str,
+    body: PlanUpdateRequest,
+    _: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    result = await db.execute(
+        select(SubscriptionPlan).where(SubscriptionPlan.id == _uuid.UUID(plan_id))
+    )
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    update_data = body.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(plan, field, value)
+
+    await db.commit()
+    await db.refresh(plan)
+    logger.info("Admin updated plan %s: %s", plan_id, list(update_data.keys()))
+    return {"id": str(plan.id), "name": plan.name, "is_active": plan.is_active}
+
+
+# ─── Admin: manually grant / revoke Pro ───────────────────────────────────────
+
+@router.post("/grant", summary="[Admin] Manually grant or revoke Pro for a user")
+async def admin_grant(
+    body: GrantRequest,
+    admin: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Override a user's subscription tier directly in the database.
+    Useful for:
+      • Comp / influencer accounts
+      • Resolving support tickets
+      • Testing without going through Apple IAP
+
+    Note: RevenueCat webhooks can later override this if the user's Apple
+    subscription changes. To keep a permanent comp, set subscription_expires_at
+    to null (which this endpoint does when granting pro without expiry).
+    """
+    result = await db.execute(
+        select(User).where(User.id == _uuid.UUID(body.user_id))
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    old_tier = user.subscription_tier
+    user.subscription_tier = body.tier
+    if body.tier == "free":
+        user.subscription_expires_at = None
+
+    await db.commit()
+    logger.info(
+        "Admin %s manually set user %s tier: %s → %s. Note: %s",
+        admin.id, user.id, old_tier, body.tier, body.note or "—",
+    )
+    return {
+        "user_id": str(user.id),
+        "name": user.full_name,
+        "tier": user.subscription_tier,
+        "previous_tier": old_tier,
+    }

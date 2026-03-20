@@ -22,6 +22,7 @@ New/empty profiles start at 10 (blank slate = maximum potential).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.user import User
 from app.models.user_score import UserScore
+from app.models.user_compatibility import UserCompatibility
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +144,30 @@ async def _build_rich_snapshot(u: User, db: AsyncSession) -> dict[str, Any]:
                 "answer":   p.get("answer"),
             })
 
+    # Resolve work prompts (Q&A)
+    work_prompts_qa = []
+    for p in (u.work_prompts or []):
+        if p.get("answer"):
+            work_prompts_qa.append({
+                "question": p.get("question"),
+                "answer":   p.get("answer"),
+            })
+
     return {
         # Identity
         "name":            u.full_name,
         "age":             age(u.date_of_birth),
         "bio":             u.bio,
         "mood_status":     u.mood_text,
+        "mood_emoji":      u.mood_emoji,
+
+        # Location & background
+        "city":            u.city,
+        "hometown":        u.hometown,
+        "country":         u.country,
+
+        # Personality traits
+        "star_sign":       _resolve_id(u.star_sign_id, lmap),
 
         # Education
         "education_level": _resolve_id(u.education_level_id, lmap),
@@ -155,6 +175,12 @@ async def _build_rich_snapshot(u: User, db: AsyncSession) -> dict[str, Any]:
 
         # Career
         "work_experience": work_history,
+        "work_industries": _resolve_ids(u.work_industries, lmap),
+        "work_skills":     _resolve_ids(u.work_skills, lmap),
+        "work_commitment": _resolve_id(u.work_commitment_level_id, lmap),
+        "work_matching_goals": _resolve_ids(u.work_matching_goals, lmap),
+        "work_prompts":    work_prompts_qa,
+        "is_hiring":       u.work_are_you_hiring,
 
         # Lifestyle habits (human-readable)
         "lifestyle": _resolve_lifestyle(u.lifestyle, lmap),
@@ -203,22 +229,34 @@ async def _ai_scores(
 
         system = """You are a dating-app personality analyst.
 Score the user profile below across exactly 8 categories.
-Each score is a float 1.0–10.0. Use the FULL 1–10 range:
-  1-3 = very low / almost no data
-  4-6 = moderate / partially filled
-  7-8 = good / well developed
-  9-10 = exceptional / very rich
+Each score is a float 1.0–10.0.
 
-Important rules:
-- A brand-new profile with almost nothing filled in scores 10 (maximum potential — clean slate).
-- Score based on depth, quality and richness of what the person has shared, NOT just quantity.
-- For "interests": score how diverse and rich the person's hobbies/passions are.
-- For "lifestyle": score how healthy and consistent their habits are (exercise, diet, no smoking/drinking = higher).
-- For "personality": score how authentic, warm and thoughtful their bio and prompt answers are.
-- For "intentions": score how clear and specific they are about what they want.
-- Write a short, human-friendly reasoning (1-2 sentences) per category.
+CRITICAL RULE — judge quality, NOT completeness:
+- If a category has NO data at all → score it 6.0 (neutral unknown, do not penalise).
+- Only score ABOVE 6 when there is genuine positive signal (rich detail, depth, good habits).
+- Only score BELOW 6 when there is clear NEGATIVE signal (e.g. heavy smoking + no exercise, vague one-word bio, contradictory stated goals).
+- Never give 1-3 just because a field is empty. Empty = we simply don't know = 6.
 
-Reply ONLY with valid JSON, no markdown. Format exactly:
+Scoring guide (only applies when data IS present):
+  6   = neutral / no data — we can't judge
+  7   = some data, decent quality
+  8   = good depth and specificity
+  9   = very rich, authentic, detailed
+  10  = exceptional — stands out strongly
+
+Per-category guidance (only when data exists):
+- "education": judge the institution prestige, degree relevance, field of study — not just whether it's filled.
+- "career": judge job titles, company calibre, career trajectory, entrepreneurial drive, skills depth.
+- "lifestyle": judge actual habits — exercise frequency, diet quality, substance use. City/location adds context (Riyadh, Dubai = cosmopolitan = social lifestyle signal).
+- "values": judge how clearly articulated and coherent the person's values, causes and beliefs are.
+- "interests": judge how diverse, specific and passionate the interests are — generic vs. niche.
+- "personality": judge bio authenticity and warmth, prompt answer depth, mood/vibe expressiveness. Hometown vs city adds personal story.
+- "social": judge language diversity, community involvement, city context for social reach.
+- "intentions": judge how specific and honest they are about what they want in a relationship.
+
+Write a short, human-friendly reasoning (1-2 sentences) per category — mention what stood out or what would help.
+
+Reply ONLY with valid JSON, no markdown:
 {"scores":{"education":X,"career":X,"lifestyle":X,"values":X,"interests":X,"personality":X,"social":X,"intentions":X},"reasoning":{"education":"...","career":"...","lifestyle":"...","values":"...","interests":"...","personality":"...","social":"...","intentions":"..."}}"""
 
         user_msg = (
@@ -256,47 +294,61 @@ Reply ONLY with valid JSON, no markdown. Format exactly:
 # ── Heuristic fallback ────────────────────────────────────────────────────────
 
 def _heuristic_scores(u: User) -> dict[str, float]:
-    """Fallback when OpenAI is unavailable — profile completeness heuristic."""
+    """
+    Fallback when OpenAI is unavailable.
+    Empty fields default to 6.0 (neutral) — we only go above/below when
+    there is genuine signal to judge, mirroring the AI prompt's logic.
+    """
     def has(v) -> bool:
         return v is not None and v != [] and v != {}
 
-    def list_score(lst, full: int = 5) -> float:
-        if not lst:
-            return 1.0
-        return min(10.0, 1.0 + (len(lst) / full) * 9.0)
+    # Education — start neutral, reward depth of what's there
+    education = 6.0
+    if has(u.education_level_id): education += 1.0
+    if has(u.education):          education += min(3.0, len(u.education) * 1.0)
 
-    education = 5.0
-    if has(u.education_level_id): education += 2.0
-    if has(u.education):          education += min(3.0, len(u.education) * 1.5)
+    # Career — start neutral, reward richness
+    career = 6.0
+    if has(u.work_experience):    career += min(2.5, len(u.work_experience) * 1.0)
+    if has(u.work_skills):        career += min(1.0, len(u.work_skills or []) * 0.2)
+    if has(u.work_industries):    career += 0.5
 
-    career = 5.0
-    if has(u.work_experience):    career += min(5.0, len(u.work_experience) * 1.5)
-
-    lifestyle = 5.0
+    # Lifestyle — start neutral, reward healthy habits
+    lifestyle = 6.0
     if has(u.lifestyle):
         filled = sum(1 for v in u.lifestyle.values() if v)
-        lifestyle += (filled / 4) * 5.0
+        lifestyle += (filled / 4) * 4.0
 
-    values = 5.0
-    if has(u.religion_id):     values += 1.5
-    if has(u.family_plans_id): values += 1.5
-    if has(u.values_list):     values += min(2.0, len(u.values_list) * 0.5)
+    # Values — start neutral, reward articulation
+    values = 6.0
+    if has(u.religion_id):     values += 0.5
+    if has(u.family_plans_id): values += 0.5
+    if has(u.have_kids_id):    values += 0.5
+    if has(u.values_list):     values += min(2.5, len(u.values_list) * 0.5)
+    if has(u.causes):          values += min(1.0, len(u.causes) * 0.3)
 
-    interests = list_score(u.interests, 6)
+    # Interests — start neutral, reward diversity
+    interests = 6.0
+    if has(u.interests):       interests += min(4.0, len(u.interests) * 0.5)
 
-    personality = 3.0
-    if has(u.bio) and len(u.bio or "") > 30:  personality += 3.0
+    # Personality — start neutral, reward authentic expression
+    personality = 6.0
+    if has(u.bio) and len(u.bio or "") > 50:  personality += 1.5
+    if has(u.bio) and len(u.bio or "") > 150: personality += 1.0
     if has(u.prompts):
         answered = [p for p in (u.prompts or []) if p.get("answer")]
-        personality += min(4.0, len(answered) * 1.3)
+        personality += min(2.5, len(answered) * 0.8)
+    if has(u.mood_text): personality += 0.5
 
-    social = 5.0
-    if has(u.languages): social += min(3.0, len(u.languages) * 1.0)
-    if has(u.causes):    social += 2.0
+    # Social — start neutral
+    social = 6.0
+    if has(u.languages): social += min(2.5, len(u.languages) * 0.8)
+    if has(u.causes):    social += min(1.5, len(u.causes) * 0.4)
 
-    intentions = 5.0
-    if has(u.purpose):        intentions += 2.5
-    if has(u.looking_for_id): intentions += 2.5
+    # Intentions — start neutral, reward clarity
+    intentions = 6.0
+    if has(u.purpose):        intentions += min(2.0, len(u.purpose) * 0.7)
+    if has(u.looking_for_id): intentions += 2.0
 
     return {
         cat: round(min(10.0, max(1.0, v)), 1)
@@ -320,15 +372,44 @@ def _weighted_overall(scores: dict[str, float]) -> float:
     return round(min(10.0, max(1.0, total)), 2)
 
 
+# ── Profile change detection ──────────────────────────────────────────────────
+
+# Fields that affect any scoring dimension. Changes to these trigger a rescore.
+_SCORED_FIELDS = (
+    "bio", "date_of_birth", "gender_id", "education_level_id", "education",
+    "work_experience", "work_industries", "work_skills", "work_commitment_level_id",
+    "work_matching_goals", "lifestyle", "height_cm",
+    "religion_id", "family_plans_id", "have_kids_id", "values_list", "causes",
+    "interests", "languages", "prompts", "mood_text",
+    "looking_for_id", "purpose", "star_sign_id",
+)
+
+
+def _profile_hash(user: User) -> str:
+    """Return an MD5 hex digest of all profile fields that affect scoring."""
+    payload = {f: getattr(user, f, None) for f in _SCORED_FIELDS}
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
     """
-    Compute score using OpenAI (falls back to heuristic), persist and return.
-    All lookup IDs are resolved to labels before sending to AI.
+    Compute score via OpenAI (falls back to heuristic) and persist.
+    If the profile hash matches the stored one, the existing score is returned
+    immediately — no OpenAI call is made, no DB write occurs.
     """
-    snapshot = await _build_rich_snapshot(user, db)
+    current_hash = _profile_hash(user)
+    existing = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
 
+    # Cache hit: profile hasn't changed since last score — return as-is
+    if existing and existing.overall is not None and existing.profile_hash == current_hash:
+        logger.debug("Score cache hit for user %s (hash %s)", user.id, current_hash)
+        return existing
+
+    # Cache miss: compute fresh score
+    snapshot = await _build_rich_snapshot(user, db)
     result = await _ai_scores(snapshot)
     if result:
         scores, reasoning = result
@@ -338,43 +419,82 @@ async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
 
     overall = _weighted_overall(scores)
 
-    existing = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
     if existing:
         for cat in CATEGORIES:
             setattr(existing, cat, scores[cat])
-        existing.overall   = overall
-        existing.reasoning = reasoning
-        existing.version   = (existing.version or 1) + 1
-        existing.scored_at = datetime.now(timezone.utc)
+        existing.overall       = overall
+        existing.reasoning     = reasoning
+        existing.profile_hash  = current_hash
+        existing.version       = (existing.version or 1) + 1
+        existing.scored_at     = datetime.now(timezone.utc)
         row = existing
     else:
         row = UserScore(
-            user_id   = user.id,
-            overall   = overall,
-            reasoning = reasoning,
-            version   = 1,
-            scored_at = datetime.now(timezone.utc),
+            user_id      = user.id,
+            overall      = overall,
+            reasoning    = reasoning,
+            profile_hash = current_hash,
+            version      = 1,
+            scored_at    = datetime.now(timezone.utc),
             **{cat: scores[cat] for cat in CATEGORIES},
         )
         db.add(row)
 
     await db.commit()
     await db.refresh(row)
+    logger.info("Rescored user %s → overall=%.2f (hash %s)", user.id, overall, current_hash)
     return row
 
 
+def heuristic_score_obj(user: User) -> "SimpleNamespaceScore":
+    """
+    Return an in-memory score object computed purely from heuristics (no DB, no OpenAI).
+    Compatible with compatibility_between() since it uses getattr() duck-typing.
+    Use this as a fallback when no UserScore row exists for a candidate.
+    """
+    scores = _heuristic_scores(user)
+
+    class SimpleNamespaceScore:
+        pass
+
+    obj = SimpleNamespaceScore()
+    for cat, val in scores.items():
+        setattr(obj, cat, val)
+    return obj  # type: ignore[return-value]
+
+
 async def get_or_create_score(user: User, db: AsyncSession) -> UserScore:
-    """Return existing score or compute fresh one if missing."""
+    """
+    Return the cached score if the profile is unchanged, otherwise compute fresh.
+    This is safe to call on every profile view — the hash check avoids unnecessary
+    OpenAI calls when nothing has changed.
+    """
     existing = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
-    if existing and existing.overall is not None:
+    current_hash = _profile_hash(user)
+
+    if existing and existing.overall is not None and existing.profile_hash == current_hash:
         return existing
+
     return await compute_and_save_score(user, db)
+
+
+_CATEGORY_META: dict[str, dict[str, str]] = {
+    "education":   {"emoji": "🎓", "label": "Education"},
+    "career":      {"emoji": "💼", "label": "Career"},
+    "lifestyle":   {"emoji": "🏃", "label": "Lifestyle"},
+    "values":      {"emoji": "🌟", "label": "Values"},
+    "interests":   {"emoji": "❤️", "label": "Interests"},
+    "personality": {"emoji": "✨", "label": "Personality"},
+    "social":      {"emoji": "🌍", "label": "Social"},
+    "intentions":  {"emoji": "🎯", "label": "Intentions"},
+}
 
 
 def compatibility_between(score_a: UserScore, score_b: UserScore) -> dict[str, Any]:
     """
     Pairwise compatibility between two users.
-    Returns percent (0-100), tier label, and per-category similarity breakdown.
+    Returns percent (0-100), tier label, per-category similarity breakdown,
+    top insight chips, and a short human-readable brief.
     """
     breakdown: dict[str, float] = {}
     for cat in CATEGORIES:
@@ -386,10 +506,35 @@ def compatibility_between(score_a: UserScore, score_b: UserScore) -> dict[str, A
     total   = sum(breakdown[c] * WEIGHTS[c] for c in CATEGORIES)
     percent = round(min(100.0, max(0.0, total / sum(WEIGHTS.values()))), 1)
 
+    # Top 4 strongest matching categories → insight chips for the frontend
+    sorted_cats = sorted(breakdown.items(), key=lambda x: x[1], reverse=True)
+    insights = [
+        {"emoji": _CATEGORY_META[cat]["emoji"], "label": _CATEGORY_META[cat]["label"]}
+        for cat, score in sorted_cats[:4]
+        if score >= 60
+    ]
+
+    # Short human-readable brief driven by percent tier
+    tier = _tier(percent)
+    if tier == "soulmate":
+        brief = "Exceptionally aligned across values, lifestyle, and intentions."
+    elif tier == "great_match":
+        top = [_CATEGORY_META[c]["label"] for c, _ in sorted_cats[:2]]
+        brief = f"Strong chemistry — especially in {' & '.join(top).lower()}."
+    elif tier == "good_match":
+        top = [_CATEGORY_META[c]["label"] for c, _ in sorted_cats[:1]]
+        brief = f"Good foundation with shared {top[0].lower() if top else 'interests'}."
+    elif tier == "moderate":
+        brief = "Some common ground — differences could spark interesting conversations."
+    else:
+        brief = "Different paths, but opposites sometimes attract."
+
     return {
         "percent":   percent,
         "breakdown": breakdown,
-        "tier":      _tier(percent),
+        "tier":      tier,
+        "insights":  insights,
+        "brief":     brief,
     }
 
 
@@ -399,3 +544,79 @@ def _tier(pct: float) -> str:
     if pct >= 55: return "good_match"
     if pct >= 40: return "moderate"
     return "low"
+
+
+def _pair_hash(hash_a: str | None, hash_b: str | None) -> str:
+    """Stable hash of two users' profile hashes — order-independent."""
+    combined = "".join(sorted([hash_a or "", hash_b or ""]))
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+async def get_or_compute_compatibility(
+    user_a: User,
+    user_b: User,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """
+    Return the cached pairwise compatibility dict or compute + persist it.
+
+    The result is stored in `user_compatibility` with a stable canonical key
+    (smaller UUID first). A pair is only recomputed when either user's profile
+    has changed (detected via their individual `profile_hash` values).
+    """
+    import uuid as _uuid
+
+    # Stable ordering so we always have one row per pair
+    uid_a, uid_b = sorted([user_a.id, user_b.id], key=lambda u: str(u))
+
+    existing: UserCompatibility | None = await db.scalar(
+        select(UserCompatibility).where(
+            UserCompatibility.user_a_id == uid_a,
+            UserCompatibility.user_b_id == uid_b,
+        )
+    )
+
+    # Fetch individual scores (uses per-user hash cache)
+    score_a = await get_or_create_score(user_a, db)
+    score_b = await get_or_create_score(user_b, db)
+
+    current_pair_hash = _pair_hash(score_a.profile_hash, score_b.profile_hash)
+
+    # Cache hit: both individual scores unchanged → return stored result
+    if existing and existing.score_hash == current_pair_hash:
+        logger.debug("Compat cache hit for pair %s ↔ %s", uid_a, uid_b)
+        return {
+            "percent":   existing.percent,
+            "tier":      existing.tier,
+            "breakdown": existing.breakdown,
+            "insights":  existing.insights,
+            "brief":     existing.brief,
+        }
+
+    # Cache miss: compute fresh
+    result = compatibility_between(score_a, score_b)
+
+    if existing:
+        existing.percent    = result["percent"]
+        existing.tier       = result["tier"]
+        existing.breakdown  = result["breakdown"]
+        existing.insights   = result["insights"]
+        existing.brief      = result["brief"]
+        existing.score_hash = current_pair_hash
+        existing.computed_at = datetime.now(timezone.utc)
+    else:
+        db.add(UserCompatibility(
+            user_a_id    = uid_a,
+            user_b_id    = uid_b,
+            percent      = result["percent"],
+            tier         = result["tier"],
+            breakdown    = result["breakdown"],
+            insights     = result["insights"],
+            brief        = result["brief"],
+            score_hash   = current_pair_hash,
+            computed_at  = datetime.now(timezone.utc),
+        ))
+
+    await db.commit()
+    logger.info("Compat saved for pair %s ↔ %s → %.1f%%", uid_a, uid_b, result["percent"])
+    return result

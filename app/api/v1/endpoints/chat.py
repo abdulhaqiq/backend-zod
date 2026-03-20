@@ -34,13 +34,12 @@ router = APIRouter(tags=["chat"])
 ws_router = APIRouter(tags=["chat-ws"])
 
 
-# ── Connection Manager ────────────────────────────────────────────────────────
+# ── Connection Managers ───────────────────────────────────────────────────────
 
 class ConnectionManager:
-    """Tracks active WebSocket connections keyed by user_id string."""
+    """Tracks a single active WebSocket per user (last connection wins)."""
 
     def __init__(self):
-        # user_id (str) → WebSocket
         self._connections: dict[str, WebSocket] = {}
 
     def connect(self, user_id: str, ws: WebSocket):
@@ -55,7 +54,6 @@ class ConnectionManager:
         return user_id in self._connections
 
     async def send_to(self, user_id: str, payload: dict) -> bool:
-        """Send JSON payload to a connected user. Returns True if delivered."""
         ws = self._connections.get(user_id)
         if ws is None:
             return False
@@ -68,10 +66,53 @@ class ConnectionManager:
             return False
 
 
+class MultiConnectionManager:
+    """Tracks ALL active WebSocket connections per user (fan-out delivery).
+
+    Used for the /ws/notify channel so a user can have both a global
+    CallContext socket and a per-screen socket open simultaneously without
+    one overwriting the other.
+    """
+
+    def __init__(self):
+        self._connections: dict[str, list[WebSocket]] = {}
+
+    def connect(self, user_id: str, ws: WebSocket):
+        self._connections.setdefault(user_id, []).append(ws)
+        _log.info("ws:notify | user=%s connected, sessions=%d", user_id[:8], len(self._connections[user_id]))
+
+    def disconnect(self, user_id: str, ws: WebSocket):
+        bucket = self._connections.get(user_id, [])
+        self._connections[user_id] = [c for c in bucket if c is not ws]
+        if not self._connections[user_id]:
+            del self._connections[user_id]
+        _log.info("ws:notify | user=%s session removed", user_id[:8])
+
+    def is_online(self, user_id: str) -> bool:
+        return bool(self._connections.get(user_id))
+
+    async def send_to(self, user_id: str, payload: dict) -> bool:
+        connections = list(self._connections.get(user_id, []))
+        if not connections:
+            return False
+        dead: list[WebSocket] = []
+        sent = False
+        for ws in connections:
+            try:
+                await ws.send_text(json.dumps(payload))
+                sent = True
+            except Exception as exc:
+                _log.warning("ws:notify | send_to %s failed: %s", user_id[:8], exc)
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(user_id, ws)
+        return sent
+
+
 manager = ConnectionManager()
 
-# Separate manager for general push notifications (liked_you, match, etc.)
-notify_manager = ConnectionManager()
+# Fan-out notify manager — supports multiple concurrent sessions per user
+notify_manager = MultiConnectionManager()
 
 
 # ── WebSocket: notifications ───────────────────────────────────────────────────
@@ -92,51 +133,198 @@ async def websocket_notify(
       {"type": "match",      "profile": { ...profile fields } }
       {"type": "ping"}
     """
-    async with AsyncSessionLocal() as db:
-        try:
-            from app.core.security import decode_access_token
-            payload = decode_access_token(token)
-            user_id = payload.get("sub")
-            if not user_id:
-                raise ValueError("missing sub")
-        except Exception:
+    # Accept first so we can always send proper close codes
+    # and avoid uvicorn trying to write a 500 on an unaccepted transport.
+    await websocket.accept()
+
+    try:
+        from app.core.security import decode_access_token
+        payload = decode_access_token(token)
+        user_id = payload.get("sub")
+        if not user_id:
             await websocket.close(code=4001)
             return
+    except Exception:
+        await websocket.close(code=4001)
+        return
 
-        current_user = await _get_user_by_id(db, user_id)
-        if not current_user:
-            await websocket.close(code=4004)
-            return
+    try:
+        async with AsyncSessionLocal() as db:
+            current_user = await _get_user_by_id(db, user_id)
+    except Exception as exc:
+        _log.warning("ws:notify | DB unavailable, closing cleanly: %s", exc)
+        await websocket.close(code=1011)
+        return
 
-        uid_me = str(current_user.id)
+    if not current_user:
+        await websocket.close(code=4004)
+        return
 
-        await websocket.accept()
+    uid_me = str(current_user.id)
     notify_manager.connect(uid_me, websocket)
 
     try:
-        # Keep alive — client can send {"type":"ping"} and we pong back
         while True:
             raw = await websocket.receive_text()
             try:
                 data = json.loads(raw)
-                if data.get("type") == "ping":
+                msg_type = data.get("type", "")
+
+                # ── Ping ──────────────────────────────────────────────────────
+                if msg_type == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
-                elif data.get("type") == "presence_query":
-                    # Client asking for current online status of another user
+
+                # ── Presence query ────────────────────────────────────────────
+                elif msg_type == "presence_query":
                     query_uid = str(data.get("user_id", ""))
                     if query_uid:
-                        is_on = notify_manager.is_online(query_uid)
+                        is_on = notify_manager.is_online(query_uid) or manager.is_online(query_uid)
                         await websocket.send_text(json.dumps({
                             "type": "presence_status",
                             "user_id": query_uid,
                             "online": is_on,
                         }))
+
+                # ── Call invite ───────────────────────────────────────────────
+                elif msg_type == "call_invite":
+                    to_uid = str(data.get("to", ""))
+                    if not to_uid:
+                        continue
+                    async with AsyncSessionLocal() as db:
+                        me     = await _get_user_by_id(db, uid_me)
+                        target = await _get_user_by_id(db, to_uid)
+                        if not (me and target):
+                            continue
+                        caller_name  = me.full_name or "Someone"
+                        caller_image = (me.photos or [None])[0]
+                        room_id      = Message.make_room_id(me.id, target.id)
+                        other_push_token = target.push_token
+                    delivered = await notify_manager.send_to(to_uid, {
+                        "type":         "call_invite",
+                        "from":         uid_me,
+                        "caller_name":  caller_name,
+                        "caller_image": caller_image,
+                    })
+                    if not delivered:
+                        await send_push_notification(
+                            other_push_token,
+                            title=f"📞 {caller_name} is calling…",
+                            body="Tap to answer",
+                            data={
+                                "type":         "call",
+                                "from":         uid_me,
+                                "caller_name":  caller_name,
+                                "caller_image": caller_image,
+                                "room_id":      room_id,
+                            },
+                        )
+
+                # ── Call accept ───────────────────────────────────────────────
+                elif msg_type == "call_accept":
+                    to_uid = str(data.get("to", ""))
+                    if to_uid:
+                        await notify_manager.send_to(to_uid, {
+                            "type": "call_accept",
+                            "from": uid_me,
+                        })
+
+                # ── Call decline ──────────────────────────────────────────────
+                # Only relay the signal — no DB record here.
+                # The caller's frontend will auto-send call_end (duration=0)
+                # which creates the single "Missed call" record.
+                elif msg_type == "call_decline":
+                    to_uid = str(data.get("to", ""))
+                    if not to_uid:
+                        continue
+                    await notify_manager.send_to(to_uid, {
+                        "type": "call_decline",
+                        "from": uid_me,
+                    })
+
+                # ── WebRTC SDP offer (caller → callee) ───────────────────────
+                elif msg_type == "sdp_offer":
+                    to_uid = str(data.get("to", ""))
+                    if to_uid:
+                        await notify_manager.send_to(to_uid, {
+                            "type": "sdp_offer",
+                            "from": uid_me,
+                            "sdp":  data.get("sdp"),
+                        })
+
+                # ── WebRTC SDP answer (callee → caller) ───────────────────────
+                elif msg_type == "sdp_answer":
+                    to_uid = str(data.get("to", ""))
+                    if to_uid:
+                        await notify_manager.send_to(to_uid, {
+                            "type": "sdp_answer",
+                            "from": uid_me,
+                            "sdp":  data.get("sdp"),
+                        })
+
+                # ── WebRTC ICE candidate (both directions) ────────────────────
+                elif msg_type == "ice_candidate":
+                    to_uid = str(data.get("to", ""))
+                    if to_uid:
+                        await notify_manager.send_to(to_uid, {
+                            "type":      "ice_candidate",
+                            "from":      uid_me,
+                            "candidate": data.get("candidate"),
+                        })
+
+                # ── Call end ──────────────────────────────────────────────────
+                elif msg_type == "call_end":
+                    to_uid   = str(data.get("to", ""))
+                    duration = int(data.get("duration", 0))
+                    if not to_uid:
+                        continue
+                    await notify_manager.send_to(to_uid, {
+                        "type":     "call_end",
+                        "from":     uid_me,
+                        "duration": duration,
+                    })
+                    call_type = "ended" if duration > 0 else "missed"
+                    async with AsyncSessionLocal() as db:
+                        me     = await _get_user_by_id(db, uid_me)
+                        target = await _get_user_by_id(db, to_uid)
+                        if me and target:
+                            room_id = Message.make_room_id(me.id, target.id)
+                            # Deduplication: skip if a call record exists in last 30 s
+                            from datetime import timedelta
+                            from sqlalchemy import select as sa_select
+                            cutoff = datetime.now(timezone.utc) - timedelta(seconds=30)
+                            existing = (await db.execute(
+                                sa_select(Message).where(
+                                    Message.room_id == room_id,
+                                    Message.msg_type == "call",
+                                    Message.created_at > cutoff,
+                                )
+                            )).scalar_one_or_none()
+                            if existing is None:
+                                call_msg = Message(
+                                    room_id=room_id,
+                                    sender_id=me.id,
+                                    receiver_id=target.id,
+                                    content="",
+                                    msg_type="call",
+                                    extra={"call_type": call_type, "duration": duration},
+                                    is_read=False,
+                                    created_at=datetime.now(timezone.utc),
+                                )
+                                db.add(call_msg)
+                                await db.commit()
+                                await db.refresh(call_msg)
+                                rec = {"type": "call_record", **_msg_to_dict(call_msg)}
+                                await notify_manager.send_to(uid_me, rec)
+                                await notify_manager.send_to(to_uid,  rec)
+
             except Exception:
                 pass
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, OSError):
         pass
+    except Exception as exc:
+        _log.debug("ws:notify | connection dropped for user=%s: %s", uid_me[:8], exc)
     finally:
-        notify_manager.disconnect(uid_me)
+        notify_manager.disconnect(uid_me, websocket)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -202,6 +390,17 @@ async def websocket_chat(
 
         if not current_user or not other_user:
             await websocket.close(code=4004)
+            return
+
+        # Recipient requires face-verified senders — close before accepting
+        if other_user.require_verified_to_chat and current_user.verification_status != "verified":
+            await websocket.accept()
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "detail": "This person only accepts messages from verified users. Verify your photo to send a message.",
+                "code": "verification_required",
+            }))
+            await websocket.close(code=4003)
             return
 
         uid_me    = str(current_user.id)
@@ -360,6 +559,71 @@ async def websocket_chat(
                 continue
 
 
+            # ── Call signalling (relay via notify_manager for global delivery) ─
+            if msg_type_ws in ("call_invite", "call_accept", "call_decline", "call_end"):
+                signal: dict[str, Any] = {"type": msg_type_ws, "from": uid_me}
+                if msg_type_ws == "call_invite":
+                    caller_name  = current_user.full_name or "Someone"
+                    caller_image = (current_user.photos or [None])[0] if current_user.photos else None
+                    signal.update({
+                        "caller_name":  caller_name,
+                        "caller_image": caller_image,
+                    })
+                    await send_push_notification(
+                        other_user.push_token,
+                        title=f"📞 {caller_name} is calling…",
+                        body="Tap to answer",
+                        data={
+                            "type":         "call",
+                            "from":         uid_me,
+                            "caller_name":  caller_name,
+                            "caller_image": caller_image,
+                            "room_id":      room_id,
+                        },
+                    )
+                elif msg_type_ws == "call_end":
+                    signal["duration"] = int(payload_in.get("duration", 0))
+                # Deliver to the other user on whichever socket they have open
+                await manager.send_to(uid_other, signal)
+                await notify_manager.send_to(uid_other, signal)
+                # Persist a call record on end / decline
+                # call_decline via chat-WS: only relay, no record (same as notify-WS path)
+                # call_end via chat-WS: create record with deduplication
+                if msg_type_ws == "call_end":
+                    dur       = int(payload_in.get("duration", 0))
+                    call_type = "ended" if dur > 0 else "missed"
+                    async with AsyncSessionLocal() as db:
+                        from datetime import timedelta
+                        from sqlalchemy import select as sa_select
+                        cutoff = datetime.now(timezone.utc) - timedelta(seconds=30)
+                        existing = (await db.execute(
+                            sa_select(Message).where(
+                                Message.room_id == room_id,
+                                Message.msg_type == "call",
+                                Message.created_at > cutoff,
+                            )
+                        )).scalar_one_or_none()
+                        if existing is None:
+                            call_msg = Message(
+                                room_id=room_id,
+                                sender_id=current_user.id,
+                                receiver_id=other_user.id,
+                                content="",
+                                msg_type="call",
+                                extra={"call_type": call_type, "duration": dur},
+                                is_read=False,
+                                created_at=datetime.now(timezone.utc),
+                            )
+                            db.add(call_msg)
+                            await db.commit()
+                            await db.refresh(call_msg)
+                            rec = {"type": "call_record", **_msg_to_dict(call_msg)}
+                            await websocket.send_text(json.dumps(rec))
+                            await manager.send_to(uid_other, rec)
+                            await notify_manager.send_to(uid_other, rec)
+                            await notify_manager.send_to(uid_me, rec)
+                continue
+
             content  = str(payload_in.get("content", "")).strip()
             msg_type = payload_in.get("msg_type", "text")
             metadata = payload_in.get("metadata")
@@ -404,7 +668,19 @@ async def websocket_chat(
             # Push notification if the recipient is offline
             if not delivered:
                 sender_name = current_user.full_name or "Someone"
-                preview     = content[:80]
+                # Friendly preview — don't expose raw URLs in notifications
+                if msg_type == "image":
+                    preview = "📷 Sent a photo"
+                elif msg_type == "voice":
+                    preview = "🎙️ Sent a voice message"
+                elif msg_type in ("tod_invite",):
+                    preview = "🎯 Wants to play Truth or Dare"
+                elif msg_type in ("tod_answer",):
+                    preview = "🎯 Answered your Truth or Dare"
+                elif msg_type in ("question_cards", "wyr", "hot_takes", "nhi"):
+                    preview = "🎮 Sent a game card"
+                else:
+                    preview = content[:80]
                 await send_push_notification(
                     other_push_token,
                     title=f"💬 {sender_name}",
@@ -418,10 +694,10 @@ async def websocket_chat(
                     },
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, OSError):
         pass
     except Exception as exc:
-        _log.warning("ws:chat | unexpected error for user=%s: %s", uid_me[:8], exc)
+        _log.debug("ws:chat | connection dropped for user=%s: %s", uid_me[:8], exc)
     finally:
         manager.disconnect(uid_me)
         # Broadcast offline presence
@@ -508,6 +784,43 @@ async def get_conversations(
     return {"conversations": conversations, "total": len(conversations)}
 
 
+@router.delete("/chat/messages/{message_id}", summary="Unsend (delete) a message you sent")
+async def unsend_message(
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Permanently deletes a message. Only the original sender may unsend it.
+    Notifies the other party via the notify WebSocket so their UI hides it instantly.
+    """
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    msg: Message | None = await db.get(Message, msg_uuid)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only unsend your own messages")
+
+    room_id     = msg.room_id
+    receiver_id = str(msg.receiver_id)
+
+    await db.delete(msg)
+    await db.commit()
+
+    # Notify the receiver so their UI removes the message in real-time
+    await notify_manager.send_to(receiver_id, {
+        "type":       "message_deleted",
+        "message_id": message_id,
+        "room_id":    room_id,
+    })
+
+    return {"success": True, "message_id": message_id}
+
+
 @router.get("/chat/{other_user_id}/messages", summary="Paginated message history for a conversation")
 async def get_messages(
     other_user_id: str,
@@ -557,6 +870,13 @@ async def send_message(
     other_user = await _get_user_by_id(db, other_uuid)
     if not other_user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Recipient requires face-verified senders only
+    if other_user.require_verified_to_chat and current_user.verification_status != "verified":
+        raise HTTPException(
+            status_code=403,
+            detail="This person only accepts messages from verified users. Verify your photo to send a message.",
+        )
 
     content  = str(body.get("content", "")).strip()
     msg_type = body.get("msg_type", "text")

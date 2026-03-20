@@ -263,9 +263,20 @@ async def verify_otp_endpoint(
             detail=f"Invalid OTP code. {remaining_attempts} attempt(s) remaining.",
         )
 
-    # Mark as verified immediately so the code cannot be reused even if later steps fail
+    # Upsert user — do this BEFORE consuming the OTP so a recoverable error
+    # (e.g. snoozed account) doesn't permanently burn the code.
+    user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
+
+    # Signing in is an intentional action — if the account was snoozed
+    # (is_active=False via the snooze toggle), automatically re-activate it.
+    # A hard-banned account would need a separate flag; is_active alone is
+    # used only for snooze/discovery visibility.
+    if not user.is_active:
+        user.is_active = True
+
+    # Mark OTP as verified so the code cannot be reused
     otp.verified_at = now
-    # Update device info from the verification request (may differ from send — e.g. different network)
+    # Update device info from the verification request (may differ from send)
     if payload.device:
         d = payload.device
         if d.ip_address:
@@ -279,15 +290,6 @@ async def verify_otp_endpoint(
         if d.network_type:
             otp.network_type = d.network_type
     await db.commit()
-
-    # Upsert user
-    user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
-
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is inactive.",
-        )
 
     token_pair = await _issue_token_pair(user_id=str(user.id), db=db, device=payload.device)
     return token_pair
@@ -330,7 +332,8 @@ async def apple_sign_in(payload: AppleAuthRequest, db: AsyncSession = Depends(ge
         await db.flush()
 
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive.")
+        user.is_active = True  # Re-activate on sign-in (un-snooze)
+    await db.flush()
 
     return await _issue_token_pair(user_id=str(user.id), db=db)
 
@@ -370,7 +373,8 @@ async def facebook_sign_in(payload: FacebookAuthRequest, db: AsyncSession = Depe
         await db.flush()
 
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive.")
+        user.is_active = True  # Re-activate on sign-in (un-snooze)
+    await db.flush()
 
     return await _issue_token_pair(user_id=str(user.id), db=db)
 

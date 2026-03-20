@@ -85,6 +85,10 @@ class User(Base):
     subscription_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     revenuecat_customer_id: Mapped[str | None] = mapped_column(String(256), nullable=True, unique=True)
 
+    # ── Super likes (Pro only — 10 per month, resets on calendar month boundary) ─
+    super_likes_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    super_likes_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # ── Preferences ───────────────────────────────────────────────────────────
     dark_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     best_photo_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -126,6 +130,26 @@ class User(Base):
     filter_height_min:      Mapped[int | None]  = mapped_column(Integer, nullable=True)  # cm
     filter_height_max:      Mapped[int | None]  = mapped_column(Integer, nullable=True)  # cm
 
+    # ── University / institution ──────────────────────────────────────────────
+    university:               Mapped[str | None]      = mapped_column(String(255), nullable=True)
+    university_email:         Mapped[str | None]      = mapped_column(String(255), nullable=True)
+    university_email_verified: Mapped[bool]           = mapped_column(Boolean, default=False, nullable=False)
+    # OTP stored as bcrypt hash — never the plain code
+    university_otp_hash:      Mapped[str | None]      = mapped_column(String(255), nullable=True)
+    university_otp_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Privacy settings ──────────────────────────────────────────────────────
+    hide_age:                 Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    hide_distance:            Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    require_verified_to_chat: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # ── Pro features ──────────────────────────────────────────────────────────
+    is_incognito:         Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    travel_mode_enabled:  Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_zod_enabled:     Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    travel_city:          Mapped[str | None] = mapped_column(String(128), nullable=True)
+    travel_country:       Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     # ── Mood / vibe status ────────────────────────────────────────────────────
     mood_emoji:  Mapped[str | None] = mapped_column(String(8),   nullable=True)  # e.g. "🎉"
     mood_text:   Mapped[str | None] = mapped_column(String(60),  nullable=True)  # e.g. "Up for a coffee chat"
@@ -136,6 +160,10 @@ class User(Base):
     verification_status: Mapped[str] = mapped_column(
         String(16), default="unverified", nullable=False
     )
+    # Set to True by moderation/admin when the account must re-verify face
+    face_scan_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set to True by moderation/admin when the account must submit ID verification
+    id_scan_required:   Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # ── Status flags ─────────────────────────────────────────────────────────
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

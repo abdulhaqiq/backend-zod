@@ -327,8 +327,27 @@ async def get_game_cards(
     _: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns all cards for a game type, optionally filtered by category."""
-    q = select(Card).where(Card.game == game_type, Card.is_active == True)
+    """Returns all cards for a game type, optionally filtered by category.
+
+    Handles legacy game-type aliases so that cards seeded under old names
+    (e.g. 'question' for question_cards, 'truth_or_dare' for truth_or_dare)
+    are returned regardless of which key name is used in the URL.
+    """
+    # Canonical aliases — maps the URL game_type to every DB game value we should search
+    _ALIASES: dict[str, list[str]] = {
+        "question_cards": ["question_cards", "question"],
+        "truth_or_dare":  ["truth_or_dare", "tod"],
+        "nhi":            ["nhi", "never_have_i_ever"],
+        "hot_takes":      ["hot_takes", "hot"],
+        "wyr":            ["wyr", "would_you_rather"],
+    }
+    game_values = _ALIASES.get(game_type, [game_type])
+
+    from sqlalchemy import or_
+    q = select(Card).where(
+        or_(*[Card.game == gv for gv in game_values]),
+        Card.is_active == True,
+    )
     if category:
         q = q.where(Card.category == category)
     q = q.order_by(Card.sort_order)
@@ -345,7 +364,19 @@ async def get_random_card(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns a single random card for a game type."""
-    q = select(Card).where(Card.game == game_type, Card.is_active == True)
+    from sqlalchemy import or_
+    _ALIASES: dict[str, list[str]] = {
+        "question_cards": ["question_cards", "question"],
+        "truth_or_dare":  ["truth_or_dare", "tod"],
+        "nhi":            ["nhi", "never_have_i_ever"],
+        "hot_takes":      ["hot_takes", "hot"],
+        "wyr":            ["wyr", "would_you_rather"],
+    }
+    game_values = _ALIASES.get(game_type, [game_type])
+    q = select(Card).where(
+        or_(*[Card.game == gv for gv in game_values]),
+        Card.is_active == True,
+    )
     if category:
         q = q.where(Card.category == category)
     rows = await db.execute(q)

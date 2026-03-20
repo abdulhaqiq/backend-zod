@@ -46,6 +46,21 @@ class ProfileUpdateRequest(BaseModel):
     religion_id: int | None = None                        # lookup_options (category=religion)
     ethnicity_id: int | None = None                       # lookup_options (category=ethnicity)
 
+    # University / institution
+    university: str | None = Field(None, max_length=255)
+
+    # Privacy settings
+    hide_age:                 bool | None = None
+    hide_distance:            bool | None = None
+    require_verified_to_chat: bool | None = None
+
+    # Pro features
+    is_incognito:        bool | None = None
+    travel_mode_enabled: bool | None = None
+    auto_zod_enabled:    bool | None = None
+    travel_city:         str | None = Field(None, max_length=128)
+    travel_country:      str | None = Field(None, max_length=128)
+
     # Mood / vibe status
     mood_emoji: str | None = Field(None, max_length=8)
     mood_text:  str | None = Field(None, max_length=60)
@@ -55,13 +70,12 @@ class ProfileUpdateRequest(BaseModel):
     dark_mode: bool | None = None
     best_photo_enabled: bool | None = None
 
-    # Location (free-text + coordinates)
+    # Location (free-text only — coordinates are set exclusively via
+    # POST /location/update and POST /location/change-city, never via profile PATCH)
     city: str | None = Field(None, max_length=128)
     hometown: str | None = Field(None, max_length=128)
     address: str | None = Field(None, max_length=512)
     country: str | None = Field(None, max_length=128)
-    latitude: float | None = None
-    longitude: float | None = None
 
     # Rich structured data (no lookup IDs needed)
     voice_prompts: list[dict[str, Any]] | None = None     # [{topic, url, duration_sec}]
@@ -84,7 +98,7 @@ class ProfileUpdateRequest(BaseModel):
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         int | None = Field(None, ge=18, le=80)
     filter_age_max:         int | None = Field(None, ge=18, le=80)
-    filter_max_distance_km: int | None = Field(None, ge=1, le=150)   # null = any distance
+    filter_max_distance_km: int | None = Field(None, ge=1, le=80)
     filter_verified_only:   bool | None = None
     filter_star_signs:      list[int] | None = None        # [lookup_options.id] category=star_sign
     filter_interests:       list[int] | None = None        # [lookup_options.id] category=interests
@@ -101,6 +115,32 @@ class ProfileUpdateRequest(BaseModel):
     filter_smoking:         list[int] | None = None        # [lookup_options.id] category=smoking
     filter_height_min:      int | None = Field(None, ge=130, le=220)  # cm
     filter_height_max:      int | None = Field(None, ge=130, le=220)  # cm
+
+
+class FilterUpdateRequest(BaseModel):
+    """
+    Sent by the filter sheet when the user taps "Apply Filters".
+    Only discover filter preferences — nothing else.
+    """
+    filter_age_min:         int | None = Field(None, ge=18, le=80)
+    filter_age_max:         int | None = Field(None, ge=18, le=80)
+    filter_max_distance_km: int | None = Field(None, ge=1, le=80)
+    filter_verified_only:   bool | None = None
+    filter_star_signs:      list[int] | None = None
+    filter_interests:       list[int] | None = None
+    filter_languages:       list[int] | None = None
+    # Pro-only (backend silently ignores if user is not pro)
+    filter_purpose:         list[int] | None = None
+    filter_looking_for:     list[int] | None = None
+    filter_education_level: list[int] | None = None
+    filter_family_plans:    list[int] | None = None
+    filter_have_kids:       list[int] | None = None
+    filter_ethnicities:     list[int] | None = None
+    filter_exercise:        list[int] | None = None
+    filter_drinking:        list[int] | None = None
+    filter_smoking:         list[int] | None = None
+    filter_height_min:      int | None = Field(None, ge=130, le=220)
+    filter_height_max:      int | None = Field(None, ge=130, le=220)
 
 
 class MeResponse(BaseModel):
@@ -141,8 +181,6 @@ class MeResponse(BaseModel):
     hometown: str | None
     address: str | None
     country: str | None
-    latitude: float | None
-    longitude: float | None
     dark_mode: bool
     best_photo_enabled: bool
     mood_emoji: str | None
@@ -181,9 +219,26 @@ class MeResponse(BaseModel):
     filter_height_min:      int | None
     filter_height_max:      int | None
 
+    university:               str | None
+    university_email:         str | None
+    university_email_verified: bool
+
+    hide_age: bool
+    hide_distance: bool
+    require_verified_to_chat: bool
+
+    is_incognito: bool
+    travel_mode_enabled: bool
+    auto_zod_enabled: bool
+    travel_city: str | None
+    travel_country: str | None
+
     face_match_score: float | None
     verification_status: str   # unverified | pending | verified | rejected
+    face_scan_required: bool
+    id_scan_required:   bool = False
     subscription_tier: str     # free | pro
+    super_likes_remaining: int
     is_active: bool
     is_verified: bool
     is_onboarded: bool

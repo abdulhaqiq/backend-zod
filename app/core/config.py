@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     FACEBOOK_APP_ID: str = ""
     FACEBOOK_APP_SECRET: str = ""
 
+    # Email (SMTP) — used for university email verification
+    # Leave blank to use dev-mode (OTP is logged to console instead of sent)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    EMAIL_FROM: str = "noreply@zod.app"
+    EMAIL_FROM_NAME: str = "Zod"
+
     # OTP policy
     OTP_EXPIRE_MINUTES: int = 10
     OTP_MAX_ATTEMPTS: int = 5
@@ -60,6 +69,11 @@ class Settings(BaseSettings):
     REVENUECAT_PUBLIC_KEY: str = ""        # iOS SDK public key (appl_... or test_...)
     REVENUECAT_SECRET_KEY: str = ""        # V1 secret key from RevenueCat dashboard
     REVENUECAT_WEBHOOK_AUTH: str = ""      # Authorization header value for webhooks
+
+    # AWS Rekognition (face detection + matching — used for verification)
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = "us-east-1"
 
     # DigitalOcean Spaces
     DO_SPACES_KEY: str = ""
