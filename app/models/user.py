@@ -156,6 +156,12 @@ class User(Base):
     auto_zod_enabled:     Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     travel_city:          Mapped[str | None] = mapped_column(String(128), nullable=True)
     travel_country:       Mapped[str | None] = mapped_column(String(128), nullable=True)
+    travel_expires_at:    Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Snapshot of the user's real GPS location before travel mode overwrote it
+    real_latitude:        Mapped[float | None] = mapped_column(Float, nullable=True)
+    real_longitude:       Mapped[float | None] = mapped_column(Float, nullable=True)
+    real_city:            Mapped[str | None] = mapped_column(String(128), nullable=True)
+    real_country:         Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # ── Mood / vibe status ────────────────────────────────────────────────────
     mood_emoji:  Mapped[str | None] = mapped_column(String(8),   nullable=True)  # e.g. "🎉"

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -399,6 +400,9 @@ async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
     Compute score via OpenAI (falls back to heuristic) and persist.
     If the profile hash matches the stored one, the existing score is returned
     immediately — no OpenAI call is made, no DB write occurs.
+
+    Uses an atomic INSERT ... ON CONFLICT (user_id) DO UPDATE to avoid the
+    SELECT→INSERT race condition that caused deadlocks under concurrent load.
     """
     current_hash = _profile_hash(user)
     existing = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
@@ -417,33 +421,44 @@ async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
         scores    = _heuristic_scores(user)
         reasoning = {c: "Computed via profile completeness analysis." for c in CATEGORIES}
 
-    overall = _weighted_overall(scores)
+    overall  = _weighted_overall(scores)
+    now      = datetime.now(timezone.utc)
+    new_version = (existing.version or 1) + 1 if existing else 1
 
-    if existing:
-        for cat in CATEGORIES:
-            setattr(existing, cat, scores[cat])
-        existing.overall       = overall
-        existing.reasoning     = reasoning
-        existing.profile_hash  = current_hash
-        existing.version       = (existing.version or 1) + 1
-        existing.scored_at     = datetime.now(timezone.utc)
-        row = existing
-    else:
-        row = UserScore(
-            user_id      = user.id,
-            overall      = overall,
-            reasoning    = reasoning,
-            profile_hash = current_hash,
-            version      = 1,
-            scored_at    = datetime.now(timezone.utc),
-            **{cat: scores[cat] for cat in CATEGORIES},
+    insert_values = {
+        "user_id":      user.id,
+        "overall":      overall,
+        "reasoning":    reasoning,
+        "profile_hash": current_hash,
+        "version":      new_version,
+        "scored_at":    now,
+        **{cat: scores[cat] for cat in CATEGORIES},
+    }
+
+    # Atomic upsert — serialised by the unique index on user_id, so concurrent
+    # requests for the same user can never deadlock via SELECT→INSERT races.
+    stmt = (
+        pg_insert(UserScore)
+        .values(**insert_values)
+        .on_conflict_do_update(
+            index_elements=["user_id"],
+            set_={
+                "overall":      overall,
+                "reasoning":    reasoning,
+                "profile_hash": current_hash,
+                "version":      new_version,
+                "scored_at":    now,
+                **{cat: scores[cat] for cat in CATEGORIES},
+            },
         )
-        db.add(row)
-
+    )
+    await db.execute(stmt)
     await db.commit()
-    await db.refresh(row)
+
+    # Re-fetch the row so callers receive a fully-hydrated ORM object
+    row = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
     logger.info("Rescored user %s → overall=%.2f (hash %s)", user.id, overall, current_hash)
-    return row
+    return row  # type: ignore[return-value]
 
 
 def heuristic_score_obj(user: User) -> "SimpleNamespaceScore":
@@ -468,13 +483,10 @@ async def get_or_create_score(user: User, db: AsyncSession) -> UserScore:
     Return the cached score if the profile is unchanged, otherwise compute fresh.
     This is safe to call on every profile view — the hash check avoids unnecessary
     OpenAI calls when nothing has changed.
+
+    Delegates entirely to compute_and_save_score which performs an atomic upsert,
+    so there is no separate SELECT here that could race with the write.
     """
-    existing = await db.scalar(select(UserScore).where(UserScore.user_id == user.id))
-    current_hash = _profile_hash(user)
-
-    if existing and existing.overall is not None and existing.profile_hash == current_hash:
-        return existing
-
     return await compute_and_save_score(user, db)
 
 
@@ -595,28 +607,36 @@ async def get_or_compute_compatibility(
 
     # Cache miss: compute fresh
     result = compatibility_between(score_a, score_b)
+    now    = datetime.now(timezone.utc)
 
-    if existing:
-        existing.percent    = result["percent"]
-        existing.tier       = result["tier"]
-        existing.breakdown  = result["breakdown"]
-        existing.insights   = result["insights"]
-        existing.brief      = result["brief"]
-        existing.score_hash = current_pair_hash
-        existing.computed_at = datetime.now(timezone.utc)
-    else:
-        db.add(UserCompatibility(
-            user_a_id    = uid_a,
-            user_b_id    = uid_b,
-            percent      = result["percent"],
-            tier         = result["tier"],
-            breakdown    = result["breakdown"],
-            insights     = result["insights"],
-            brief        = result["brief"],
-            score_hash   = current_pair_hash,
-            computed_at  = datetime.now(timezone.utc),
-        ))
-
+    # Atomic upsert — prevents SELECT→INSERT race on the (user_a_id, user_b_id) pair
+    compat_stmt = (
+        pg_insert(UserCompatibility)
+        .values(
+            user_a_id   = uid_a,
+            user_b_id   = uid_b,
+            percent     = result["percent"],
+            tier        = result["tier"],
+            breakdown   = result["breakdown"],
+            insights    = result["insights"],
+            brief       = result["brief"],
+            score_hash  = current_pair_hash,
+            computed_at = now,
+        )
+        .on_conflict_do_update(
+            constraint="uq_user_compat_pair",
+            set_={
+                "percent":     result["percent"],
+                "tier":        result["tier"],
+                "breakdown":   result["breakdown"],
+                "insights":    result["insights"],
+                "brief":       result["brief"],
+                "score_hash":  current_pair_hash,
+                "computed_at": now,
+            },
+        )
+    )
+    await db.execute(compat_stmt)
     await db.commit()
     logger.info("Compat saved for pair %s ↔ %s → %.1f%%", uid_a, uid_b, result["percent"])
     return result

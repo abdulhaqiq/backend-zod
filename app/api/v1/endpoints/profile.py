@@ -197,6 +197,20 @@ async def update_me(
                     detail="This email address is already in use.",
                 )
         setattr(current_user, field, value)
+        # When the user manually turns off travel mode, restore their real GPS location
+        if field == "travel_mode_enabled" and value is False:
+            current_user.travel_expires_at = None
+            current_user.travel_city = None
+            current_user.travel_country = None
+            if current_user.real_latitude is not None:
+                current_user.latitude = current_user.real_latitude
+                current_user.longitude = current_user.real_longitude
+                current_user.city = current_user.real_city
+                current_user.country = current_user.real_country
+            current_user.real_latitude = None
+            current_user.real_longitude = None
+            current_user.real_city = None
+            current_user.real_country = None
 
     try:
         await db.commit()

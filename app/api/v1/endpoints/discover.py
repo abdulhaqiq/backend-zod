@@ -442,6 +442,15 @@ async def _fetch_discover_profiles(
     try:
         my_score = await get_or_create_score(me, db)
     except Exception:
+        # Roll back the aborted transaction so the connection stays usable.
+        await db.rollback()
+        # After rollback SQLAlchemy expires all ORM objects, so `me`'s attributes
+        # would trigger a sync lazy-load (MissingGreenlet) inside heuristic_score_obj.
+        # Refresh `me` first so all columns are rehydrated asynchronously.
+        try:
+            await db.refresh(me)
+        except Exception:
+            pass
         my_score = heuristic_score_obj(me)  # type: ignore[assignment]
 
     # Bulk-fetch scores for all candidates in one query

@@ -39,6 +39,21 @@ async def lifespan(app: FastAPI):
         await conn.execute(_text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS id_scan_required BOOLEAN NOT NULL DEFAULT FALSE"
         ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS travel_expires_at TIMESTAMPTZ"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS real_latitude DOUBLE PRECISION"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS real_longitude DOUBLE PRECISION"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS real_city VARCHAR(128)"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS real_country VARCHAR(128)"
+        ))
         # user_compatibility is created by create_all above; nothing to backfill
     
     import asyncio
@@ -119,8 +134,50 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             _log.warning("Stale attempt recovery failed (non-critical): %s", exc)
 
+    async def _expire_travel_modes():
+        """Hourly loop: reset travel mode for users whose 7-day window has elapsed."""
+        from sqlalchemy import select
+        from app.db.session import AsyncSessionLocal
+        from app.models.user import User
+        from datetime import datetime, timezone
+
+        while True:
+            await asyncio.sleep(3600)  # check every hour
+            try:
+                async with AsyncSessionLocal() as db:
+                    now = datetime.now(timezone.utc)
+                    result = await db.execute(
+                        select(User).where(
+                            User.travel_mode_enabled.is_(True),
+                            User.travel_expires_at.isnot(None),
+                            User.travel_expires_at <= now,
+                        )
+                    )
+                    expired = result.scalars().all()
+                    for user in expired:
+                        user.travel_mode_enabled = False
+                        user.travel_city = None
+                        user.travel_country = None
+                        user.travel_expires_at = None
+                        # Restore the real GPS coordinates saved before travel mode
+                        if user.real_latitude is not None:
+                            user.latitude = user.real_latitude
+                            user.longitude = user.real_longitude
+                            user.city = user.real_city
+                            user.country = user.real_country
+                        user.real_latitude = None
+                        user.real_longitude = None
+                        user.real_city = None
+                        user.real_country = None
+                    if expired:
+                        await db.commit()
+                        _log.info("Travel mode expired and reset for %d user(s)", len(expired))
+            except Exception as exc:
+                _log.warning("Travel mode expiry loop error (non-critical): %s", exc)
+
     asyncio.create_task(_warmup_deepface())
     asyncio.create_task(_recover_stale_attempts())
+    asyncio.create_task(_expire_travel_modes())
     
     yield
     # Dispose engine on shutdown

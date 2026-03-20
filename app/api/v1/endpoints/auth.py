@@ -42,8 +42,10 @@ from app.services.twilio_service import send_otp as twilio_send_otp
 
 import random
 import string
+import uuid as _uuid_mod
 
 from app.core.limiter import limiter
+from slowapi.util import get_remote_address
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -52,10 +54,38 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Test/internal accounts — bypass all OTP rate limits
+_TEST_PHONE_LAST10 = {"5838175920", "9148880196"}
+
+def _is_test_phone(phone: str) -> bool:
+    """True when the phone belongs to a whitelisted test account."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    return digits[-10:] in _TEST_PHONE_LAST10
+
+
+async def _otp_rate_key(request: Request) -> str:
+    """
+    Per-phone rate-limit key.
+    Test phones get a unique UUID each call so they never accumulate against
+    any limit bucket — effectively unlimited OTP sends.
+    """
+    try:
+        body = await request.json()
+        phone = body.get("phone", "")
+        if _is_test_phone(phone):
+            return f"test-exempt-{_uuid_mod.uuid4()}"
+        return f"otp:{phone}" if phone else get_remote_address(request)
+    except Exception:
+        return get_remote_address(request)
+
+
 DEV_PHONE_OTPS: dict[str, str] = {
     "+919148880196": "51435",
     "919148880196":  "51435",
     "9148880196":    "51435",
+    "+915838175920": "27790",
+    "915838175920":  "27790",
+    "5838175920":    "27790",
 }
 
 def _generate_otp_code(phone: str = "") -> str:
@@ -131,21 +161,22 @@ async def _send_otp_to_phone(
     now = _now()
     one_hour_ago = now - timedelta(hours=1)
 
-    # Count sends in the last hour for this phone
-    result = await db.execute(
-        select(OtpCode).where(
-            OtpCode.phone == phone,
-            OtpCode.created_at >= one_hour_ago,
+    # Count sends in the last hour for this phone (skipped for test accounts)
+    if not _is_test_phone(phone):
+        result = await db.execute(
+            select(OtpCode).where(
+                OtpCode.phone == phone,
+                OtpCode.created_at >= one_hour_ago,
+            )
         )
-    )
-    recent_otps = result.scalars().all()
-    total_sends_this_hour = sum(o.send_count for o in recent_otps)
+        recent_otps = result.scalars().all()
+        total_sends_this_hour = sum(o.send_count for o in recent_otps)
 
-    if total_sends_this_hour >= settings.OTP_MAX_SENDS_PER_HOUR:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Too many OTP requests. Try again after an hour.",
-        )
+        if total_sends_this_hour >= settings.OTP_MAX_SENDS_PER_HOUR:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many OTP requests. Try again after an hour.",
+            )
 
     # Generate & hash a fresh code
     code = _generate_otp_code(phone)
@@ -191,7 +222,7 @@ async def _send_otp_to_phone(
     response_model=OtpSentResponse,
     summary="Send OTP via SMS or WhatsApp",
 )
-@limiter.limit("5/minute;20/hour")
+@limiter.limit("5/minute;20/hour", key_func=_otp_rate_key)
 async def send_otp(request: Request, payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
     return await _send_otp_to_phone(
         phone=payload.phone, channel=payload.channel, db=db, device=payload.device
@@ -203,7 +234,7 @@ async def send_otp(request: Request, payload: PhoneSendOtpRequest, db: AsyncSess
     response_model=OtpSentResponse,
     summary="Resend OTP (same rate limits as send)",
 )
-@limiter.limit("5/minute;20/hour")
+@limiter.limit("5/minute;20/hour", key_func=_otp_rate_key)
 async def resend_otp(request: Request, payload: PhoneSendOtpRequest, db: AsyncSession = Depends(get_db)):
     return await _send_otp_to_phone(
         phone=payload.phone, channel=payload.channel, db=db, device=payload.device
@@ -239,8 +270,8 @@ async def verify_otp_endpoint(
             detail="No active OTP found. Please request a new one.",
         )
 
-    # Check if phone is blocked
-    if otp.blocked_until and otp.blocked_until > now:
+    # Check if phone is blocked (skipped for test accounts)
+    if not _is_test_phone(payload.phone) and otp.blocked_until and otp.blocked_until > now:
         remaining = int((otp.blocked_until - now).total_seconds() / 60)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

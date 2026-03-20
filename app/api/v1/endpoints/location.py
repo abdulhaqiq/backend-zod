@@ -8,7 +8,7 @@ POST /location/update
   Saves: latitude, longitude, city, address, country, location_updated_at.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -189,28 +189,38 @@ async def change_city(
     """
     coords = await _geocode_place(body.place_id, body.city, body.country)
 
-    current_user.city               = body.city
-    current_user.country            = body.country
+    # Snapshot real GPS before overwriting (only on the first activation, not if already in travel mode)
+    if not current_user.travel_mode_enabled:
+        current_user.real_latitude  = current_user.latitude
+        current_user.real_longitude = current_user.longitude
+        current_user.real_city      = current_user.city
+        current_user.real_country   = current_user.country
+
+    now = datetime.now(timezone.utc)
+    current_user.city                = body.city
+    current_user.country             = body.country
     current_user.travel_mode_enabled = True
-    current_user.travel_city        = body.city
-    current_user.travel_country     = body.country
+    current_user.travel_city         = body.city
+    current_user.travel_country      = body.country
+    current_user.travel_expires_at   = now + timedelta(days=7)
 
     if coords:
         current_user.latitude  = coords[0]
         current_user.longitude = coords[1]
-        current_user.location_updated_at = datetime.now(timezone.utc)
+        current_user.location_updated_at = now
 
     await db.commit()
 
     logger.info(
-        "Travel mode set for user %s → %s, %s (coords=%s)",
-        current_user.id, body.city, body.country, coords,
+        "Travel mode set for user %s → %s, %s (coords=%s, expires=%s)",
+        current_user.id, body.city, body.country, coords, current_user.travel_expires_at,
     )
 
     return {
-        "city":    body.city,
-        "country": body.country,
+        "city":               body.city,
+        "country":            body.country,
         "travel_mode_enabled": True,
+        "travel_expires_at":  current_user.travel_expires_at.isoformat(),
     }
 
 

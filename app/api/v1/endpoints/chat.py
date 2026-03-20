@@ -634,6 +634,14 @@ async def websocket_chat(
                 await websocket.send_text(json.dumps({"type": "error", "detail": "empty content"}))
                 continue
 
+            # ── Content restriction (text / answer messages only) ─────────────
+            if msg_type in ("text", "answer", "card"):
+                from app.utils.content_filter import check_content
+                violation = check_content(content)
+                if violation:
+                    await websocket.send_text(json.dumps({"type": "restricted", "detail": violation}))
+                    continue
+
             async with AsyncSessionLocal() as db:
                 msg = Message(
                     room_id=room_id,

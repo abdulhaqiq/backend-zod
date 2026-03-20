@@ -235,6 +235,7 @@ class MeResponse(BaseModel):
     auto_zod_enabled: bool
     travel_city: str | None
     travel_country: str | None
+    travel_expires_at: datetime | None
 
     face_match_score: float | None
     verification_status: str   # unverified | pending | verified | rejected
