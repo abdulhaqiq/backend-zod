@@ -438,23 +438,29 @@ async def _fetch_discover_profiles(
 
     has_my_location = me_lat is not None and me_lon is not None
 
+    # Extract candidate IDs before any potential rollback, because rollback()
+    # expires all tracked ORM objects and accessing .id afterwards triggers a
+    # sync lazy-load which crashes in async asyncpg (MissingGreenlet).
+    candidate_ids = [u.id for u in candidates]
+
     # ── Compatibility scores ──────────────────────────────────────────────────
     try:
         my_score = await get_or_create_score(me, db)
     except Exception:
         # Roll back the aborted transaction so the connection stays usable.
         await db.rollback()
-        # After rollback SQLAlchemy expires all ORM objects, so `me`'s attributes
-        # would trigger a sync lazy-load (MissingGreenlet) inside heuristic_score_obj.
-        # Refresh `me` first so all columns are rehydrated asynchronously.
+        # After rollback SQLAlchemy expires all ORM objects — refresh them all
+        # asynchronously before any attribute access below.
         try:
             await db.refresh(me)
         except Exception:
             pass
+        for u in candidates:
+            try:
+                await db.refresh(u)
+            except Exception:
+                pass
         my_score = heuristic_score_obj(me)  # type: ignore[assignment]
-
-    # Bulk-fetch scores for all candidates in one query
-    candidate_ids = [u.id for u in candidates]
     score_rows = {}
     if candidate_ids:
         score_result = await db.execute(
