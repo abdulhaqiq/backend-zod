@@ -229,6 +229,9 @@ _APP_KEY_PUBLIC = (
     "/health", "/", "/openapi.json", "/docs", "/redoc",
     # LinkedIn OAuth callback — LinkedIn redirects here directly (no app key)
     "/api/v1/linkedin/callback",
+    # WebSocket connections use the WS constructor, not fetch — can't send custom headers
+    "/api/v1/ws/",
+    "/ws/",
 )
 
 
