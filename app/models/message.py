@@ -22,9 +22,14 @@ class Message(Base):
 
     content: Mapped[str] = mapped_column(Text, nullable=False)
     msg_type: Mapped[str] = mapped_column(String(20), nullable=False, default="text")
-    extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # card/answer metadata
+    extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set the first time the receiver marks the message as read
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set whenever the sender edits the message content
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

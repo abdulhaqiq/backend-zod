@@ -22,6 +22,9 @@ import app.models.user_score  # noqa: F401
 import app.models.user_compatibility  # noqa: F401
 import app.models.gift_card  # noqa: F401
 import app.models.user_report  # noqa: F401
+import app.models.message  # noqa: F401
+import app.models.message_reaction  # noqa: F401
+import app.models.tod_round  # noqa: F401
 
 
 @asynccontextmanager
@@ -53,6 +56,13 @@ async def lifespan(app: FastAPI):
         ))
         await conn.execute(_text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS real_country VARCHAR(128)"
+        ))
+        # Message enhancements
+        await conn.execute(_text(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ"
         ))
         # user_compatibility is created by create_all above; nothing to backfill
     

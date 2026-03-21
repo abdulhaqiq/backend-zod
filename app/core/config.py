@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"
 
+    # Expo Push Notifications (optional — improves rate limits in production)
+    # Generate at: https://expo.dev/accounts/<username>/settings/access-tokens
+    EXPO_ACCESS_TOKEN: str = ""
+
     # DigitalOcean Spaces
     DO_SPACES_KEY: str = ""
     DO_SPACES_SECRET: str = ""

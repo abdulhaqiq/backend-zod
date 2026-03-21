@@ -1,9 +1,23 @@
 """
-Expo Push Notification helper.
+Push-notification gateway — Expo Push API.
 
-Uses the Expo push API (https://exp.host/--/api/v2/push/send) which works
-for both iOS (APNs) and Android (FCM) through a single endpoint.
-No SDK credentials needed — only the ExponentPushToken saved per-user.
+The mobile app registers an ExponentPushToken[…] (via expo-notifications) and
+saves it to the backend via POST /profile/me/push-token.  Expo's gateway then
+proxies the notification to FCM (Android) or APNs (iOS) transparently, so this
+single implementation covers both platforms.
+
+Usage
+-----
+    from app.core.push import send_push_notification
+
+    await send_push_notification(
+        user.push_token,
+        title="💬 Alice",
+        body="Hey, are you free tonight?",
+        data={"type": "chat", "other_user_id": "..."},
+    )
+
+If push_token is None or empty the call is a no-op.
 """
 from __future__ import annotations
 
@@ -14,64 +28,81 @@ import httpx
 
 _log = logging.getLogger(__name__)
 
-EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+_EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+
+# Optional: set EXPO_ACCESS_TOKEN in .env to authenticate with Expo's push service.
+# Without it requests still work but are subject to stricter rate limits.
+_expo_access_token: str | None = None
+try:
+    from app.core.config import settings
+    _expo_access_token = getattr(settings, "EXPO_ACCESS_TOKEN", None) or None
+except Exception:
+    pass
 
 
 async def send_push_notification(
-    token: str | None,
+    push_token: str | None,
+    *,
     title: str,
     body: str,
     data: dict[str, Any] | None = None,
-    *,
-    sound: str = "default",
+    channel_id: str = "default",
+    priority: str = "high",
     badge: int | None = None,
 ) -> None:
-    """Fire-and-forget: send one Expo push notification.
-
-    Silently does nothing if the token is missing or not an Expo token.
-    Network errors are logged but never raised — push is best-effort.
     """
-    if not token or not token.startswith("ExponentPushToken"):
+    Send a single push notification to a device via Expo's push gateway.
+
+    Parameters
+    ----------
+    push_token:  ExponentPushToken[…] stored on the User model.
+    title:       Bold headline (shown in the notification banner).
+    body:        Notification body text.
+    data:        Extra payload delivered to the app when the notification is
+                 tapped (deep-linking, call metadata, etc.).
+    channel_id:  Android notification channel ("default" or "incoming_call").
+    priority:    "default" | "normal" | "high".
+    badge:       iOS badge count override (omit to leave unchanged).
+    """
+    if not push_token:
         return
 
-    payload: dict[str, Any] = {
-        "to":    token,
-        "title": title,
-        "body":  body,
-        "sound": sound,
-        "data":  data or {},
+    message: dict[str, Any] = {
+        "to":        push_token,
+        "title":     title,
+        "body":      body,
+        "sound":     "default",
+        "priority":  priority,
+        "channelId": channel_id,
     }
+    if data:
+        message["data"] = data
     if badge is not None:
-        payload["badge"] = badge
+        message["badge"] = badge
 
-    try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            resp = await client.post(
-                EXPO_PUSH_URL,
-                json=payload,
-                headers={"Accept": "application/json", "Accept-Encoding": "gzip, deflate"},
-            )
-            if resp.status_code >= 400:
-                _log.warning("Expo push error %s: %s", resp.status_code, resp.text[:200])
-    except Exception as exc:
-        _log.warning("push notification failed (token=%.20s…): %s", token, exc)
+    headers: dict[str, str] = {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if _expo_access_token:
+        headers["Authorization"] = f"Bearer {_expo_access_token}"
 
-
-async def send_push_bulk(notifications: list[dict[str, Any]]) -> None:
-    """Send multiple notifications in a single Expo batch request (max 100)."""
-    if not notifications:
-        return
-    valid = [n for n in notifications if n.get("to", "").startswith("ExponentPushToken")]
-    if not valid:
-        return
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                EXPO_PUSH_URL,
-                json=valid,
-                headers={"Accept": "application/json", "Accept-Encoding": "gzip, deflate"},
+            resp = await client.post(_EXPO_PUSH_URL, json=message, headers=headers)
+            result = resp.json()
+
+        ticket = result.get("data") if isinstance(result, dict) else None
+        if isinstance(ticket, dict) and ticket.get("status") == "error":
+            _log.warning(
+                "push | delivery error token=%s… msg=%s details=%s",
+                push_token[:24],
+                ticket.get("message"),
+                ticket.get("details"),
             )
-            if resp.status_code >= 400:
-                _log.warning("Expo push bulk error %s: %s", resp.status_code, resp.text[:200])
+        else:
+            _log.debug("push | sent token=%s… status=%s", push_token[:24], ticket)
+
     except Exception as exc:
-        _log.warning("push bulk failed: %s", exc)
+        _log.warning("push | HTTP error: %s", exc)

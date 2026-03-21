@@ -27,6 +27,7 @@ from app.api.v1.endpoints.auth import get_current_user
 from app.core.push import send_push_notification
 from app.db.session import AsyncSessionLocal, get_db
 from app.models.message import Message
+from app.models.message_reaction import MessageReaction
 from app.models.user import User
 from app.models.user_report import UserReport
 
@@ -331,7 +332,7 @@ async def websocket_notify(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _msg_to_dict(m: Message) -> dict[str, Any]:
+def _msg_to_dict(m: Message, reactions: list[dict] | None = None) -> dict[str, Any]:
     return {
         "id":          str(m.id),
         "room_id":     m.room_id,
@@ -339,10 +340,24 @@ def _msg_to_dict(m: Message) -> dict[str, Any]:
         "receiver_id": str(m.receiver_id),
         "content":     m.content,
         "msg_type":    m.msg_type,
-        "metadata": m.extra,
+        "metadata":    m.extra,
         "is_read":     m.is_read,
+        "read_at":     m.read_at.isoformat() if m.read_at else None,
+        "edited_at":   m.edited_at.isoformat() if m.edited_at else None,
         "created_at":  m.created_at.isoformat(),
+        "reactions":   reactions or [],
     }
+
+
+async def _get_reactions(db: AsyncSession, message_id: uuid.UUID) -> list[dict]:
+    """Return all reactions for a message as [{emoji, user_id, created_at}]."""
+    rows = (await db.execute(
+        select(MessageReaction).where(MessageReaction.message_id == message_id)
+    )).scalars().all()
+    return [
+        {"emoji": r.emoji, "user_id": str(r.user_id), "created_at": r.created_at.isoformat()}
+        for r in rows
+    ]
 
 
 async def _get_user_by_id(db: AsyncSession, uid: str | uuid.UUID) -> User | None:
@@ -437,6 +452,7 @@ async def websocket_chat(
 
             # ── Read receipt ──────────────────────────────────────────────────
             if msg_type_ws == "read":
+                now_utc = datetime.now(timezone.utc)
                 async with AsyncSessionLocal() as db:
                     await db.execute(
                         update(Message)
@@ -446,33 +462,142 @@ async def websocket_chat(
                             Message.receiver_id == current_user.id,
                             Message.is_read == False,  # noqa: E712
                         )
-                        .values(is_read=True)
+                        .values(is_read=True, read_at=now_utc)
                     )
                     await db.commit()
-                await manager.send_to(uid_other, {"type": "read", "reader_id": uid_me})
+                await manager.send_to(uid_other, {
+                    "type": "read", "reader_id": uid_me,
+                    "read_at": now_utc.isoformat(),
+                })
                 continue
 
             # ── Truth-or-Dare game messages ───────────────────────────────────
-            if msg_type_ws in ("tod_invite", "tod_accept", "tod_answer", "tod_next"):
+            if msg_type_ws in ("tod_invite", "tod_choice", "tod_accept", "tod_answer", "tod_next", "tod_skip"):
+                from app.models.tod_round import TodRound
+                from datetime import timedelta
+
                 game_meta = payload_in.get("extra") or {}
                 game_meta["sender_id"] = uid_me
-
-                # Map ws type → db msg_type
-                db_msg_type = msg_type_ws  # tod_invite | tod_accept | tod_answer | tod_next
                 game_content = payload_in.get("content", "🎲 Truth or Dare")
+                now_utc = datetime.now(timezone.utc)
+                game_ttl = timedelta(hours=12)
 
                 async with AsyncSessionLocal() as db:
+                    # ── 1. Persist the chat message (existing behaviour) ──────
                     msg = Message(
                         room_id=room_id,
                         sender_id=current_user.id,
                         receiver_id=other_user.id,
                         content=game_content,
-                        msg_type=db_msg_type,
+                        msg_type=msg_type_ws,
                         extra=game_meta,
                         is_read=False,
-                        created_at=datetime.now(timezone.utc),
+                        created_at=now_utc,
                     )
                     db.add(msg)
+                    await db.flush()          # gives msg.id without committing yet
+
+                    # ── 2. Create / update the dedicated tod_rounds row ───────
+                    if msg_type_ws == "tod_invite":
+                        # Expire any active rounds in this room (started within 12 h)
+                        active_cutoff = now_utc - game_ttl
+                        active_rounds = (await db.execute(
+                            select(TodRound).where(
+                                TodRound.room_id == room_id,
+                                TodRound.status.notin_(["answered", "skipped", "expired"]),
+                                TodRound.created_at >= active_cutoff,
+                            )
+                        )).scalars().all()
+                        for old_round in active_rounds:
+                            old_round.status = "expired"
+                            old_round.updated_at = now_utc
+
+                        # Start a fresh round
+                        tod_row = TodRound(
+                            room_id=room_id,
+                            invite_msg_id=msg.id,
+                            sender_id=current_user.id,
+                            receiver_id=other_user.id,
+                            status="invited",
+                            created_at=now_utc,
+                            updated_at=now_utc,
+                        )
+                        db.add(tod_row)
+
+                    elif msg_type_ws == "tod_skip":
+                        # Receiver skipped — mark the round as skipped
+                        turn_id_raw = game_meta.get("turnMsgId")
+                        if turn_id_raw:
+                            try:
+                                turn_uuid = uuid.UUID(str(turn_id_raw))
+                                tod_row = (await db.execute(
+                                    select(TodRound).where(TodRound.question_msg_id == turn_uuid)
+                                )).scalar_one_or_none()
+                                if tod_row:
+                                    tod_row.status       = "skipped"
+                                    tod_row.updated_at   = now_utc
+                                    tod_row.completed_at = now_utc
+                            except (ValueError, TypeError):
+                                pass
+
+                    elif msg_type_ws == "tod_choice":
+                        # Partner chose Truth or Dare — update the open round
+                        invite_id_raw = game_meta.get("inviteId")
+                        if invite_id_raw:
+                            try:
+                                invite_uuid = uuid.UUID(str(invite_id_raw))
+                                tod_row = (await db.execute(
+                                    select(TodRound).where(TodRound.invite_msg_id == invite_uuid)
+                                )).scalar_one_or_none()
+                                if tod_row:
+                                    tod_row.choice = game_meta.get("choice")
+                                    tod_row.status = "choice_made"
+                                    tod_row.updated_at = now_utc
+                            except (ValueError, TypeError):
+                                pass
+
+                    elif msg_type_ws == "tod_next":
+                        # Sender picked and sent the actual question card
+                        invite_id_raw = game_meta.get("inviteId")
+                        if invite_id_raw:
+                            try:
+                                invite_uuid = uuid.UUID(str(invite_id_raw))
+                                tod_row = (await db.execute(
+                                    select(TodRound).where(TodRound.invite_msg_id == invite_uuid)
+                                )).scalar_one_or_none()
+                                if tod_row:
+                                    tod_row.question          = game_meta.get("question")
+                                    tod_row.question_emoji    = game_meta.get("emoji")
+                                    tod_row.question_category = game_meta.get("category")
+                                    tod_row.question_msg_id   = msg.id
+                                    tod_row.status            = "question_sent"
+                                    tod_row.updated_at        = now_utc
+                            except (ValueError, TypeError):
+                                pass
+
+                    elif msg_type_ws == "tod_answer":
+                        # Receiver answered — complete the round
+                        turn_id_raw = game_meta.get("turnMsgId") or game_meta.get("inviteId")
+                        if turn_id_raw:
+                            try:
+                                turn_uuid = uuid.UUID(str(turn_id_raw))
+                                # Try to find by question_msg_id first, then invite_msg_id
+                                tod_row = (await db.execute(
+                                    select(TodRound).where(TodRound.question_msg_id == turn_uuid)
+                                )).scalar_one_or_none()
+                                if not tod_row:
+                                    tod_row = (await db.execute(
+                                        select(TodRound).where(TodRound.invite_msg_id == turn_uuid)
+                                    )).scalar_one_or_none()
+                                if tod_row:
+                                    tod_row.answer        = game_content
+                                    tod_row.answer_msg_id = msg.id
+                                    tod_row.status        = "answered"
+                                    tod_row.updated_at    = now_utc
+                                    tod_row.completed_at  = now_utc
+                            except (ValueError, TypeError):
+                                pass
+
                     await db.commit()
                     await db.refresh(msg)
                     msg_dict = _msg_to_dict(msg)
@@ -483,15 +608,27 @@ async def websocket_chat(
                 await websocket.send_text(json.dumps(outgoing))
                 delivered = await manager.send_to(uid_other, outgoing)
 
+                notify_payload = {"type": "new_message", **msg_dict}
+                await notify_manager.send_to(uid_me, notify_payload)
                 if not delivered:
-                    await notify_manager.send_to(uid_other, {"type": "new_message", **msg_dict})
-                    if msg_type_ws == "tod_invite":
-                        await send_push_notification(
-                            other_push_token,
-                            title=f"🎲 {current_user.full_name or 'Someone'} wants to play!",
-                            body="Truth or Dare — tap to join!",
-                            data={"type": "chat", "room_id": room_id, "other_user_id": uid_me},
-                        )
+                    await notify_manager.send_to(uid_other, notify_payload)
+                    sender_name = current_user.full_name or "Someone"
+                    _choice_label = (game_meta.get("choice") or "truth").capitalize()
+                    tod_push_map = {
+                        "tod_invite":  (f"🎲 {sender_name} wants to play!", "Truth or Dare — tap to join!"),
+                        "tod_choice":  (f"🎲 {sender_name} chose {_choice_label}!", f"Send them a {_choice_label} question now →"),
+                        "tod_accept":  (f"🎲 {sender_name} accepted!", "They're ready to play Truth or Dare"),
+                        "tod_answer":  (f"🎲 {sender_name} answered!", "Tap to see their answer"),
+                        "tod_next":    (f"🎲 {sender_name} sent a question!", "Truth or Dare — your turn"),
+                        "tod_skip":    (f"↩ {sender_name} skipped", "They'll need a new question — send another!"),
+                    }
+                    push_title, push_body = tod_push_map.get(msg_type_ws, (f"🎲 {sender_name}", game_content[:80]))
+                    await send_push_notification(
+                        other_push_token,
+                        title=push_title,
+                        body=push_body,
+                        data={"type": "chat", "room_id": room_id, "other_user_id": uid_me},
+                    )
                 continue
 
             # ── Game response (receiver answered a bubble — update in-place) ───
@@ -499,13 +636,26 @@ async def websocket_chat(
                 ref_msg_id = payload_in.get("ref_msg_id")
                 response_extra = payload_in.get("extra") or {}
                 response_extra["responder_id"] = uid_me
-                # Just relay to the other user so their bubble updates in-place too
                 relay = {
                     "type": "game_response",
                     "ref_msg_id": ref_msg_id,
                     "extra": response_extra,
                 }
-                await manager.send_to(uid_other, relay)
+                delivered_relay = await manager.send_to(uid_other, relay)
+                # Also push via notify channel so other screens (ChatsPage) can update
+                if not delivered_relay:
+                    await notify_manager.send_to(uid_other, relay)
+                    # Push notification so the original sender knows their partner responded
+                    async with AsyncSessionLocal() as db:
+                        fresh_other = await _get_user_by_id(db, uid_other)
+                        other_push_token = fresh_other.push_token if fresh_other else None
+                    responder_name = current_user.full_name or "Someone"
+                    await send_push_notification(
+                        other_push_token,
+                        title=f"🎮 {responder_name} responded!",
+                        body="They answered your game card — tap to see!",
+                        data={"type": "chat", "room_id": room_id, "other_user_id": uid_me},
+                    )
                 continue
 
             # ── Mini-game messages ────────────────────────────────────────────
@@ -550,8 +700,10 @@ async def websocket_chat(
                 await websocket.send_text(json.dumps(outgoing))
                 delivered = await manager.send_to(uid_other, outgoing)
 
+                notify_payload = {"type": "new_message", **msg_dict}
+                await notify_manager.send_to(uid_me, notify_payload)
                 if not delivered:
-                    await notify_manager.send_to(uid_other, {"type": "new_message", **msg_dict})
+                    await notify_manager.send_to(uid_other, notify_payload)
                     await send_push_notification(
                         other_push_token,
                         title=push_title,
@@ -667,13 +819,13 @@ async def websocket_chat(
             await websocket.send_text(json.dumps(outgoing))
             delivered = await manager.send_to(uid_other, outgoing)
 
-            # If recipient isn't in this chat room, push via notify_manager so
-            # any open screen (ChatsPage, FeedScreen, etc.) can handle it.
+            # Always notify both parties via notify_manager so ChatsPage stays live.
+            # Sender gets the echo so their own conversation list updates in real-time.
+            # Recipient gets it so their list updates even when not inside the chat room.
+            notify_payload = {"type": "new_message", **msg_dict}
+            await notify_manager.send_to(uid_me,    notify_payload)
             if not delivered:
-                await notify_manager.send_to(uid_other, {
-                    "type":    "new_message",
-                    **msg_dict,
-                })
+                await notify_manager.send_to(uid_other, notify_payload)
 
             # Push notification if the recipient is offline
             if not delivered:
@@ -683,12 +835,28 @@ async def websocket_chat(
                     preview = "📷 Sent a photo"
                 elif msg_type == "voice":
                     preview = "🎙️ Sent a voice message"
-                elif msg_type in ("tod_invite",):
-                    preview = "🎯 Wants to play Truth or Dare"
-                elif msg_type in ("tod_answer",):
-                    preview = "🎯 Answered your Truth or Dare"
-                elif msg_type in ("question_cards", "wyr", "hot_takes", "nhi"):
+                elif msg_type == "card":
+                    preview = "🃏 Sent a card"
+                elif msg_type in ("game_wyr", "wyr"):
+                    preview = "🤷 Sent a Would You Rather"
+                elif msg_type in ("game_nhi", "nhi"):
+                    preview = "🍹 Sent Never Have I Ever"
+                elif msg_type in ("game_hot", "hot_takes"):
+                    preview = "🔥 Sent a Hot Take"
+                elif msg_type in ("game_quiz",):
+                    preview = "💘 Sent a Compatibility Quiz"
+                elif msg_type in ("game_date",):
+                    preview = "🗓️ Sent Build a Date"
+                elif msg_type in ("game_emoji",):
+                    preview = "😂 Sent an Emoji Story"
+                elif msg_type in ("question_cards",):
                     preview = "🎮 Sent a game card"
+                elif msg_type == "tod_invite":
+                    preview = "🎲 Wants to play Truth or Dare"
+                elif msg_type == "tod_answer":
+                    preview = "🎲 Answered your Truth or Dare"
+                elif msg_type == "call":
+                    preview = "📞 Missed call"
                 else:
                     preview = content[:80]
                 await send_push_notification(
@@ -836,6 +1004,7 @@ async def get_messages(
     other_user_id: str,
     limit:  int = Query(50,  ge=1, le=200),
     before: str = Query(None, description="ISO timestamp — fetch messages older than this"),
+    after:  str = Query(None, description="ISO timestamp — fetch messages newer than this (catch-up)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession    = Depends(get_db),
 ):
@@ -858,11 +1027,35 @@ async def get_messages(
             query = query.where(Message.created_at < before_dt)
         except ValueError:
             pass
+    if after:
+        try:
+            after_dt = datetime.fromisoformat(after)
+            query = query.where(Message.created_at > after_dt)
+        except ValueError:
+            pass
 
     result = await db.execute(query)
     messages = list(reversed(result.scalars().all()))
 
-    return {"messages": [_msg_to_dict(m) for m in messages], "total": len(messages)}
+    # Batch-fetch all reactions for this page in a single query (avoids N+1)
+    reactions_by_msg: dict[uuid.UUID, list[dict]] = {}
+    if messages:
+        msg_ids = [m.id for m in messages]
+        rxn_rows = (await db.execute(
+            select(MessageReaction).where(MessageReaction.message_id.in_(msg_ids))
+        )).scalars().all()
+        for r in rxn_rows:
+            reactions_by_msg.setdefault(r.message_id, []).append({
+                "emoji":      r.emoji,
+                "user_id":    str(r.user_id),
+                "created_at": r.created_at.isoformat(),
+            })
+
+    return {
+        "messages": [_msg_to_dict(m, reactions_by_msg.get(m.id, [])) for m in messages],
+        "total":    len(messages),
+        "has_more": len(messages) == limit,
+    }
 
 
 @router.post("/chat/{other_user_id}/messages", status_code=201, summary="Send a message (REST fallback)")
@@ -918,12 +1111,11 @@ async def send_message(
     # Also echo to sender if they are connected
     await manager.send_to(str(current_user.id), outgoing)
 
-    # If recipient isn't in this chat room, deliver via notify_manager
+    # Notify both parties via notify_manager so ChatsPage stays live on both sides
+    notify_payload = {"type": "new_message", **msg_dict}
+    await notify_manager.send_to(str(current_user.id), notify_payload)
     if not delivered:
-        await notify_manager.send_to(str(other_uuid), {
-            "type": "new_message",
-            **msg_dict,
-        })
+        await notify_manager.send_to(str(other_uuid), notify_payload)
 
     if not delivered:
         sender_name = current_user.full_name or "Someone"
@@ -956,6 +1148,7 @@ async def mark_read(
 
     room_id = Message.make_room_id(current_user.id, other_uuid)
 
+    now_utc = datetime.now(timezone.utc)
     await db.execute(
         update(Message)
         .where(
@@ -964,14 +1157,184 @@ async def mark_read(
             Message.receiver_id == current_user.id,
             Message.is_read == False,  # noqa: E712
         )
-        .values(is_read=True)
+        .values(is_read=True, read_at=now_utc)
     )
     await db.commit()
 
-    # Notify the sender that messages were read
-    await manager.send_to(str(other_uuid), {"type": "read", "reader_id": str(current_user.id)})
+    await manager.send_to(str(other_uuid), {
+        "type": "read",
+        "reader_id": str(current_user.id),
+        "read_at": now_utc.isoformat(),
+    })
 
     return {"ok": True}
+
+
+# ── React to a message ───────────────────────────────────────────────────────
+
+class ReactBody(BaseModel):
+    emoji: str
+
+
+@router.post("/chat/messages/{message_id}/react", summary="Add or toggle an emoji reaction")
+async def react_to_message(
+    message_id: str,
+    body: ReactBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Toggle a reaction: if the user has already reacted with this emoji, the
+    reaction is removed (un-react). Otherwise it is added.
+    The partner is notified in real-time via the notify WebSocket.
+    """
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    emoji = body.emoji.strip()[:16]
+    if not emoji:
+        raise HTTPException(status_code=422, detail="emoji is required")
+
+    msg: Message | None = await db.get(Message, msg_uuid)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    uid_me    = str(current_user.id)
+    # Partner is whoever is in the conversation but isn't us
+    uid_other = str(msg.receiver_id) if str(msg.sender_id) == uid_me else str(msg.sender_id)
+
+    # Check for existing reaction
+    existing = (await db.execute(
+        select(MessageReaction).where(
+            MessageReaction.message_id == msg_uuid,
+            MessageReaction.user_id    == current_user.id,
+            MessageReaction.emoji      == emoji,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        await db.delete(existing)
+        action = "removed"
+    else:
+        db.add(MessageReaction(
+            message_id=msg_uuid,
+            user_id=current_user.id,
+            emoji=emoji,
+        ))
+        action = "added"
+
+    await db.commit()
+
+    # Re-fetch full reaction list and relay to both parties
+    reactions = await _get_reactions(db, msg_uuid)
+    relay = {
+        "type":       "reaction_update",
+        "message_id": message_id,
+        "reactions":  reactions,
+    }
+    await notify_manager.send_to(uid_me,    relay)
+    await notify_manager.send_to(uid_other, relay)
+    await manager.send_to(uid_other, relay)
+
+    return {"action": action, "reactions": reactions}
+
+
+# ── Edit a message ────────────────────────────────────────────────────────────
+
+class EditBody(BaseModel):
+    content: str
+
+
+@router.patch("/chat/messages/{message_id}", summary="Edit a sent message")
+async def edit_message(
+    message_id: str,
+    body: EditBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Sender can edit the content of a text message they sent.
+    Only text messages can be edited; media and game messages are rejected.
+    The partner is notified in real-time.
+    """
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    msg: Message | None = await db.get(Message, msg_uuid)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only edit your own messages")
+    if msg.msg_type not in ("text", "answer"):
+        raise HTTPException(status_code=422, detail="Only text messages can be edited")
+
+    new_content = body.content.strip()
+    if not new_content:
+        raise HTTPException(status_code=422, detail="content cannot be empty")
+
+    from app.utils.content_filter import check_content
+    violation = check_content(new_content)
+    if violation:
+        raise HTTPException(status_code=422, detail=violation)
+
+    msg.content   = new_content
+    msg.edited_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(msg)
+
+    uid_other = str(msg.receiver_id)
+    relay = {
+        "type":       "message_edited",
+        "message_id": message_id,
+        "content":    new_content,
+        "edited_at":  msg.edited_at.isoformat(),
+    }
+    await notify_manager.send_to(str(current_user.id), relay)
+    await notify_manager.send_to(uid_other, relay)
+    await manager.send_to(uid_other, relay)
+
+    return {"ok": True, "edited_at": msg.edited_at.isoformat()}
+
+
+# ── Message info (delivery + read times) ─────────────────────────────────────
+
+@router.get("/chat/messages/{message_id}/info", summary="Get delivery and read timestamps for a message")
+async def message_info(
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Returns sent_at, delivered_at (same as sent for WebSocket delivery),
+    and read_at for a message the current user sent or received.
+    """
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    msg: Message | None = await db.get(Message, msg_uuid)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    uid_me = str(current_user.id)
+    if str(msg.sender_id) != uid_me and str(msg.receiver_id) != uid_me:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    reactions = await _get_reactions(db, msg_uuid)
+
+    return {
+        "message_id":   message_id,
+        "sent_at":      msg.created_at.isoformat(),
+        "edited_at":    msg.edited_at.isoformat() if msg.edited_at else None,
+        "is_read":      msg.is_read,
+        "read_at":      msg.read_at.isoformat() if msg.read_at else None,
+        "reactions":    reactions,
+    }
 
 
 # ── Unmatch ───────────────────────────────────────────────────────────────────
@@ -1119,3 +1482,58 @@ async def report_user(
     await db.commit()
 
     return {"ok": True}
+
+
+# ── Truth-or-Dare game history ────────────────────────────────────────────────
+
+@router.get("/chat/{other_user_id}/tod-history", summary="Paginated Truth-or-Dare round history")
+async def get_tod_history(
+    other_user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Returns all Truth-or-Dare rounds played in a conversation, newest first.
+    Each row contains the full lifecycle: invite → choice → question → answer.
+    """
+    from app.models.tod_round import TodRound
+
+    try:
+        uuid.UUID(other_user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    room_id = Message.make_room_id(current_user.id, uuid.UUID(other_user_id))
+
+    result = await db.execute(
+        select(TodRound)
+        .where(TodRound.room_id == room_id)
+        .order_by(TodRound.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+
+    def _row(r: TodRound) -> dict:
+        return {
+            "id":                 str(r.id),
+            "room_id":            r.room_id,
+            "invite_msg_id":      str(r.invite_msg_id) if r.invite_msg_id else None,
+            "sender_id":          str(r.sender_id),
+            "receiver_id":        str(r.receiver_id),
+            "choice":             r.choice,
+            "question":           r.question,
+            "question_emoji":     r.question_emoji,
+            "question_category":  r.question_category,
+            "question_msg_id":    str(r.question_msg_id) if r.question_msg_id else None,
+            "answer":             r.answer,
+            "answer_msg_id":      str(r.answer_msg_id) if r.answer_msg_id else None,
+            "status":             r.status,
+            "created_at":         r.created_at.isoformat(),
+            "updated_at":         r.updated_at.isoformat(),
+            "completed_at":       r.completed_at.isoformat() if r.completed_at else None,
+        }
+
+    return {"rounds": [_row(r) for r in rows], "total": len(rows)}
