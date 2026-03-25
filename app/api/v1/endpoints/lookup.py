@@ -46,6 +46,7 @@ async def get_options(
             "category": row.category,
             "emoji": row.emoji,
             "label": row.label,
+            "subcategory": row.subcategory,
         })
     if category:
         return grouped.get(category, [])
@@ -60,4 +61,4 @@ async def get_options_by_category(category: str, db: AsyncSession = Depends(get_
         .order_by(LookupOption.sort_order)
     )
     rows = result.scalars().all()
-    return [{"id": r.id, "category": r.category, "emoji": r.emoji, "label": r.label} for r in rows]
+    return [{"id": r.id, "category": r.category, "emoji": r.emoji, "label": r.label, "subcategory": r.subcategory} for r in rows]

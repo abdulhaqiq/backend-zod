@@ -56,6 +56,9 @@ class VerificationAttempt(Base):
     id_has_dob: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     id_has_expiry: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     id_has_number: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Deep-check: does the name/birth-year on the ID match the user's profile?
+    id_name_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    id_dob_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # ── Shared result ─────────────────────────────────────────────────────────
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

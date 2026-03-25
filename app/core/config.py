@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     LINKEDIN_CLIENT_ID: str = ""
     LINKEDIN_CLIENT_SECRET: str = ""
 
+    # LinkedIn Scraper APIs
+    # Tier 1 — Proxycurl (https://nubela.co/proxycurl)  ~$0.01/call, best quality
+    PROXYCURL_API_KEY: str = ""
+    # Tier 2 — RapidAPI Fresh LinkedIn Profile Data (https://rapidapi.com/freshdata-freshdata-default/api/fresh-linkedin-profile-data)
+    RAPIDAPI_KEY: str = ""
+
     # RevenueCat
     REVENUECAT_PUBLIC_KEY: str = ""        # iOS SDK public key (appl_... or test_...)
     REVENUECAT_SECRET_KEY: str = ""        # V1 secret key from RevenueCat dashboard

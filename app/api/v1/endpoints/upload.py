@@ -22,6 +22,7 @@ from app.core.deps import get_current_user
 from app.core.photo_analyzer import analyze_photo
 from app.core.storage import upload_file, upload_photo
 from app.db.session import AsyncSessionLocal, get_db
+from app.models.lookup import LookupOption
 from app.models.user import User
 from app.models.verification import VerificationAttempt
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,46 +31,6 @@ _log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
-# ─── Duplicate detection ──────────────────────────────────────────────────────
-
-_HASH_THRESHOLD = 8   # hamming distance — 0=identical, >10=different image
-
-
-def _phash_bytes(data: bytes):
-    """Return perceptual hash of image bytes."""
-    import imagehash
-    from PIL import Image as PILImage
-    img = PILImage.open(io.BytesIO(data)).convert("RGB")
-    return imagehash.phash(img)
-
-
-def _is_duplicate(new_bytes: bytes, existing_urls: list[str]) -> tuple[bool, str | None]:
-    """
-    Downloads each existing photo and compares perceptual hashes.
-    Returns (is_duplicate, matching_url | None).
-    """
-    import imagehash
-
-    try:
-        new_hash = _phash_bytes(new_bytes)
-    except Exception as exc:
-        _log.warning("Could not hash new image: %s", exc)
-        return False, None
-
-    for url in existing_urls:
-        try:
-            resp = httpx.get(url, timeout=5, follow_redirects=True)
-            if resp.status_code != 200:
-                continue
-            existing_hash = _phash_bytes(resp.content)
-            distance = new_hash - existing_hash
-            _log.info("Hash distance vs %s → %d", url, distance)
-            if distance <= _HASH_THRESHOLD:
-                return True, url
-        except Exception as exc:
-            _log.warning("Could not fetch/hash existing photo %s: %s", url, exc)
-
-    return False, None
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic"}
 ALLOWED_AUDIO_TYPES = {
@@ -82,137 +43,81 @@ MAX_AUDIO_MB = 20
 MAX_AUDIO_SECONDS = 35  # a little over 30 to allow for encoding overhead
 
 
-FACE_MATCH_THRESHOLD = 80.0   # AWS Rekognition recommendation for high-confidence matching
-FACE_MODEL           = "ArcFace"
-FACE_METRIC          = "cosine"
+FACE_MATCH_THRESHOLD = 80.0   # AWS Rekognition CompareFaces similarity threshold
 
 
-def _pct(distance: float, threshold: float) -> float:
-    """Convert DeepFace distance → 0–100 % confidence (100 = identical)."""
-    return round(max(0.0, (1.0 - distance / threshold)) * 100.0, 1)
 
-
-def _correct_orientation(img):
-    """Apply EXIF orientation tag so the image is right-side up."""
-    try:
-        from PIL import ImageOps
-        return ImageOps.exif_transpose(img)
-    except Exception:
-        return img
+def _to_jpeg_bytes(img_bytes: bytes) -> bytes:
+    """Convert image to JPEG bytes for Rekognition. Handles WebP/HEIC/PNG → JPEG."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(img_bytes)).convert("RGB").save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
 
 def _rekognition_client():
     """Return a boto3 Rekognition client using AWS credentials from settings."""
     import boto3
+    from botocore.config import Config
     from app.core.config import settings
     return boto3.client(
         "rekognition",
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY or None,
         region_name=settings.AWS_REGION or "us-east-1",
+        config=Config(
+            connect_timeout=8,   # seconds to establish connection
+            read_timeout=15,     # seconds to wait for a response
+            retries={"max_attempts": 1},  # no retries — fail fast, caller handles
+        ),
     )
 
 
 def _detect_face_fast(img_bytes: bytes):
     """
-    Face detection using AWS Rekognition (primary) → DeepFace (fallback).
-    Returns (success, reason, age, img_array, face_region).
-
-    AWS Rekognition DetectFaces:
-      - Industry-standard accuracy (used by Tinder, Bumble, Hinge)
-      - Handles varied lighting, angles, expressions, skin tones
-      - Returns age range estimate and face confidence
-      - ~100-200ms latency
-
-    Falls back to DeepFace if AWS credentials are not configured.
+    Face detection via AWS Rekognition DetectFaces.
+    Returns (success, reason, age, jpeg_bytes, face_bounding_box).
+    Quality (sharpness + brightness) is read from Rekognition's Quality field — no NumPy/Pillow math.
     """
-    import io as _io
-    import numpy as np
-    from PIL import Image as PILImage, ImageStat
-    from app.core.config import settings
-
-    # Correct EXIF rotation
-    raw = PILImage.open(_io.BytesIO(img_bytes))
-    img = _correct_orientation(raw).convert("RGB")
-
-    # Brightness check (applies regardless of which engine is used)
-    stat = ImageStat.Stat(img)
-    brightness = sum(stat.mean) / 3
-    if brightness < 35:
-        return False, "Image too dark. Please find better lighting.", None, None, None
-    if brightness > 245:
-        return False, "Image overexposed. Avoid direct bright light.", None, None, None
-
-    img_array = np.array(img)
-
-    # ── Primary: AWS Rekognition ──────────────────────────────────────────────
-    if settings.AWS_ACCESS_KEY_ID:
-        try:
-            import io as _bio
-            buf = _bio.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            jpeg_bytes = buf.getvalue()
-
-            client = _rekognition_client()
-            resp = client.detect_faces(
-                Image={"Bytes": jpeg_bytes},
-                Attributes=["ALL"],
-            )
-            faces = resp.get("FaceDetails", [])
-            if not faces:
-                return False, "No face detected. Make sure your face is clearly visible and well-lit.", None, None, None
-
-            face = faces[0]
-            confidence = face.get("Confidence", 0.0)
-            if confidence < 85.0:
-                return False, "Face not clearly visible. Please ensure good lighting and look directly at the camera.", None, None, None
-
-            age_range = face.get("AgeRange", {})
-            age = (age_range.get("Low", 0) + age_range.get("High", 0)) // 2
-
-            _log.info("face-detect [Rekognition] | confidence=%.1f%% age=%s", confidence, age)
-            return True, None, age, img_array, face.get("BoundingBox", {})
-
-        except Exception as exc:
-            _log.warning("face-detect | Rekognition failed, falling back to DeepFace: %s", exc)
-
-    # ── Fallback: DeepFace ────────────────────────────────────────────────────
     try:
-        from deepface import DeepFace
+        jpeg_bytes = _to_jpeg_bytes(img_bytes)
+    except Exception as exc:
+        _log.warning("face-detect | image conversion failed: %s", exc)
+        return False, "Could not read image. Please try a different photo.", None, None, None
 
-        w, h = img.size
-        min_side = min(w, h)
-        if min_side < 640:
-            scale = 640 / min_side
-            img = img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
-            img_array = np.array(img)
+    try:
+        client = _rekognition_client()
+        resp   = client.detect_faces(Image={"Bytes": jpeg_bytes}, Attributes=["ALL"])
+        faces  = resp.get("FaceDetails", [])
 
-        result = DeepFace.analyze(
-            img_path=img_array,
-            actions=["age"],
-            detector_backend="retinaface",
-            enforce_detection=True,
-            silent=True,
-        )
-        faces = result if isinstance(result, list) else [result]
         if not faces:
-            return False, "No face detected. Make sure your face is clearly visible.", None, None, None
+            return False, "No face detected. Make sure your face is clearly visible and well-lit.", None, None, None
 
-        face = faces[0]
-        age = int(face.get("age", 0))
-        region = face.get("region", {})
-        confidence = face.get("face_confidence", 0.0)
-        if confidence < 0.70:
+        face       = faces[0]
+        confidence = face.get("Confidence", 0.0)
+        if confidence < 85.0:
             return False, "Face not clearly visible. Please ensure good lighting and look directly at the camera.", None, None, None
 
-        _log.info("face-detect [DeepFace] | confidence=%.2f age=%s", confidence, age)
-        return True, None, age, img_array, region
+        quality    = face.get("Quality", {})
+        brightness = float(quality.get("Brightness", 50.0))
+        sharpness  = float(quality.get("Sharpness",  50.0))
+
+        if brightness < 10.0:
+            return False, "Image too dark. Please find better lighting.", None, None, None
+        if brightness > 95.0:
+            return False, "Image overexposed. Avoid direct bright light.", None, None, None
+        if sharpness < 20.0:
+            return False, "Image is too blurry. Please upload a sharper photo.", None, None, None
+
+        age_range = face.get("AgeRange", {})
+        age = (age_range.get("Low", 0) + age_range.get("High", 0)) // 2
+
+        _log.info("face-detect [Rekognition] | confidence=%.1f%% brightness=%.0f sharpness=%.0f age=%s",
+                  confidence, brightness, sharpness, age)
+        return True, None, age, jpeg_bytes, face.get("BoundingBox", {})
 
     except Exception as exc:
-        msg = str(exc).lower()
-        _log.warning("face-detect | DeepFace failed: %s", exc)
-        if any(k in msg for k in ("face", "detected", "could not", "detector")):
-            return False, "No face detected. Make sure your face is fully visible and well-lit.", None, None, None
+        _log.warning("face-detect | Rekognition failed: %s", exc)
         return False, "Could not process image. Please try again.", None, None, None
 
 
@@ -221,35 +126,17 @@ def _match_against_photos(
     photo_urls: list[str],
 ) -> tuple[float, int]:
     """
-    Industry-grade face matching using AWS Rekognition CompareFaces (primary)
-    with DeepFace ArcFace as fallback.
-
+    Face matching using AWS Rekognition CompareFaces exclusively.
     Returns (best_similarity_pct, photos_compared).
-
-    AWS Rekognition CompareFaces:
-      - 99%+ accuracy, same engine used by Tinder, Bumble, Hinge
-      - Handles varied angles, lighting, expressions, ages
-      - Returns similarity 0-100% (not a distance metric — higher = more similar)
-      - ~150ms per comparison
     """
-    import io as _io
-    from PIL import Image as PILImage
-    from app.core.config import settings
-
     best_pct = 0.0
     compared = 0
 
-    # Convert selfie to JPEG bytes once for Rekognition
-    selfie_jpeg: bytes | None = None
-    if settings.AWS_ACCESS_KEY_ID:
-        try:
-            buf = _io.BytesIO()
-            PILImage.open(_io.BytesIO(selfie_img_bytes)).convert("RGB").save(buf, format="JPEG", quality=90)
-            selfie_jpeg = buf.getvalue()
-        except Exception:
-            selfie_jpeg = None
-
-    use_rekognition = bool(selfie_jpeg and settings.AWS_ACCESS_KEY_ID)
+    try:
+        selfie_jpeg = _to_jpeg_bytes(selfie_img_bytes)
+    except Exception as exc:
+        _log.warning("Could not convert selfie to JPEG: %s", exc)
+        return 0.0, 0
 
     for url in photo_urls:
         try:
@@ -257,74 +144,27 @@ def _match_against_photos(
             if resp.status_code != 200:
                 continue
 
-            profile_bytes = resp.content
-            pct: float | None = None
+            target_jpeg = _to_jpeg_bytes(resp.content)
 
-            # ── Primary: AWS Rekognition ──────────────────────────────────────
-            if use_rekognition:
-                try:
-                    # Convert profile photo to JPEG for Rekognition
-                    buf2 = _io.BytesIO()
-                    PILImage.open(_io.BytesIO(profile_bytes)).convert("RGB").save(buf2, format="JPEG", quality=90)
-                    target_jpeg = buf2.getvalue()
-
-                    client = _rekognition_client()
-                    rek_resp = client.compare_faces(
-                        SourceImage={"Bytes": selfie_jpeg},
-                        TargetImage={"Bytes": target_jpeg},
-                        SimilarityThreshold=0,  # get all results, we apply our own threshold
-                    )
-                    matches = rek_resp.get("FaceMatches", [])
-                    if matches:
-                        pct = float(matches[0]["Similarity"])
-                        _log.info("Face match [Rekognition] vs %s → %.1f%%",
-                                  url.split("/")[-1][:24], pct)
-                    else:
-                        # No match found by Rekognition (different person or no face)
-                        pct = 0.0
-                        _log.info("Face match [Rekognition] vs %s → no match",
-                                  url.split("/")[-1][:24])
-                    compared += 1
-                except Exception as exc:
-                    _log.warning("Rekognition compare failed for %s: %s — falling back to DeepFace",
-                                 url.split("/")[-1][:24], exc)
-                    pct = None  # trigger fallback
-
-            # ── Fallback: DeepFace ArcFace ────────────────────────────────────
-            if pct is None:
-                try:
-                    import numpy as np
-                    from deepface import DeepFace
-
-                    selfie_arr  = np.array(PILImage.open(_io.BytesIO(selfie_img_bytes)).convert("RGB"))
-                    profile_arr = np.array(PILImage.open(_io.BytesIO(profile_bytes)).convert("RGB"))
-
-                    result = DeepFace.verify(
-                        img1_path=selfie_arr,
-                        img2_path=profile_arr,
-                        model_name="ArcFace",
-                        distance_metric="cosine",
-                        detector_backend="retinaface",
-                        enforce_detection=False,
-                        silent=True,
-                    )
-                    pct = _pct(result["distance"], result["threshold"])
-                    _log.info("Face match [DeepFace] vs %s → %.1f%%",
-                              url.split("/")[-1][:24], pct)
-                    compared += 1
-                except Exception as exc:
-                    msg = str(exc).lower()
-                    if any(k in msg for k in ("face", "detected", "could not")):
-                        _log.info("No face in profile photo %s — skipping", url.split("/")[-1][:24])
-                    else:
-                        _log.warning("DeepFace match error for %s: %s", url.split("/")[-1][:24], exc)
-                    continue
-
-            if pct is not None and pct > best_pct:
+            client = _rekognition_client()
+            rek_resp = client.compare_faces(
+                SourceImage={"Bytes": selfie_jpeg},
+                TargetImage={"Bytes": target_jpeg},
+                SimilarityThreshold=0,
+            )
+            matches = rek_resp.get("FaceMatches", [])
+            if matches:
+                pct = float(matches[0]["Similarity"])
+                _log.info("[FACE MATCH] Rekognition vs %s → %.1f%%", url.split("/")[-1][:24], pct)
+            else:
+                pct = 0.0
+                _log.info("[FACE MATCH] Rekognition vs %s → no match", url.split("/")[-1][:24])
+            compared += 1
+            if pct > best_pct:
                 best_pct = pct
 
         except Exception as exc:
-            _log.warning("Face-match outer error for %s: %s", url.split("/")[-1][:24], exc)
+            _log.warning("Face-match error for %s: %s", url.split("/")[-1][:24], exc)
 
     return round(best_pct, 1), compared
 
@@ -339,8 +179,36 @@ async def _process_verification(
     """
     Runs after the HTTP response is returned.
     Performs liveness + face-match, then updates the attempt record and user row.
+    Hard timeout: 40 s total.
     """
     _log.info("bg-verify | attempt=%s STARTED", attempt_id)
+    try:
+        await asyncio.wait_for(
+            _run_face_verification(attempt_id, selfie_bytes, photo_urls),
+            timeout=40,
+        )
+    except asyncio.TimeoutError:
+        _log.error("bg-verify | attempt=%s TIMED OUT after 40s", attempt_id)
+        try:
+            async with AsyncSessionLocal() as db:
+                attempt = await db.get(VerificationAttempt, attempt_id)
+                if attempt and attempt.status == "pending":
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = "Face scan timed out. Please try again."
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user = await db.get(User, attempt.user_id)
+                    if user:
+                        user.verification_status = "rejected"
+                    await db.commit()
+        except Exception as e:
+            _log.error("bg-verify | timeout cleanup failed: %s", e)
+
+
+async def _run_face_verification(
+    attempt_id: _uuid.UUID,
+    selfie_bytes: bytes,
+    photo_urls: list[str],
+) -> None:
     async with AsyncSessionLocal() as db:
         attempt: VerificationAttempt | None = await db.get(VerificationAttempt, attempt_id)
         if not attempt:
@@ -589,27 +457,22 @@ async def get_verification_history(
 # ─── ID Verification ──────────────────────────────────────────────────────────
 
 def _extract_id_text(img_bytes: bytes) -> str:
-    """
-    Run EasyOCR on an ID image and return all detected text joined as a string.
-    No GPU required; runs on CPU fine for ID card text sizes.
-    """
-    import io as _io
-    import numpy as np
-    from PIL import Image as PILImage
-    import easyocr
-
-    img = PILImage.open(_io.BytesIO(img_bytes))
-    img = _correct_orientation(img).convert("RGB")
-
-    # Upscale small IDs for better OCR accuracy
-    w, h = img.size
-    if min(w, h) < 600:
-        scale = 600 / min(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
-
-    reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-    results = reader.readtext(np.array(img), detail=0, paragraph=False)
-    return " ".join(results)
+    """Extract text from an ID image using AWS Rekognition DetectText."""
+    try:
+        jpeg_bytes = _to_jpeg_bytes(img_bytes)
+        client = _rekognition_client()
+        resp = client.detect_text(Image={"Bytes": jpeg_bytes})
+        words = [
+            det["DetectedText"]
+            for det in resp.get("TextDetections", [])
+            if det.get("Type") == "WORD" and det.get("Confidence", 0) >= 60
+        ]
+        text = " ".join(words)
+        _log.info("id-ocr | rekognition extracted %d words", len(words))
+        return text
+    except Exception as exc:
+        _log.warning("id-ocr | rekognition failed: %s", exc)
+        return ""
 
 
 _DATE_PATTERN = r"\b(\d{1,2}[\s/\-\.]\d{1,2}[\s/\-\.]\d{2,4}|\d{4}[\s/\-\.]\d{1,2}[\s/\-\.]\d{1,2})\b"
@@ -618,14 +481,16 @@ _EXPIRY_WORDS = {"exp", "expiry", "expires", "expiration", "valid", "until", "th
 _DOB_WORDS    = {"dob", "born", "birth", "date of birth", "birthday"}
 
 
+def _extract_years_from_text(text: str) -> list[int]:
+    """Extract all 4-digit year-like numbers from OCR text."""
+    import re
+    return [int(y) for y in re.findall(r"\b(19[0-9]{2}|20[0-2][0-9])\b", text)]
+
+
 def _analyse_id_text(text: str) -> dict:
     """
-    Parse OCR text for ID field presence:
-      - has_name:   2+ capitalised words side-by-side (First Last pattern)
-      - has_dob:    date-like pattern near 'birth' / 'dob' keyword, or any date pattern
-      - has_expiry: date-like pattern near 'exp' / 'valid' keyword
-      - has_number: alphanumeric 6-12 char token (ID/licence number)
-    Returns dict with boolean flags and detected field snippets.
+    Parse OCR text for ID field presence AND extract values for matching.
+    Returns boolean flags + extracted_name_tokens + extracted_years.
     """
     import re
 
@@ -633,60 +498,113 @@ def _analyse_id_text(text: str) -> dict:
     dates  = re.findall(_DATE_PATTERN, text)
     idnums = re.findall(_ID_NUMBER_PATTERN, text)
 
-    has_name   = bool(re.search(r"[A-Z][a-z]+\s+[A-Z][a-z]+", text))
+    # Name: title-case "First Last" OR all-caps "FIRST LAST" (common on govt IDs)
+    has_name = bool(
+        re.search(r"[A-Z][a-z]+\s+[A-Z][a-z]+", text) or
+        re.search(r"\b[A-Z]{2,}\s+[A-Z]{2,}\b", text)
+    )
+
     has_dob    = any(w in lower for w in _DOB_WORDS) and bool(dates)
     has_expiry = any(w in lower for w in _EXPIRY_WORDS) and bool(dates)
     has_number = bool(idnums)
 
-    # Fallback: if no keyword context, still credit dates as dob/expiry presence
     if not has_dob and len(dates) >= 1:
         has_dob = True
     if not has_expiry and len(dates) >= 2:
         has_expiry = True
 
+    # Extract all alpha words (2+ chars) as lowercase tokens for name matching.
+    # Include every word regardless of case — OCR output varies by document.
+    name_tokens: set[str] = set()
+    for word in re.findall(r"\b[A-Za-z]{2,}\b", text):
+        name_tokens.add(word.lower())
+
+    # Extract years in DOB plausible range (1930–2010)
+    all_years = _extract_years_from_text(text)
+    dob_years = [y for y in all_years if 1930 <= y <= 2010]
+
     return {
-        "has_name":   has_name,
-        "has_dob":    has_dob,
-        "has_expiry": has_expiry,
-        "has_number": has_number,
+        "has_name":         has_name,
+        "has_dob":          has_dob,
+        "has_expiry":       has_expiry,
+        "has_number":       has_number,
+        "name_tokens":      name_tokens,    # set of lowercase words found on ID
+        "dob_years":        dob_years,      # plausible birth years from OCR
     }
+
+
+def _name_matches(profile_name: str | None, id_name_tokens: set[str], raw_text: str = "") -> bool:
+    """
+    Returns True if at least one meaningful part of the profile name is found
+    on the ID — either as an exact token match or as a substring in the raw OCR.
+
+    Example: profile "Abdul Kumshey" passes if the ID contains "Abdul" OR "Kumshey"
+    anywhere (exact word or substring), case-insensitive.
+    """
+    if not profile_name:
+        return False
+
+    # Split profile name into significant parts (skip 1-char particles)
+    profile_parts = [w.lower() for w in profile_name.split() if len(w) >= 2]
+    if not profile_parts:
+        return False
+
+    # 1. Exact token match (ID word == profile word)
+    if id_name_tokens and any(p in id_name_tokens for p in profile_parts):
+        return True
+
+    # 2. Substring fallback — OCR sometimes merges words or adds noise.
+    #    Check if any profile part appears anywhere in the raw lowercase OCR text.
+    if raw_text:
+        lower_raw = raw_text.lower()
+        if any(p in lower_raw for p in profile_parts):
+            return True
+
+    return False
+
+
+def _dob_year_matches(profile_dob, id_dob_years: list[int]) -> bool:
+    """
+    Returns True if the user's birth year appears anywhere in the ID OCR text.
+    """
+    if not profile_dob or not id_dob_years:
+        return False
+    try:
+        birth_year = profile_dob.year
+    except Exception:
+        return False
+    return birth_year in id_dob_years
 
 
 def _match_face_on_id(selfie_bytes: bytes, id_bytes: bytes) -> tuple[bool, float]:
     """
-    Compare the user's stored selfie against the face cropped from the ID photo.
+    Compare the user's live selfie against the face on their ID document.
+    Uses AWS Rekognition CompareFaces (same engine as face scan — no extra deps).
     Returns (passed, match_pct).
     """
-    import io as _io
-    import numpy as np
-    from PIL import Image as PILImage
-    from deepface import DeepFace
+    from app.core.config import settings
 
-    selfie_img = PILImage.open(_io.BytesIO(selfie_bytes))
-    selfie_img = _correct_orientation(selfie_img).convert("RGB")
-    selfie_arr = np.array(selfie_img)
+    # ── Primary: AWS Rekognition CompareFaces ─────────────────────────────────
+    if settings.AWS_ACCESS_KEY_ID:
+        try:
+            client = _rekognition_client()
+            resp = client.compare_faces(
+                SourceImage={"Bytes": selfie_bytes},
+                TargetImage={"Bytes": id_bytes},
+                SimilarityThreshold=0,
+            )
+            matches = resp.get("FaceMatches", [])
+            if matches:
+                similarity = matches[0]["Similarity"]   # 0–100
+                _log.info("id-face-match | rekognition similarity=%.1f%%", similarity)
+                return similarity >= FACE_MATCH_THRESHOLD, round(similarity, 1)
+            _log.info("id-face-match | rekognition found no face match")
+            return False, 0.0
+        except Exception as exc:
+            _log.warning("id-face-match | rekognition failed (%s)", exc)
+            return False, 0.0
 
-    id_img = PILImage.open(_io.BytesIO(id_bytes))
-    id_img = _correct_orientation(id_img).convert("RGB")
-    id_arr = np.array(id_img)
-
-    try:
-        result = DeepFace.verify(
-            img1_path=selfie_arr,
-            img2_path=id_arr,
-            model_name="ArcFace",
-            distance_metric="cosine",
-            detector_backend="retinaface",
-            enforce_detection=False,
-            silent=True,
-        )
-        pct = _pct(result["distance"], result["threshold"])
-        _log.info("id-face-match | distance=%.3f threshold=%.3f => %.1f%%",
-                  result["distance"], result["threshold"], pct)
-        return pct >= FACE_MATCH_THRESHOLD, round(pct, 1)
-    except Exception as exc:
-        _log.warning("id-face-match | failed: %s", exc)
-        return False, 0.0
+    return False, 0.0
 
 
 async def _process_id_verification(
@@ -698,8 +616,41 @@ async def _process_id_verification(
     """
     Background task: OCR the ID + optionally match face on ID against selfie.
     Updates VerificationAttempt and User.
+    Hard timeout: 50 s total — prevents hanging when Rekognition is slow.
     """
     _log.info("bg-id | attempt=%s STARTED", attempt_id)
+    try:
+        await asyncio.wait_for(
+            _run_id_verification(attempt_id, front_bytes, back_bytes, selfie_bytes),
+            timeout=50,
+        )
+    except asyncio.TimeoutError:
+        _log.error("bg-id | attempt=%s TIMED OUT after 50s", attempt_id)
+        try:
+            from app.api.v1.endpoints.verification_ws import watcher as _watcher, _attempt_payload
+            async with AsyncSessionLocal() as db:
+                attempt = await db.get(VerificationAttempt, attempt_id)
+                if attempt and attempt.status == "pending":
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = "Verification timed out. Please try again."
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user = await db.get(User, attempt.user_id)
+                    if user:
+                        user.verification_status = "rejected"
+                    await db.commit()
+                    await _watcher.notify(user.id, _attempt_payload(attempt))
+        except Exception as e:
+            _log.error("bg-id | timeout cleanup failed: %s", e)
+
+
+async def _run_id_verification(
+    attempt_id: _uuid.UUID,
+    front_bytes: bytes,
+    back_bytes: bytes | None,
+    selfie_bytes: bytes | None,
+) -> None:
+    from app.api.v1.endpoints.verification_ws import watcher as _watcher
+
     async with AsyncSessionLocal() as db:
         attempt: VerificationAttempt | None = await db.get(VerificationAttempt, attempt_id)
         if not attempt:
@@ -710,31 +661,43 @@ async def _process_id_verification(
             _log.warning("bg-id | user not found for attempt=%s", attempt_id)
             return
 
-        try:
-            # ── OCR front of ID ───────────────────────────────────────────────
-            _log.info("bg-id | attempt=%s running OCR on front...", attempt_id)
-            front_text = await asyncio.to_thread(_extract_id_text, front_bytes)
-            _log.info("bg-id | front OCR: %s", front_text[:200])
+        async def _commit_and_notify() -> None:
+            """Commit the current DB state and push the result to any waiting WS."""
+            await db.commit()
+            from app.api.v1.endpoints.verification_ws import _attempt_payload
+            try:
+                await _watcher.notify(user.id, _attempt_payload(attempt))
+            except Exception as e:
+                _log.warning("bg-id | watcher notify failed: %s", e)
 
-            all_text = front_text
+        try:
+            # ── OCR front + back in parallel ──────────────────────────────────
+            _log.info("bg-id | attempt=%s running OCR (front%s)...", attempt_id, "+back" if back_bytes else "")
             if back_bytes:
-                _log.info("bg-id | attempt=%s running OCR on back...", attempt_id)
-                back_text = await asyncio.to_thread(_extract_id_text, back_bytes)
-                _log.info("bg-id | back OCR: %s", back_text[:200])
+                front_text, back_text = await asyncio.gather(
+                    asyncio.to_thread(_extract_id_text, front_bytes),
+                    asyncio.to_thread(_extract_id_text, back_bytes),
+                )
+                _log.info("bg-id | front OCR: %s", front_text[:200])
+                _log.info("bg-id | back OCR:  %s", back_text[:200])
                 all_text = front_text + " " + back_text
+            else:
+                front_text = await asyncio.to_thread(_extract_id_text, front_bytes)
+                _log.info("bg-id | front OCR: %s", front_text[:200])
+                all_text = front_text
 
             fields = _analyse_id_text(all_text)
-            attempt.id_text_detected = all_text[:2000]  # cap storage
+            attempt.id_text_detected = all_text[:2000]
             attempt.id_has_name   = fields["has_name"]
             attempt.id_has_dob    = fields["has_dob"]
             attempt.id_has_expiry = fields["has_expiry"]
             attempt.id_has_number = fields["has_number"]
 
-            missing = [k for k, v in fields.items() if not v]
-            _log.info("bg-id | attempt=%s fields=%s missing=%s", attempt_id, fields, missing)
+            bool_fields = {k: v for k, v in fields.items() if isinstance(v, bool)}
+            detected_count = sum(bool_fields.values())
+            _log.info("bg-id | attempt=%s fields=%s dob_years=%s", attempt_id, bool_fields, fields["dob_years"])
 
             # Require at least 2 of 4 fields for "looks like an ID"
-            detected_count = sum(fields.values())
             if detected_count < 2:
                 attempt.status = "rejected"
                 attempt.rejection_reason = (
@@ -743,8 +706,42 @@ async def _process_id_verification(
                 )
                 attempt.processed_at = datetime.now(timezone.utc)
                 user.verification_status = "rejected"
-                await db.commit()
+                await _commit_and_notify()
                 _log.info("bg-id | attempt=%s REJECTED (only %d fields detected)", attempt_id, detected_count)
+                return
+
+            # ── Name match ────────────────────────────────────────────────────
+            name_match = _name_matches(user.full_name, fields["name_tokens"], all_text)
+            attempt.id_name_match = name_match
+            _log.info("bg-id | attempt=%s name_match=%s (profile=%r tokens=%r)",
+                      attempt_id, name_match, user.full_name, fields["name_tokens"])
+
+            if not name_match:
+                attempt.status = "rejected"
+                attempt.rejection_reason = (
+                    "The name on the ID doesn't match your profile name. "
+                    "Please upload an ID that matches the name on your account."
+                )
+                attempt.processed_at = datetime.now(timezone.utc)
+                user.verification_status = "rejected"
+                await _commit_and_notify()
+                return
+
+            # ── Birth year match ──────────────────────────────────────────────
+            dob_match = _dob_year_matches(user.date_of_birth, fields["dob_years"])
+            attempt.id_dob_match = dob_match
+            _log.info("bg-id | attempt=%s dob_match=%s (profile_dob=%s years=%s)",
+                      attempt_id, dob_match, user.date_of_birth, fields["dob_years"])
+
+            if not dob_match:
+                attempt.status = "rejected"
+                attempt.rejection_reason = (
+                    "The birth year on the ID doesn't match your profile date of birth. "
+                    "Make sure your profile date of birth is correct and upload a matching ID."
+                )
+                attempt.processed_at = datetime.now(timezone.utc)
+                user.verification_status = "rejected"
+                await _commit_and_notify()
                 return
 
             # ── Face match: selfie vs face on ID ──────────────────────────────
@@ -764,18 +761,63 @@ async def _process_id_verification(
                     )
                     attempt.processed_at = datetime.now(timezone.utc)
                     user.verification_status = "rejected"
-                    await db.commit()
+                    await _commit_and_notify()
                     return
             else:
                 _log.info("bg-id | attempt=%s no selfie on file — skipping face match", attempt_id)
                 attempt.id_face_match_score = None
+
+            # ── Selfie vs profile photos ─────────────────────────────────────
+            # Ensure the verified identity (selfie/ID) actually matches the
+            # photos on the profile. Any photo that doesn't match is removed.
+            # If NO profile photo matches the selfie, reject entirely.
+            PROFILE_ID_MATCH_THRESHOLD = 60.0
+            if selfie_bytes and user.photos:
+                profile_urls = list(user.photos)
+                _log.info("bg-id | attempt=%s checking selfie vs %d profile photos...",
+                          attempt_id, len(profile_urls))
+                kept: list[str] = []
+                removed: list[str] = []
+                for url in profile_urls:
+                    try:
+                        pct, cmp = await asyncio.to_thread(
+                            _match_against_photos, selfie_bytes, [url]
+                        )
+                        if cmp == 0 or pct >= PROFILE_ID_MATCH_THRESHOLD:
+                            kept.append(url)
+                        else:
+                            removed.append(url)
+                            _log.warning(
+                                "bg-id | attempt=%s removing non-matching photo (%.1f%% < %.0f%%): %s",
+                                attempt_id, pct, PROFILE_ID_MATCH_THRESHOLD, url.split("/")[-1][:30],
+                            )
+                    except Exception as exc:
+                        _log.warning("bg-id | photo match error for %s: %s",
+                                     url.split("/")[-1][:24], exc)
+                        kept.append(url)  # keep on error — don't wrongly remove
+
+                if removed:
+                    user.photos = kept if kept else []
+                    _log.info("bg-id | attempt=%s removed %d fake/non-matching photos, kept %d",
+                              attempt_id, len(removed), len(kept))
+
+                if not kept:
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = (
+                        "None of your profile photos match your verified identity. "
+                        "Please upload photos of yourself and try again."
+                    )
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user.verification_status = "rejected"
+                    await _commit_and_notify()
+                    return
 
             # ── All checks passed ─────────────────────────────────────────────
             attempt.status = "verified"
             attempt.processed_at = datetime.now(timezone.utc)
             user.verification_status = "verified"
             user.is_verified = True
-            await db.commit()
+            await _commit_and_notify()
             _log.info("bg-id | attempt=%s VERIFIED (fields=%d, face=%.1f%%)",
                       attempt_id, detected_count, attempt.id_face_match_score or 0)
 
@@ -785,7 +827,7 @@ async def _process_id_verification(
             attempt.rejection_reason = "Internal analysis error. Please try again."
             attempt.processed_at = datetime.now(timezone.utc)
             user.verification_status = "rejected"
-            await db.commit()
+            await _commit_and_notify()
 
 
 @router.post("/verify-id", summary="Submit ID front + back for verification")
@@ -851,7 +893,11 @@ async def verify_id_endpoint(
         )
         face_attempt = face_attempt_result.scalar_one_or_none()
         if face_attempt and face_attempt.selfie_url:
-            resp = httpx.get(face_attempt.selfie_url, timeout=8, follow_redirects=True)
+            # Use asyncio.to_thread so the async event loop is not blocked
+            resp = await asyncio.to_thread(
+                httpx.get, face_attempt.selfie_url,
+                timeout=4, follow_redirects=True,
+            )
             if resp.status_code == 200:
                 selfie_bytes = resp.content
     except Exception as exc:
@@ -913,6 +959,8 @@ async def get_id_verification_status(
             "id_has_dob":          attempt.id_has_dob,
             "id_has_expiry":       attempt.id_has_expiry,
             "id_has_number":       attempt.id_has_number,
+            "id_name_match":       attempt.id_name_match,
+            "id_dob_match":        attempt.id_dob_match,
             "rejection_reason":    attempt.rejection_reason,
         },
     }
@@ -975,6 +1023,7 @@ async def upload_photo_endpoint(
     file: UploadFile = File(...),
     purpose: str = Form(default="profile"),
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Upload a photo.
@@ -1028,26 +1077,80 @@ async def upload_photo_endpoint(
                 detail=analysis.rejection_reason,
             )
 
-        # ── Duplicate photo detection ─────────────────────────────────────────
-        existing_urls: list[str] = list(current_user.photos or [])
-        if existing_urls:
+        # ── Gender consistency check ──────────────────────────────────────────
+        # Strict: if profile is Male, only Male-detected photos are accepted.
+        # Threshold lowered to 70% — anything Rekognition calls Female/Male
+        # with reasonable certainty is enforced, no exceptions.
+        GENDER_CONFIDENCE_MIN = 70.0
+        if current_user.gender_id and analysis.detected_gender:
             try:
-                is_dup, dup_url = await asyncio.to_thread(
-                    _is_duplicate, contents, existing_urls
+                row = await db.execute(
+                    select(LookupOption.label).where(LookupOption.id == current_user.gender_id)
                 )
-                if is_dup:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="This photo is too similar to one you've already uploaded. Please choose a different photo.",
+                gender_label: str | None = row.scalar_one_or_none()
+                if gender_label:
+                    label_lower = gender_label.lower()
+                    # Match any common male/female label variant
+                    is_profile_male   = any(w in label_lower for w in ("male", "man", "boy"))
+                    is_profile_female = any(w in label_lower for w in ("female", "woman", "girl"))
+                    detected = analysis.detected_gender   # "Male" or "Female"
+                    conf     = analysis.gender_confidence
+
+                    mismatch = (
+                        (is_profile_male   and detected == "Female" and conf >= GENDER_CONFIDENCE_MIN) or
+                        (is_profile_female and detected == "Male"   and conf >= GENDER_CONFIDENCE_MIN)
                     )
+                    _log.info(
+                        "Gender check | profile=%s detected=%s(%.0f%%) mismatch=%s",
+                        gender_label, detected, conf, mismatch,
+                    )
+                    if mismatch:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=(
+                                "This photo doesn't match your profile gender. "
+                                "Only photos that match your declared gender are allowed."
+                            ),
+                        )
             except HTTPException:
                 raise
             except Exception as exc:
-                _log.warning("Duplicate check failed (skipping): %s", exc)
+                _log.warning("Gender check failed (skipping): %s", exc)
 
-        # ── Face consistency check ────────────────────────────────────────────
+        existing_urls: list[str] = list(current_user.photos or [])
+
+        # ── Selfie anchor check (verified users) ─────────────────────────────
+        # If the user has a verified selfie on file, every new profile photo
+        # must match it. This prevents adding celebrity/fake photos post-verification.
         PROFILE_MATCH_THRESHOLD = 60.0
 
+        if analysis.has_face and current_user.is_verified:
+            try:
+                selfie_row = await db.execute(
+                    select(VerificationAttempt.selfie_url)
+                    .where(VerificationAttempt.user_id == current_user.id)
+                    .where(VerificationAttempt.attempt_type == "face")
+                    .where(VerificationAttempt.status == "verified")
+                    .order_by(VerificationAttempt.submitted_at.desc())
+                    .limit(1)
+                )
+                selfie_url: str | None = selfie_row.scalar_one_or_none()
+                if selfie_url:
+                    selfie_pct, selfie_cmp = await asyncio.to_thread(
+                        _match_against_photos, contents, [selfie_url]
+                    )
+                    _log.info("[SELFIE ANCHOR] new photo vs verified selfie → %.1f%% (cmp=%d)", selfie_pct, selfie_cmp)
+                    if selfie_cmp > 0 and selfie_pct < PROFILE_MATCH_THRESHOLD:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="This photo doesn't match your verified identity. Please upload a photo of yourself.",
+                        )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                _log.warning("Selfie anchor check failed (skipping): %s", exc)
+
+        # ── Face consistency check (against other profile photos) ─────────────
         if existing_urls and analysis.has_face:
             try:
                 best_pct, compared = await asyncio.to_thread(

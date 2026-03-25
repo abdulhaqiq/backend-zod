@@ -40,6 +40,58 @@ except Exception:
     pass
 
 
+# Maps notification event types to their User model preference field.
+# If a type isn't listed here it's always sent (e.g. calls are critical).
+_NOTIF_TYPE_TO_PREF: dict[str, str] = {
+    "match":         "notif_new_match",
+    "message":       "notif_new_message",
+    "chat":          "notif_new_message",
+    "super_like":    "notif_super_like",
+    "liked_you":     "notif_liked_profile",
+    "profile_view":  "notif_profile_views",
+    "ai_picks":      "notif_ai_picks",
+    "promotions":    "notif_promotions",
+    "dating_tips":   "notif_dating_tips",
+}
+
+
+async def notify_user(
+    user: Any,
+    notif_type: str,
+    *,
+    title: str,
+    body: str,
+    data: dict[str, Any] | None = None,
+    channel_id: str = "default",
+    priority: str = "high",
+    badge: int | None = None,
+) -> None:
+    """
+    Send a push notification to a user, respecting their per-category
+    notification preferences.
+
+    Parameters
+    ----------
+    user:        ORM User object (must have push_token + notif_* fields).
+    notif_type:  Event type string — see _NOTIF_TYPE_TO_PREF for mapping.
+    """
+    if user is None:
+        return
+    pref_field = _NOTIF_TYPE_TO_PREF.get(notif_type)
+    if pref_field and not getattr(user, pref_field, True):
+        _log.debug("push | skipped (user pref off) type=%s user=%s", notif_type, getattr(user, "id", "?"))
+        return
+    await send_push_notification(
+        getattr(user, "push_token", None),
+        title=title,
+        body=body,
+        data=data,
+        channel_id=channel_id,
+        priority=priority,
+        badge=badge,
+    )
+
+
 async def send_push_notification(
     push_token: str | None,
     *,

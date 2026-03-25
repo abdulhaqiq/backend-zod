@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from fastapi import Depends, HTTPException, status
@@ -11,6 +12,11 @@ from app.db.session import get_db
 from app.models.user import User
 
 bearer_scheme = HTTPBearer()
+
+_DB_UNAVAILABLE = HTTPException(
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    detail="Service temporarily unavailable. Please try again.",
+)
 
 
 async def _resolve_user(
@@ -34,8 +40,16 @@ async def _resolve_user(
     except JWTError:
         raise credentials_exception
 
-    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
+    try:
+        result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+        user = result.scalar_one_or_none()
+    except (asyncio.TimeoutError, TimeoutError, OSError):
+        raise _DB_UNAVAILABLE
+    except Exception as exc:
+        # Catch asyncpg-level errors (no module import needed — match by message)
+        if "timeout" in str(exc).lower() or "nodename" in str(exc).lower():
+            raise _DB_UNAVAILABLE
+        raise
 
     if user is None:
         raise credentials_exception

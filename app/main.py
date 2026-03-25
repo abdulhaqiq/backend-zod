@@ -33,9 +33,11 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
 
-    # Incremental column migrations (safe to run on every restart)
+    # Incremental column migrations (safe to run on every restart).
+    # Wrapped in try/except so a stale DB connection on hot-reload doesn't crash startup.
     from sqlalchemy import text as _text
-    async with engine.begin() as conn:
+    try:
+      async with engine.begin() as conn:
         await conn.execute(_text(
             "ALTER TABLE user_scores ADD COLUMN IF NOT EXISTS profile_hash VARCHAR(32)"
         ))
@@ -64,51 +66,89 @@ async def lifespan(app: FastAPI):
         await conn.execute(_text(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ"
         ))
+        # Halal / Islamic mode columns
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS sect_id INTEGER"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS prayer_frequency_id INTEGER"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS marriage_timeline_id INTEGER"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_email VARCHAR(255)"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_verified BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS blur_photos_halal BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS halal_mode_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_sect JSONB"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_prayer_frequency JSONB"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_marriage_timeline JSONB"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_wali_verified_only BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_wants_to_work BOOLEAN"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_new_match BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_new_message BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_super_like BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_liked_profile BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_profile_views BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_ai_picks BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_promotions BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_dating_tips BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
         # user_compatibility is created by create_all above; nothing to backfill
-    
+    except Exception as _migration_exc:
+        import logging as _mlog
+        _mlog.getLogger(__name__).warning(
+            "Startup migration skipped (DB not ready yet, will apply on next start): %s",
+            _migration_exc.__class__.__name__,
+        )
+
     import asyncio
     import logging
     _log = logging.getLogger(__name__)
 
-    # Pre-download DeepFace models to avoid blocking first verification
-    async def _warmup_deepface():
-        """
-        Pre-download production models:
-          - RetinaFace detector (fast, accurate)
-          - ArcFace recognition model (SOTA for face matching)
-        This prevents blocking during first verification.
-        """
-        try:
-            _log.info("DeepFace warmup: pre-loading production models...")
-            from deepface import DeepFace
-            import numpy as np
-
-            dummy = np.ones((224, 224, 3), dtype=np.uint8) * 128
-
-            try:
-                DeepFace.represent(
-                    img_path=dummy,
-                    model_name="ArcFace",
-                    detector_backend="skip",
-                    enforce_detection=False,
-                )
-                _log.info("✓ ArcFace model loaded")
-            except Exception as e:
-                _log.debug("ArcFace warmup (expected on dummy): %s", e)
-
-            try:
-                DeepFace.extract_faces(
-                    img_path=dummy,
-                    detector_backend="retinaface",
-                    enforce_detection=False,
-                )
-                _log.info("✓ RetinaFace detector loaded")
-            except Exception as e:
-                _log.debug("RetinaFace warmup (expected on dummy): %s", e)
-
-            _log.info("DeepFace production models ready")
-        except Exception as exc:
-            _log.warning("DeepFace warmup failed (non-critical): %s", exc)
+    # Suppress "Future exception was never retrieved" for transient DNS/OS errors
+    # that occur inside asyncpg's internal connection pool background tasks.
+    _loop = asyncio.get_event_loop()
+    _orig_handler = _loop.get_exception_handler() or _loop.default_exception_handler
+    def _quiet_future_handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, OSError):
+            return  # DNS failures / network transients — ignore silently
+        _orig_handler(context) if callable(_orig_handler) else loop.default_exception_handler(context)
+    _loop.set_exception_handler(_quiet_future_handler)
 
     # On restart: any attempt stuck in "pending" means the server was reloaded
     # mid-verification. Mark them as rejected so users aren't stuck forever.
@@ -185,9 +225,13 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _log.warning("Travel mode expiry loop error (non-critical): %s", exc)
 
-    asyncio.create_task(_warmup_deepface())
-    asyncio.create_task(_recover_stale_attempts())
-    asyncio.create_task(_expire_travel_modes())
+    _bg_tasks = {
+        asyncio.create_task(_recover_stale_attempts()),
+        asyncio.create_task(_expire_travel_modes()),
+    }
+    # Keep strong references so GC doesn't discard them before they finish
+    for _t in _bg_tasks:
+        _t.add_done_callback(_bg_tasks.discard)
     
     yield
     # Dispose engine on shutdown

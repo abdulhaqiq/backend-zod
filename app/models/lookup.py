@@ -30,5 +30,6 @@ class LookupOption(Base):
     category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     emoji: Mapped[str | None] = mapped_column(String(16), nullable=True)
     label: Mapped[str] = mapped_column(String(128), nullable=False)
+    subcategory: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

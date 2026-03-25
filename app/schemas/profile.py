@@ -95,6 +95,24 @@ class ProfileUpdateRequest(BaseModel):
     work_who_to_show_id: int | None = None                # lookup_options (category=work_who_to_show)
     work_priority_startup: bool | None = None
 
+    # ── Notification preferences ──────────────────────────────────────────────
+    notif_new_match:     bool | None = None
+    notif_new_message:   bool | None = None
+    notif_super_like:    bool | None = None
+    notif_liked_profile: bool | None = None
+    notif_profile_views: bool | None = None
+    notif_ai_picks:      bool | None = None
+    notif_promotions:    bool | None = None
+    notif_dating_tips:   bool | None = None
+
+    # ── Halal profile fields ──────────────────────────────────────────────────
+    sect_id:              int | None = None                # lookup_options (category=sect)
+    prayer_frequency_id:  int | None = None                # lookup_options (category=prayer_frequency)
+    marriage_timeline_id: int | None = None                # lookup_options (category=marriage_timeline)
+    wali_email:           str | None = Field(None, max_length=255)
+    blur_photos_halal:    bool | None = None
+    halal_mode_enabled:   bool | None = None
+
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         int | None = Field(None, ge=18, le=80)
     filter_age_max:         int | None = Field(None, ge=18, le=80)
@@ -115,6 +133,12 @@ class ProfileUpdateRequest(BaseModel):
     filter_smoking:         list[int] | None = None        # [lookup_options.id] category=smoking
     filter_height_min:      int | None = Field(None, ge=130, le=220)  # cm
     filter_height_max:      int | None = Field(None, ge=130, le=220)  # cm
+    # Halal-specific filters
+    filter_sect:               list[int] | None = None     # [lookup_options.id] category=sect
+    filter_prayer_frequency:   list[int] | None = None     # [lookup_options.id] category=prayer_frequency
+    filter_marriage_timeline:  list[int] | None = None     # [lookup_options.id] category=marriage_timeline
+    filter_wali_verified_only: bool | None = None
+    filter_wants_to_work:      bool | None = None          # True=must work, False=must not, None=no pref
 
 
 class FilterUpdateRequest(BaseModel):
@@ -141,6 +165,12 @@ class FilterUpdateRequest(BaseModel):
     filter_smoking:         list[int] | None = None
     filter_height_min:      int | None = Field(None, ge=130, le=220)
     filter_height_max:      int | None = Field(None, ge=130, le=220)
+    # Halal-specific filters
+    filter_sect:               list[int] | None = None
+    filter_prayer_frequency:   list[int] | None = None
+    filter_marriage_timeline:  list[int] | None = None
+    filter_wali_verified_only: bool | None = None
+    filter_wants_to_work:      bool | None = None
 
 
 class MeResponse(BaseModel):
@@ -173,6 +203,15 @@ class MeResponse(BaseModel):
     star_sign_id: int | None
     religion_id: int | None
     ethnicity_id: int | None
+
+    # Halal profile fields
+    sect_id:              int | None
+    prayer_frequency_id:  int | None
+    marriage_timeline_id: int | None
+    wali_email:           str | None
+    wali_verified:        bool
+    blur_photos_halal:    bool
+    halal_mode_enabled:   bool
 
     voice_prompts: list[dict[str, Any]] | None
     work_experience: list[dict[str, Any]] | None
@@ -218,6 +257,12 @@ class MeResponse(BaseModel):
     filter_smoking:         list[int] | None
     filter_height_min:      int | None
     filter_height_max:      int | None
+    # Halal filters
+    filter_sect:               list[int] | None
+    filter_prayer_frequency:   list[int] | None
+    filter_marriage_timeline:  list[int] | None
+    filter_wali_verified_only: bool
+    filter_wants_to_work:      bool | None
 
     university:               str | None
     university_email:         str | None
@@ -225,6 +270,16 @@ class MeResponse(BaseModel):
 
     linkedin_url:      str | None
     linkedin_verified: bool
+
+    # ── Notification preferences ──────────────────────────────────────────────
+    notif_new_match:     bool
+    notif_new_message:   bool
+    notif_super_like:    bool
+    notif_liked_profile: bool
+    notif_profile_views: bool
+    notif_ai_picks:      bool
+    notif_promotions:    bool
+    notif_dating_tips:   bool
 
     hide_age: bool
     hide_distance: bool

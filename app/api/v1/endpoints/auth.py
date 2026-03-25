@@ -63,20 +63,24 @@ def _is_test_phone(phone: str) -> bool:
     return digits[-10:] in _TEST_PHONE_LAST10
 
 
-async def _otp_rate_key(request: Request) -> str:
+def _otp_rate_key(request: Request) -> str:
     """
-    Per-phone rate-limit key.
-    Test phones get a unique UUID each call so they never accumulate against
-    any limit bucket — effectively unlimited OTP sends.
+    Per-phone rate-limit key (sync — slowapi does not await key_func).
+    Reads from the already-cached body (FastAPI populates request._body
+    during Pydantic model dependency injection before the handler runs).
+    Test phones get a unique UUID so they never hit any limit bucket.
     """
+    import json as _json
     try:
-        body = await request.json()
-        phone = body.get("phone", "")
-        if _is_test_phone(phone):
-            return f"test-exempt-{_uuid_mod.uuid4()}"
-        return f"otp:{phone}" if phone else get_remote_address(request)
+        body_bytes: bytes | None = getattr(request, "_body", None)
+        if body_bytes:
+            phone = _json.loads(body_bytes).get("phone", "")
+            if _is_test_phone(phone):
+                return f"test-exempt-{_uuid_mod.uuid4()}"
+            return f"otp:{phone}" if phone else get_remote_address(request)
     except Exception:
-        return get_remote_address(request)
+        pass
+    return get_remote_address(request)
 
 
 DEV_PHONE_OTPS: dict[str, str] = {

@@ -412,8 +412,14 @@ async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
         logger.debug("Score cache hit for user %s (hash %s)", user.id, current_hash)
         return existing
 
-    # Cache miss: compute fresh score
+    # Cache miss: build snapshot while we still have the session open, then
+    # commit to release all read locks (on user_scores, lookup_options, etc.)
+    # BEFORE the slow OpenAI call.  Holding an open transaction across a
+    # multi-second network call was the root cause of cross-request deadlocks.
     snapshot = await _build_rich_snapshot(user, db)
+    existing_version = (existing.version or 1) + 1 if existing else 1
+    await db.commit()  # release read locks; upsert below starts a fresh tx
+
     result = await _ai_scores(snapshot)
     if result:
         scores, reasoning = result
@@ -423,7 +429,7 @@ async def compute_and_save_score(user: User, db: AsyncSession) -> UserScore:
 
     overall  = _weighted_overall(scores)
     now      = datetime.now(timezone.utc)
-    new_version = (existing.version or 1) + 1 if existing else 1
+    new_version = existing_version
 
     insert_values = {
         "user_id":      user.id,

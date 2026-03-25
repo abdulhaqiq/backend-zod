@@ -11,13 +11,20 @@ if settings.DB_SSLMODE == "require":
     _ssl_ctx.check_hostname = False
     _ssl_ctx.verify_mode = ssl.CERT_NONE
 
+_connect_args: dict = {"ssl": _ssl_ctx} if _ssl_ctx else {}
+# command_timeout: max seconds asyncpg waits for a single DB operation.
+# 30 s covers complex discover-feed queries that JOIN/sort/geo-filter many rows.
+_connect_args["command_timeout"] = 30
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    pool_pre_ping=True,
+    pool_pre_ping=True,          # validate connections before use
     pool_size=10,
     max_overflow=20,
+    pool_recycle=1800,           # recycle idle connections every 30 min
+    pool_timeout=30,             # max seconds to wait for a free connection
     echo=settings.DEBUG,
-    connect_args={"ssl": _ssl_ctx} if _ssl_ctx else {},
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(

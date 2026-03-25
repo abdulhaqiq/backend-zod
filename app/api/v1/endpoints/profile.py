@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_current_user_allow_inactive, get_pro_user
-from app.core.photo_analyzer import _check_quality
+from app.core.photo_analyzer import get_photo_quality_score
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.profile import FilterUpdateRequest, MeResponse, ProfileUpdateRequest
@@ -71,6 +71,16 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     # Pro features
     "is_incognito", "travel_mode_enabled", "auto_zod_enabled",
     "travel_city", "travel_country",
+    # Notification preferences
+    "notif_new_match", "notif_new_message", "notif_super_like",
+    "notif_liked_profile", "notif_profile_views", "notif_ai_picks",
+    "notif_promotions", "notif_dating_tips",
+    # Halal profile fields
+    "sect_id", "prayer_frequency_id", "marriage_timeline_id",
+    "wali_email", "blur_photos_halal", "halal_mode_enabled",
+    # Halal filters
+    "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
+    "filter_wali_verified_only", "filter_wants_to_work",
 })
 
 _LIFESTYLE_KEYS: frozenset[str] = frozenset({"drinking", "smoking", "exercise", "diet"})
@@ -149,6 +159,18 @@ async def update_me(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No fields provided to update.",
         )
+
+    # Guard: halal_mode_enabled=True requires the user to have a religion set.
+    # This prevents non-Muslim users from enabling halal mode via direct API calls.
+    if update_data.get("halal_mode_enabled") is True:
+        # Use the religion_id that would be active after this update, or the
+        # existing one if the request is not also changing religion_id.
+        effective_religion_id = update_data.get("religion_id", current_user.religion_id)
+        if not effective_religion_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Halal mode is only available to Muslim users. Please set your religion on your profile first.",
+            )
 
     # Validate lifestyle keys/values if provided
     if "lifestyle" in update_data and update_data["lifestyle"] is not None:
@@ -262,7 +284,7 @@ async def select_best_photo(
             if resp.status_code != 200:
                 _log.warning("best-photo: could not fetch %s (status %s)", url, resp.status_code)
                 return (url, 0.0)
-            _, _, _, _, quality_score = await asyncio.to_thread(_check_quality, resp.content)
+            quality_score = await asyncio.to_thread(get_photo_quality_score, resp.content)
             _log.info("best-photo: %s → quality %.3f", url, quality_score)
             return (url, quality_score)
         except Exception as exc:
@@ -339,6 +361,9 @@ _FILTER_FIELDS: frozenset[str] = frozenset({
     "filter_family_plans", "filter_have_kids", "filter_ethnicities",
     "filter_exercise", "filter_drinking", "filter_smoking",
     "filter_height_min", "filter_height_max",
+    # Halal-specific filters (free tier — available to all Muslims)
+    "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
+    "filter_wali_verified_only", "filter_wants_to_work",
 })
 
 _PRO_FILTER_FIELDS: frozenset[str] = frozenset({

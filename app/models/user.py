@@ -116,6 +116,16 @@ class User(Base):
     # ── Push notifications ────────────────────────────────────────────────────
     push_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
+    # Per-category notification preferences (default ON for all)
+    notif_new_match:    Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_new_message:  Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_super_like:   Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_liked_profile: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_profile_views: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_ai_picks:     Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_promotions:   Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notif_dating_tips:  Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         Mapped[int | None]  = mapped_column(Integer, nullable=True)
     filter_age_max:         Mapped[int | None]  = mapped_column(Integer, nullable=True)
@@ -162,6 +172,36 @@ class User(Base):
     real_longitude:       Mapped[float | None] = mapped_column(Float, nullable=True)
     real_city:            Mapped[str | None] = mapped_column(String(128), nullable=True)
     real_country:         Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ── Halal profile fields ──────────────────────────────────────────────────
+    sect_id:              Mapped[int | None]  = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=sect)
+    prayer_frequency_id:  Mapped[int | None]  = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=prayer_frequency)
+    marriage_timeline_id: Mapped[int | None]  = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=marriage_timeline)
+    wali_email:           Mapped[str | None]  = mapped_column(String(255), nullable=True)     # Guardian's email
+    wali_verified:        Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    blur_photos_halal:    Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    halal_mode_enabled:   Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+
+    # ── Halal discover filters ─────────────────────────────────────────────────
+    filter_sect:              Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=sect
+    filter_prayer_frequency:  Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=prayer_frequency
+    filter_marriage_timeline: Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=marriage_timeline
+    filter_wali_verified_only: Mapped[bool]       = mapped_column(Boolean, default=False, nullable=False)
+    filter_wants_to_work:     Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # True=wants to work, False=doesn't, None=no pref
+
+    # ── Halal / Islamic mode ──────────────────────────────────────────────────
+    sect_id:                Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=sect)
+    prayer_frequency_id:    Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=prayer_frequency)
+    marriage_timeline_id:   Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=marriage_timeline)
+    wali_email:             Mapped[str | None]  = mapped_column(String(255), nullable=True)
+    wali_verified:          Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    blur_photos_halal:      Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    halal_mode_enabled:     Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    filter_sect:            Mapped[list | None] = mapped_column(JSONB, nullable=True)             # [lookup_options.id]
+    filter_prayer_frequency: Mapped[list | None] = mapped_column(JSONB, nullable=True)            # [lookup_options.id]
+    filter_marriage_timeline: Mapped[list | None] = mapped_column(JSONB, nullable=True)           # [lookup_options.id]
+    filter_wali_verified_only: Mapped[bool]     = mapped_column(Boolean, default=False, nullable=False)
+    filter_wants_to_work:   Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # ── Mood / vibe status ────────────────────────────────────────────────────
     mood_emoji:  Mapped[str | None] = mapped_column(String(8),   nullable=True)  # e.g. "🎉"

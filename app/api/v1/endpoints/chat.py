@@ -24,7 +24,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.endpoints.auth import get_current_user
-from app.core.push import send_push_notification
+from app.core.push import send_push_notification, notify_user
 from app.db.session import AsyncSessionLocal, get_db
 from app.models.message import Message
 from app.models.message_reaction import MessageReaction
@@ -165,6 +165,9 @@ async def websocket_notify(
 
     uid_me = str(current_user.id)
     notify_manager.connect(uid_me, websocket)
+
+    # Broadcast "online" to all matched partners immediately
+    await _broadcast_presence(uid_me, online=True)
 
     try:
         while True:
@@ -328,6 +331,9 @@ async def websocket_notify(
         _log.debug("ws:notify | connection dropped for user=%s: %s", uid_me[:8], exc)
     finally:
         notify_manager.disconnect(uid_me, websocket)
+        # Only broadcast "offline" if this was the user's last notify session
+        if not notify_manager.is_online(uid_me):
+            await _broadcast_presence(uid_me, online=False)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -363,6 +369,35 @@ async def _get_reactions(db: AsyncSession, message_id: uuid.UUID) -> list[dict]:
 async def _get_user_by_id(db: AsyncSession, uid: str | uuid.UUID) -> User | None:
     result = await db.execute(select(User).where(User.id == uid))
     return result.scalar_one_or_none()
+
+
+async def _get_match_partner_ids(uid: str) -> list[str]:
+    """Return all matched partner IDs for a user (raw SQL, no ORM model needed)."""
+    from sqlalchemy import text as sa_text
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            sa_text("""
+                SELECT CASE
+                    WHEN user1_id = CAST(:uid AS uuid) THEN user2_id
+                    ELSE user1_id
+                END AS partner_id
+                FROM matches
+                WHERE user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid)
+            """).bindparams(uid=uid)
+        )).fetchall()
+    return [str(r[0]) for r in rows]
+
+
+async def _broadcast_presence(uid: str, online: bool) -> None:
+    """Fan-out a presence event to all matched partners of *uid* via notify_manager."""
+    try:
+        partner_ids = await _get_match_partner_ids(uid)
+    except Exception as exc:
+        _log.debug("_broadcast_presence | DB error for user=%s: %s", uid[:8], exc)
+        return
+    payload = {"type": "presence", "user_id": uid, "online": online}
+    for pid in partner_ids:
+        await notify_manager.send_to(pid, payload)
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
@@ -497,6 +532,36 @@ async def websocket_chat(
                     db.add(msg)
                     await db.flush()          # gives msg.id without committing yet
 
+                    # ── helpers ───────────────────────────────────────────────
+                    async def _latest_tod_round(*statuses: str) -> "TodRound | None":
+                        """Fallback: newest round in this room whose status is in *statuses*."""
+                        return (await db.execute(
+                            select(TodRound)
+                            .where(TodRound.room_id == room_id, TodRound.status.in_(list(statuses)))
+                            .order_by(TodRound.created_at.desc())
+                            .limit(1)
+                        )).scalar_one_or_none()
+
+                    async def _tod_by_invite(raw_id: str | None) -> "TodRound | None":
+                        if not raw_id:
+                            return None
+                        try:
+                            return (await db.execute(
+                                select(TodRound).where(TodRound.invite_msg_id == uuid.UUID(str(raw_id)))
+                            )).scalar_one_or_none()
+                        except (ValueError, TypeError):
+                            return None
+
+                    async def _tod_by_question(raw_id: str | None) -> "TodRound | None":
+                        if not raw_id:
+                            return None
+                        try:
+                            return (await db.execute(
+                                select(TodRound).where(TodRound.question_msg_id == uuid.UUID(str(raw_id)))
+                            )).scalar_one_or_none()
+                        except (ValueError, TypeError):
+                            return None
+
                     # ── 2. Create / update the dedicated tod_rounds row ───────
                     if msg_type_ws == "tod_invite":
                         # Expire any active rounds in this room (started within 12 h)
@@ -512,13 +577,17 @@ async def websocket_chat(
                             old_round.status = "expired"
                             old_round.updated_at = now_utc
 
-                        # Start a fresh round
+                        # preSelectedChoice — sender already picked the type for the partner.
+                        # Used when the answerer immediately challenges back without a separate tod_choice step.
+                        pre_choice = game_meta.get("preSelectedChoice")
+
                         tod_row = TodRound(
                             room_id=room_id,
                             invite_msg_id=msg.id,
                             sender_id=current_user.id,
                             receiver_id=other_user.id,
-                            status="invited",
+                            choice=pre_choice,
+                            status="choice_made" if pre_choice else "invited",
                             created_at=now_utc,
                             updated_at=now_utc,
                         )
@@ -526,77 +595,54 @@ async def websocket_chat(
 
                     elif msg_type_ws == "tod_skip":
                         # Receiver skipped — mark the round as skipped
-                        turn_id_raw = game_meta.get("turnMsgId")
-                        if turn_id_raw:
-                            try:
-                                turn_uuid = uuid.UUID(str(turn_id_raw))
-                                tod_row = (await db.execute(
-                                    select(TodRound).where(TodRound.question_msg_id == turn_uuid)
-                                )).scalar_one_or_none()
-                                if tod_row:
-                                    tod_row.status       = "skipped"
-                                    tod_row.updated_at   = now_utc
-                                    tod_row.completed_at = now_utc
-                            except (ValueError, TypeError):
-                                pass
+                        tod_row = (
+                            await _tod_by_question(game_meta.get("turnMsgId"))
+                            or await _latest_tod_round("question_sent")
+                        )
+                        if tod_row:
+                            tod_row.status       = "skipped"
+                            tod_row.updated_at   = now_utc
+                            tod_row.completed_at = now_utc
 
                     elif msg_type_ws == "tod_choice":
                         # Partner chose Truth or Dare — update the open round
-                        invite_id_raw = game_meta.get("inviteId")
-                        if invite_id_raw:
-                            try:
-                                invite_uuid = uuid.UUID(str(invite_id_raw))
-                                tod_row = (await db.execute(
-                                    select(TodRound).where(TodRound.invite_msg_id == invite_uuid)
-                                )).scalar_one_or_none()
-                                if tod_row:
-                                    tod_row.choice = game_meta.get("choice")
-                                    tod_row.status = "choice_made"
-                                    tod_row.updated_at = now_utc
-                            except (ValueError, TypeError):
-                                pass
+                        tod_row = (
+                            await _tod_by_invite(game_meta.get("inviteId"))
+                            or await _latest_tod_round("invited")
+                        )
+                        if tod_row:
+                            tod_row.choice = game_meta.get("choice")
+                            tod_row.status = "choice_made"
+                            tod_row.updated_at = now_utc
 
                     elif msg_type_ws == "tod_next":
                         # Sender picked and sent the actual question card
-                        invite_id_raw = game_meta.get("inviteId")
-                        if invite_id_raw:
-                            try:
-                                invite_uuid = uuid.UUID(str(invite_id_raw))
-                                tod_row = (await db.execute(
-                                    select(TodRound).where(TodRound.invite_msg_id == invite_uuid)
-                                )).scalar_one_or_none()
-                                if tod_row:
-                                    tod_row.question          = game_meta.get("question")
-                                    tod_row.question_emoji    = game_meta.get("emoji")
-                                    tod_row.question_category = game_meta.get("category")
-                                    tod_row.question_msg_id   = msg.id
-                                    tod_row.status            = "question_sent"
-                                    tod_row.updated_at        = now_utc
-                            except (ValueError, TypeError):
-                                pass
+                        tod_row = (
+                            await _tod_by_invite(game_meta.get("inviteId"))
+                            or await _latest_tod_round("invited", "choice_made")
+                        )
+                        if tod_row:
+                            tod_row.question          = game_meta.get("question")
+                            tod_row.question_emoji    = game_meta.get("emoji")
+                            tod_row.question_category = game_meta.get("category")
+                            tod_row.question_msg_id   = msg.id
+                            tod_row.status            = "question_sent"
+                            tod_row.updated_at        = now_utc
 
                     elif msg_type_ws == "tod_answer":
                         # Receiver answered — complete the round
                         turn_id_raw = game_meta.get("turnMsgId") or game_meta.get("inviteId")
-                        if turn_id_raw:
-                            try:
-                                turn_uuid = uuid.UUID(str(turn_id_raw))
-                                # Try to find by question_msg_id first, then invite_msg_id
-                                tod_row = (await db.execute(
-                                    select(TodRound).where(TodRound.question_msg_id == turn_uuid)
-                                )).scalar_one_or_none()
-                                if not tod_row:
-                                    tod_row = (await db.execute(
-                                        select(TodRound).where(TodRound.invite_msg_id == turn_uuid)
-                                    )).scalar_one_or_none()
-                                if tod_row:
-                                    tod_row.answer        = game_content
-                                    tod_row.answer_msg_id = msg.id
-                                    tod_row.status        = "answered"
-                                    tod_row.updated_at    = now_utc
-                                    tod_row.completed_at  = now_utc
-                            except (ValueError, TypeError):
-                                pass
+                        tod_row = (
+                            await _tod_by_question(turn_id_raw)
+                            or await _tod_by_invite(turn_id_raw)
+                            or await _latest_tod_round("question_sent")
+                        )
+                        if tod_row:
+                            tod_row.answer        = game_content
+                            tod_row.answer_msg_id = msg.id
+                            tod_row.status        = "answered"
+                            tod_row.updated_at    = now_utc
+                            tod_row.completed_at  = now_utc
 
                     await db.commit()
                     await db.refresh(msg)
@@ -859,8 +905,8 @@ async def websocket_chat(
                     preview = "📞 Missed call"
                 else:
                     preview = content[:80]
-                await send_push_notification(
-                    other_push_token,
+                await notify_user(
+                    fresh_other, "chat",
                     title=f"💬 {sender_name}",
                     body=preview,
                     data={
@@ -1119,8 +1165,8 @@ async def send_message(
 
     if not delivered:
         sender_name = current_user.full_name or "Someone"
-        await send_push_notification(
-            other_user.push_token,
+        await notify_user(
+            other_user, "chat",
             title=f"💬 {sender_name}",
             body=content[:80],
             data={
@@ -1364,6 +1410,7 @@ async def unmatch(
         raise HTTPException(status_code=400, detail="Invalid user ID")
 
     uid = str(current_user.id)
+    other_str = str(other_uuid)
 
     # Delete match row (stable ordering — smaller uuid is always user1_id)
     await db.execute(
@@ -1371,18 +1418,29 @@ async def unmatch(
             DELETE FROM matches
             WHERE (user1_id = CAST(:a AS uuid) AND user2_id = CAST(:b AS uuid))
                OR (user1_id = CAST(:b AS uuid) AND user2_id = CAST(:a AS uuid))
-        """).bindparams(a=uid, b=str(other_uuid))
+        """).bindparams(a=uid, b=other_str)
     )
 
     # Delete all messages in the shared room
     room_id = Message.make_room_id(current_user.id, other_uuid)
     await db.execute(sa_delete(Message).where(Message.room_id == room_id))
 
+    # Record a "left" (dislike) swipe from the unmatching user in all feed modes
+    # so the other person will not appear in their feed again.
+    for mode in ("date", "work"):
+        await db.execute(
+            text("""
+                INSERT INTO swipes (swiper_id, swiped_id, direction, mode)
+                VALUES (CAST(:swiper AS uuid), CAST(:swiped AS uuid), 'left', :mode)
+                ON CONFLICT (swiper_id, swiped_id, mode) DO UPDATE SET direction = 'left'
+            """).bindparams(swiper=uid, swiped=other_str, mode=mode)
+        )
+
     await db.commit()
 
     # Notify the other user in real time
     await notify_manager.send_to(
-        str(other_uuid),
+        other_str,
         {"type": "unmatch", "user_id": uid},
     )
 

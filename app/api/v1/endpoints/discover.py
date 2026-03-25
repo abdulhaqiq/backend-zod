@@ -58,7 +58,7 @@ def _get_notify_manager():
     from app.api.v1.endpoints.chat import notify_manager
     return notify_manager
 
-from app.core.push import send_push_notification
+from app.core.push import send_push_notification, notify_user
 
 _log = logging.getLogger(__name__)
 
@@ -196,6 +196,14 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
         "has_voice": bool(u.voice_prompts),
         "mood": {"emoji": u.mood_emoji, "text": u.mood_text} if u.mood_text else None,
         "compatibility": compat,  # {percent, tier, breakdown} or None
+        "halal": {
+            "sect":             _label(u.sect_id),
+            "prayerFrequency":  _label(u.prayer_frequency_id),
+            "marriageTimeline": _label(u.marriage_timeline_id),
+            "waliVerified":     u.wali_verified,
+            "blurPhotos":       u.blur_photos_halal,
+            "halalMode":        u.halal_mode_enabled,
+        },
         # Work profile fields (populated for work mode)
         "work": {
             "matchingGoals":   [x["label"] for x in _labels(u.work_matching_goals)],
@@ -209,6 +217,172 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
             "photos":          list(u.work_photos or []),
         } if (u.work_matching_goals or u.work_commitment_level_id) else None,
     }
+
+
+# ── Smart preference scoring ──────────────────────────────────────────────────
+
+# Default soft max distance when user hasn't set one (used only for scoring, not filtering)
+_DEFAULT_SOFT_MAX_KM = 50.0
+
+
+def _age_from_dob(dob: date | None) -> int | None:
+    if dob is None:
+        return None
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def _list_overlap_score(mine: list | None, theirs: list | None) -> float:
+    """0.0–1.0 based on fraction of my list items found in their list."""
+    if not mine:
+        return 0.5  # no preference → neutral
+    if not theirs:
+        return 0.3  # they have nothing set → slight penalty
+    def _to_id(x):
+        if isinstance(x, int):
+            return x
+        if isinstance(x, dict):
+            return int(x.get("id", 0))
+        return int(x)
+
+    mine_set   = set(_to_id(x) for x in mine)
+    theirs_set = set(_to_id(x) for x in theirs)
+    overlap    = len(mine_set & theirs_set)
+    return min(1.0, overlap / len(mine_set))
+
+
+def _preference_score(me: User, candidate: User, dist_km: float | None) -> float:
+    """
+    Composite soft-preference score (0.0–1.0) across seven dimensions.
+    When a dimension has no data it defaults to 0.5 (neutral) so it doesn't
+    penalise incomplete profiles.
+
+    Dimension weights
+    -----------------
+    35 % – distance proximity
+    15 % – height match
+    15 % – age proximity
+    10 % – shared interests
+    10 % – lifestyle alignment (exercise / drinking / smoking)
+     5 % – family plans match
+     5 % – values overlap
+     5 % – education level match
+    """
+
+    # ── 1. Distance (35 %) ────────────────────────────────────────────────────
+    # Use the viewer's saved max distance as the reference ceiling.
+    # If not set, fall back to _DEFAULT_SOFT_MAX_KM (50 km) so closer
+    # profiles still rank above far-away ones by default.
+    if dist_km is None:
+        d_score = 0.5  # no location data — neutral
+    else:
+        ceiling = float(me.filter_max_distance_km or _DEFAULT_SOFT_MAX_KM)
+        ratio   = dist_km / ceiling  # 0 = right next door, 1 = at limit, >1 = beyond
+        if ratio <= 0.1:
+            d_score = 1.00
+        elif ratio <= 0.25:
+            d_score = 0.90
+        elif ratio <= 0.5:
+            d_score = 0.75
+        elif ratio <= 1.0:
+            d_score = 0.55
+        elif ratio <= 1.5:
+            d_score = 0.35  # outside limit but still show (soft, not hard cut)
+        else:
+            d_score = 0.15
+
+    # ── 2. Height (15 %) ──────────────────────────────────────────────────────
+    h_score = 0.5  # neutral default
+    if candidate.height_cm is not None and (me.filter_height_min or me.filter_height_max):
+        h  = candidate.height_cm
+        lo = me.filter_height_min or 0
+        hi = me.filter_height_max or 9999
+        if lo <= h <= hi:
+            h_score = 1.0
+        else:
+            gap = max(lo - h, h - hi, 0)
+            h_score = 0.80 if gap <= 5 else (0.55 if gap <= 10 else 0.25)
+
+    # ── 3. Age proximity (15 %) ───────────────────────────────────────────────
+    a_score     = 0.5
+    cand_age    = _age_from_dob(candidate.date_of_birth)
+    has_age_pref = me.filter_age_min is not None or me.filter_age_max is not None
+    if cand_age is not None and has_age_pref:
+        lo_a = me.filter_age_min or 18
+        hi_a = me.filter_age_max or 99
+        if lo_a <= cand_age <= hi_a:
+            a_score = 1.0
+        else:
+            gap_a = max(lo_a - cand_age, cand_age - hi_a, 0)
+            a_score = 0.75 if gap_a <= 2 else (0.50 if gap_a <= 5 else 0.20)
+
+    # ── 4. Interests overlap (10 %) ───────────────────────────────────────────
+    # Use viewer's filter if set; otherwise compare own interests vs candidate's
+    interests_mine = me.filter_interests or me.interests
+    i_score = _list_overlap_score(interests_mine, candidate.interests)
+
+    # ── 5. Lifestyle alignment (10 %) ─────────────────────────────────────────
+    # Each sub-dimension (exercise, drinking, smoking) contributes equally.
+    def _lifestyle_val(u: User, key: str) -> int | None:
+        d = u.lifestyle or {}
+        v = d.get(key)
+        return int(v) if v is not None else None
+
+    lifestyle_dims: list[tuple[list | None, int | None]] = [
+        (me.filter_exercise, _lifestyle_val(candidate, "exercise")),
+        (me.filter_drinking, _lifestyle_val(candidate, "drinking")),
+        (me.filter_smoking,  _lifestyle_val(candidate, "smoking")),
+    ]
+    ls_parts: list[float] = []
+    for filt, cand_val in lifestyle_dims:
+        if not filt:
+            ls_parts.append(0.5)   # no preference → neutral
+        elif cand_val is None:
+            ls_parts.append(0.4)   # candidate hasn't set it
+        elif cand_val in [int(x) for x in filt]:
+            ls_parts.append(1.0)   # exact match
+        else:
+            ls_parts.append(0.1)   # mismatch
+    ls_score = sum(ls_parts) / len(ls_parts)
+
+    # ── 6. Family plans (5 %) ─────────────────────────────────────────────────
+    fp_score = 0.5
+    if me.filter_family_plans:
+        if candidate.family_plans_id is None:
+            fp_score = 0.4
+        elif candidate.family_plans_id in [int(x) for x in me.filter_family_plans]:
+            fp_score = 1.0
+        else:
+            fp_score = 0.1
+    elif me.family_plans_id and candidate.family_plans_id:
+        fp_score = 1.0 if me.family_plans_id == candidate.family_plans_id else 0.3
+
+    # ── 7. Values overlap (5 %) ───────────────────────────────────────────────
+    v_score = _list_overlap_score(me.values_list, candidate.values_list)
+
+    # ── 8. Education level (5 %) ──────────────────────────────────────────────
+    ed_score = 0.5
+    if me.filter_education_level:
+        if candidate.education_level_id is None:
+            ed_score = 0.4
+        elif candidate.education_level_id in [int(x) for x in me.filter_education_level]:
+            ed_score = 1.0
+        else:
+            ed_score = 0.2
+    elif me.education_level_id and candidate.education_level_id:
+        ed_score = 1.0 if me.education_level_id == candidate.education_level_id else 0.4
+
+    # ── Weighted composite ────────────────────────────────────────────────────
+    return (
+        0.35 * d_score   +
+        0.15 * h_score   +
+        0.15 * a_score   +
+        0.10 * i_score   +
+        0.10 * ls_score  +
+        0.05 * fp_score  +
+        0.05 * v_score   +
+        0.05 * ed_score
+    )
 
 
 # ── Query builder ─────────────────────────────────────────────────────────────
@@ -240,6 +414,7 @@ async def _fetch_discover_profiles(
     page: int,
     limit: int,
     mode: str = "date",
+    halal: bool = False,
 ) -> list[dict]:
     await _ensure_cache(db)
 
@@ -263,6 +438,14 @@ async def _fetch_discover_profiles(
         User.is_onboarded.is_(True),
         User.photos.isnot(None),
     ]
+
+    # Standard feed must not show Halal-only profiles.
+    # Users with halal_mode_enabled=True have opted into the Halal community
+    # and should only be discoverable in the Halal feed.
+    if not halal:
+        base_filters.append(
+            (User.halal_mode_enabled.is_(False)) | (User.halal_mode_enabled.is_(None))
+        )
     if opposite_gender_id is not None:
         base_filters.append(User.gender_id == opposite_gender_id)
 
@@ -425,6 +608,52 @@ async def _fetch_discover_profiles(
         if me.filter_have_kids:
             stmt = stmt.where(User.have_kids_id.in_(me.filter_have_kids))
 
+    # ── Halal mode filters ────────────────────────────────────────────────────
+    # When halal=True, restrict the feed to same-religion profiles and apply
+    # the user's saved halal-specific filter preferences.
+    if halal:
+        # Guard: user must have halal_mode_enabled set on their profile.
+        # We trust this flag because it can only be set if the user is Muslim
+        # (validated at the profile PATCH level). This avoids a fragile
+        # cache-lookup that can fail after server restarts and cause false 403s.
+        if not me.halal_mode_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Enable Halal mode on your profile to access the Halal feed.",
+            )
+
+        # Match same religion as current user
+        stmt = stmt.where(User.religion_id == me.religion_id)
+
+        # Only show profiles who have halal_mode_enabled = True
+        stmt = stmt.where(User.halal_mode_enabled.is_(True))
+
+        # Sect filter
+        if me.filter_sect:
+            stmt = stmt.where(User.sect_id.in_(me.filter_sect))
+
+        # Prayer frequency filter
+        if me.filter_prayer_frequency:
+            stmt = stmt.where(User.prayer_frequency_id.in_(me.filter_prayer_frequency))
+
+        # Marriage timeline filter
+        if me.filter_marriage_timeline:
+            stmt = stmt.where(User.marriage_timeline_id.in_(me.filter_marriage_timeline))
+
+        # Wali verified filter
+        if me.filter_wali_verified_only:
+            stmt = stmt.where(User.wali_verified.is_(True))
+
+        # Wants to work filter (True = must work, False = must not work, None = no pref)
+        if me.filter_wants_to_work is True:
+            stmt = stmt.where(
+                User.work_matching_goals.isnot(None) | User.work_commitment_level_id.isnot(None)
+            )
+        elif me.filter_wants_to_work is False:
+            stmt = stmt.where(
+                User.work_matching_goals.is_(None) & User.work_commitment_level_id.is_(None)
+            )
+
     result = await db.execute(stmt)
     candidates: list[User] = list(result.scalars().all())
 
@@ -463,13 +692,24 @@ async def _fetch_discover_profiles(
         my_score = heuristic_score_obj(me)  # type: ignore[assignment]
     score_rows = {}
     if candidate_ids:
-        score_result = await db.execute(
-            select(UserScore).where(UserScore.user_id.in_(candidate_ids))
-        )
-        for sr in score_result.scalars().all():
-            score_rows[sr.user_id] = sr
+        try:
+            score_result = await db.execute(
+                select(UserScore).where(UserScore.user_id.in_(candidate_ids))
+            )
+            for sr in score_result.scalars().all():
+                score_rows[sr.user_id] = sr
+        except Exception:
+            # Deadlock or other transient DB error — roll back the aborted
+            # transaction and proceed with heuristic scores for all candidates.
+            await db.rollback()
 
-    profiles = []
+    # ── Collect valid candidates, compute smart ranking score ─────────────────
+    # smart_score = 60% compatibility + 40% multi-dim soft preferences.
+    # Soft preferences include distance, height, age, interests, lifestyle,
+    # family plans, values and education — weighted inside _preference_score().
+    # Hard distance filter is still enforced here (SQL bounding-box already
+    # narrowed candidates; this is an exact Haversine confirmation pass).
+    ranked: list[tuple[float, dict]] = []
     for u in candidates:
         dist_km: float | None = None
         if has_my_location and u.latitude is not None and u.longitude is not None:
@@ -481,12 +721,19 @@ async def _fetch_discover_profiles(
 
         their_score = score_rows.get(u.id) or heuristic_score_obj(u)
         compat = compatibility_between(my_score, their_score)
+        pref   = _preference_score(me, u, dist_km)
 
-        profiles.append(_build_profile(u, dist_km, compat))
-        if len(profiles) >= limit:
-            break
+        # Blend: compat is a dict with "percent" (0–100), pref is 0–1
+        compat_pct = compat.get("percent", 0) if isinstance(compat, dict) else (compat or 0)
+        compat_norm = compat_pct / 100.0 if compat_pct > 1 else compat_pct
+        smart = 0.60 * compat_norm + 0.40 * pref
 
-    return profiles
+        ranked.append((smart, _build_profile(u, dist_km, compat)))
+
+    # Sort by smart score descending so best matches surface first
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    return [profile for _, profile in ranked[:limit]]
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -644,20 +891,21 @@ async def record_swipe(
             swiped_image = (swiped_user.photos or [None])[0] if (swiped_user and swiped_user.photos) else None
 
             # Notify the person who was swiped on
-            await send_push_notification(
-                swiped_user.push_token if swiped_user else None,
-                title="It's a Match! 🎉",
-                body=f"You and {liker_name} liked each other. Say hi!",
-                data={
-                    "type":          "match",
-                    "other_user_id": str(current_user.id),
-                    "other_name":    liker_name,
-                    "other_image":   liker_image,
-                },
-            )
+            if swiped_user:
+                await notify_user(
+                    swiped_user, "match",
+                    title="It's a Match! 🎉",
+                    body=f"You and {liker_name} liked each other. Say hi!",
+                    data={
+                        "type":          "match",
+                        "other_user_id": str(current_user.id),
+                        "other_name":    liker_name,
+                        "other_image":   liker_image,
+                    },
+                )
             # Notify the swiper (may have already left the app)
-            await send_push_notification(
-                current_user.push_token,
+            await notify_user(
+                current_user, "match",
                 title="It's a Match! 🎉",
                 body=f"You and {swiped_name} liked each other. Say hi!",
                 data={
@@ -679,20 +927,21 @@ async def record_swipe(
             liker_name = current_user.full_name or "Someone"
             swiped_result = await db.execute(select(User).where(User.id == body.swiped_id))
             swiped_user   = swiped_result.scalar_one_or_none()
-            if is_super:
-                await send_push_notification(
-                    swiped_user.push_token if swiped_user else None,
-                    title=f"⭐ {liker_name} super-liked you!",
-                    body="Open the app to see who it is.",
-                    data={"type": "super_like", "other_user_id": str(current_user.id)},
-                )
-            else:
-                await send_push_notification(
-                    swiped_user.push_token if swiped_user else None,
-                    title=f"❤️ {liker_name} liked you!",
-                    body="Open the app to see who it is.",
-                    data={"type": "liked_you", "other_user_id": str(current_user.id)},
-                )
+            if swiped_user:
+                if is_super:
+                    await notify_user(
+                        swiped_user, "super_like",
+                        title=f"⭐ {liker_name} super-liked you!",
+                        body="Open the app to see who it is.",
+                        data={"type": "super_like", "other_user_id": str(current_user.id)},
+                    )
+                else:
+                    await notify_user(
+                        swiped_user, "liked_you",
+                        title=f"❤️ {liker_name} liked you!",
+                        body="Open the app to see who it is.",
+                        data={"type": "liked_you", "other_user_id": str(current_user.id)},
+                    )
 
     return {
         "recorded": True,
@@ -860,6 +1109,7 @@ async def reset_swipes(
 @router.get("/ai-picks", summary="Top 10 profiles sorted by real compatibility score, using current filters")
 async def get_ai_picks(
     mode: str = Query("date", description="Feed mode: 'date' or 'work'"),
+    halal: bool = Query(False, description="Halal mode"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -875,7 +1125,7 @@ async def get_ai_picks(
     await _ensure_cache(db)
 
     # Over-fetch so we have enough to sort after distance filtering
-    pool = await _fetch_discover_profiles(current_user, db, page=0, limit=50, mode=mode)
+    pool = await _fetch_discover_profiles(current_user, db, page=0, limit=50, mode=mode, halal=halal)
 
     # Sort by real compatibility score descending; profiles without a score go last
     pool.sort(key=lambda p: (p.get("compatibility") or {}).get("percent", 0), reverse=True)
@@ -904,14 +1154,16 @@ async def get_discover_feed(
     page: int = Query(0, ge=0, description="Page index (0-based)"),
     limit: int = Query(10, ge=1, le=50, description="Profiles per page"),
     mode: str = Query("date", description="Feed mode: 'date' or 'work'"),
+    halal: bool = Query(False, description="Halal mode — filter by same religion + halal-specific preferences"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    profiles = await _fetch_discover_profiles(current_user, db, page, limit, mode=mode)
+    profiles = await _fetch_discover_profiles(current_user, db, page, limit, mode=mode, halal=halal)
     return {
         "page": page,
         "limit": limit,
         "mode": mode,
+        "halal": halal,
         "profiles": profiles,
         "has_more": len(profiles) == limit,
     }

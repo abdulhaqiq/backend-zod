@@ -66,6 +66,18 @@ _HEARTBEAT_INTERVAL = 20      # seconds between keep-alive pings
 
 # ─── Endpoint ─────────────────────────────────────────────────────────────────
 
+async def _fetch_attempt(user_id: UUID, attempt_type: str) -> VerificationAttempt | None:
+    async with AsyncSessionLocal() as db:
+        row = await db.execute(
+            select(VerificationAttempt)
+            .where(VerificationAttempt.user_id == user_id)
+            .where(VerificationAttempt.attempt_type == attempt_type)
+            .order_by(VerificationAttempt.submitted_at.desc())
+            .limit(1)
+        )
+        return row.scalar_one_or_none()
+
+
 @router.websocket("/verify-face/{user_id}")
 async def verification_status_ws(websocket: WebSocket, user_id: UUID) -> None:
     """
@@ -76,38 +88,39 @@ async def verification_status_ws(websocket: WebSocket, user_id: UUID) -> None:
     await websocket.accept()
     _log.info("ws | user=%s type=%s accepted", user_id, attempt_type)
 
-    # ── Check if already resolved (user re-opened the page after scan) ─────────
-    async with AsyncSessionLocal() as db:
-        row = await db.execute(
-            select(VerificationAttempt)
-            .where(VerificationAttempt.user_id == user_id)
-            .where(VerificationAttempt.attempt_type == attempt_type)
-            .order_by(VerificationAttempt.submitted_at.desc())
-            .limit(1)
-        )
-        attempt = row.scalar_one_or_none()
-
-    if attempt and attempt.status in ("verified", "rejected"):
-        # Already done — send immediately and close
-        await websocket.send_json(_attempt_payload(attempt))
-        _log.info("ws | user=%s already %s — sent and closed", user_id, attempt.status)
-        return
-
-    # ── Pending — wait for background task to push the result ──────────────────
+    # ── Register in watcher BEFORE DB check to eliminate race condition ─────────
+    # If bg task finishes between our DB read and registration, we'd miss the
+    # notify(). By registering first, we guarantee we catch every notification.
     q: asyncio.Queue = asyncio.Queue(maxsize=1)
     watcher._add(user_id, q)
 
+    async def _send_result(attempt: VerificationAttempt) -> None:
+        try:
+            await websocket.send_json(_attempt_payload(attempt))
+            _log.info("ws | user=%s result=%s sent", user_id, attempt.status)
+        except (WebSocketDisconnect, Exception):
+            pass
+
     try:
+        # ── Check if already resolved (covers: re-open after scan, fast bg task) ──
+        attempt = await _fetch_attempt(user_id, attempt_type)
+        if attempt and attempt.status in ("verified", "rejected"):
+            await _send_result(attempt)
+            return
+
+        # ── Pending — wait for background task to push the result ──────────────
         while True:
             try:
-                # Wait up to HEARTBEAT_INTERVAL seconds for a result
                 msg = await asyncio.wait_for(q.get(), timeout=_HEARTBEAT_INTERVAL)
                 # Got the real result from notify()
-                await websocket.send_json(msg)
-                _log.info("ws | user=%s pushed %s", user_id, msg.get("status"))
+                try:
+                    await websocket.send_json(msg)
+                    _log.info("ws | user=%s pushed %s", user_id, msg.get("status"))
+                except (WebSocketDisconnect, Exception):
+                    pass
                 break
             except asyncio.TimeoutError:
-                # Send a heartbeat so the socket stays alive
+                # Send a heartbeat so the socket stays alive on mobile
                 try:
                     await websocket.send_json({"status": "heartbeat"})
                 except Exception:
@@ -132,5 +145,7 @@ def _attempt_payload(attempt: VerificationAttempt) -> dict:
         "id_has_dob":          attempt.id_has_dob,
         "id_has_expiry":       attempt.id_has_expiry,
         "id_has_number":       attempt.id_has_number,
+        "id_name_match":       attempt.id_name_match,
+        "id_dob_match":        attempt.id_dob_match,
         "processed_at":        attempt.processed_at.isoformat() if attempt.processed_at else None,
     }

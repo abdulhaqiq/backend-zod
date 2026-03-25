@@ -1,14 +1,21 @@
 """
-LinkedIn OAuth import endpoints.
+LinkedIn OAuth import endpoints + profile scraper.
 
-Flow
-────
+OAuth Flow
+──────────
 1. Frontend opens LinkedIn OAuth in an in-app browser.
 2. LinkedIn redirects to LINKEDIN_REDIRECT_URI with ?code=<auth_code>.
 3. App extracts the code and POSTs it to /api/v1/linkedin/import-work or
    /api/v1/linkedin/import-education.
 4. Backend exchanges the code for an access token, calls the LinkedIn API,
    and returns structured data ready to save to the user profile.
+
+Scraper endpoints
+─────────────────
+POST /linkedin/enrich  – enrich the authenticated user's profile from their
+                         stored linkedin_url using the multi-tier scraper.
+POST /linkedin/scrape  – admin-only: scrape any LinkedIn URL and return raw
+                         structured data (does not write to the DB).
 
 LinkedIn API notes
 ──────────────────
@@ -32,6 +39,7 @@ from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
+from app.services.linkedin_scraper import LinkedInScraperService, ScrapedLinkedInProfile
 
 router = APIRouter(prefix="/linkedin", tags=["linkedin"])
 
@@ -364,3 +372,125 @@ async def import_linkedin_education(
                 ))
 
         return entries
+
+
+# ─── Scraper: enrich authenticated user's profile ────────────────────────────
+
+class EnrichResponse(BaseModel):
+    scraped: ScrapedLinkedInProfile
+    updated_fields: list[str]
+
+
+@router.post("/enrich", response_model=EnrichResponse)
+async def enrich_profile_from_linkedin(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Scrape the authenticated user's LinkedIn profile and update their DB record.
+
+    Requires the user to have previously verified their LinkedIn account
+    (linkedin_verified=True and linkedin_url set).
+
+    Updated fields (only when the DB field is currently empty/None):
+      - work_experience  ← scraped positions
+      - education        ← scraped education
+      - bio              ← scraped about/summary
+      - city             ← scraped city / location
+      - full_name        ← scraped name
+
+    Fields that already have values are left untouched so users don't lose
+    manual edits.
+    """
+    if not current_user.linkedin_verified or not current_user.linkedin_url:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "LinkedIn account not verified. "
+                "Complete LinkedIn verification first via POST /linkedin/verify."
+            ),
+        )
+
+    service = LinkedInScraperService()
+    scraped = await service.scrape(current_user.linkedin_url)
+
+    if scraped.error and not scraped.full_name and not scraped.positions:
+        raise HTTPException(
+            status_code=422,
+            detail=f"LinkedIn scrape failed: {scraped.error}",
+        )
+
+    updated_fields: list[str] = []
+
+    if scraped.full_name and not current_user.full_name:
+        current_user.full_name = scraped.full_name
+        updated_fields.append("full_name")
+
+    if scraped.positions and not current_user.work_experience:
+        current_user.work_experience = [
+            {
+                "job_title": p.title,
+                "company": p.company,
+                "start_year": p.start_year,
+                "end_year": p.end_year,
+                "current": p.current,
+            }
+            for p in scraped.positions
+            if p.title or p.company
+        ]
+        if current_user.work_experience:
+            updated_fields.append("work_experience")
+
+    if scraped.education and not current_user.education:
+        current_user.education = [
+            {
+                "institution": e.institution,
+                "course": e.field,
+                "degree": e.degree,
+                "grad_year": e.grad_year,
+            }
+            for e in scraped.education
+            if e.institution or e.field
+        ]
+        if current_user.education:
+            updated_fields.append("education")
+
+    if scraped.about and not current_user.bio:
+        current_user.bio = scraped.about[:500]
+        updated_fields.append("bio")
+
+    if not current_user.city:
+        city_val = scraped.city or (scraped.location.split(",")[0].strip() if scraped.location else "")
+        if city_val:
+            current_user.city = city_val
+            updated_fields.append("city")
+
+    if updated_fields:
+        db.add(current_user)
+        await db.commit()
+
+    return EnrichResponse(scraped=scraped, updated_fields=updated_fields)
+
+
+# ─── Scraper: admin raw-scrape any LinkedIn URL ──────────────────────────────
+
+class ScrapeRequest(BaseModel):
+    linkedin_url: str
+
+
+@router.post("/scrape", response_model=ScrapedLinkedInProfile)
+async def scrape_linkedin_profile(
+    body: ScrapeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Admin-only: scrape any LinkedIn profile URL and return structured data.
+
+    Does NOT modify any database records — purely returns what the scraper
+    finds.  Useful for testing scrapers or manual data enrichment workflows.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    service = LinkedInScraperService()
+    return await service.scrape(body.linkedin_url)
