@@ -194,20 +194,6 @@ class User(Base):
     filter_wali_verified_only: Mapped[bool]       = mapped_column(Boolean, default=False, nullable=False)
     filter_wants_to_work:     Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # True=wants to work, False=doesn't, None=no pref
 
-    # ── Halal / Islamic mode ──────────────────────────────────────────────────
-    sect_id:                Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=sect)
-    prayer_frequency_id:    Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=prayer_frequency)
-    marriage_timeline_id:   Mapped[int | None]  = mapped_column(Integer, nullable=True)           # FK → lookup_options (category=marriage_timeline)
-    wali_email:             Mapped[str | None]  = mapped_column(String(255), nullable=True)
-    wali_verified:          Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
-    blur_photos_halal:      Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
-    halal_mode_enabled:     Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
-    filter_sect:            Mapped[list | None] = mapped_column(JSONB, nullable=True)             # [lookup_options.id]
-    filter_prayer_frequency: Mapped[list | None] = mapped_column(JSONB, nullable=True)            # [lookup_options.id]
-    filter_marriage_timeline: Mapped[list | None] = mapped_column(JSONB, nullable=True)           # [lookup_options.id]
-    filter_wali_verified_only: Mapped[bool]     = mapped_column(Boolean, default=False, nullable=False)
-    filter_wants_to_work:   Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-
     # ── Mood / vibe status ────────────────────────────────────────────────────
     mood_emoji:  Mapped[str | None] = mapped_column(String(8),   nullable=True)  # e.g. "🎉"
     mood_text:   Mapped[str | None] = mapped_column(String(60),  nullable=True)  # e.g. "Up for a coffee chat"
