@@ -331,9 +331,14 @@ async def websocket_notify(
         _log.debug("ws:notify | connection dropped for user=%s: %s", uid_me[:8], exc)
     finally:
         notify_manager.disconnect(uid_me, websocket)
-        # Only broadcast "offline" if this was the user's last notify session
+        # Only broadcast "offline" if this was the user's last notify session.
+        # Suppress CancelledError during server shutdown — presence fan-out is
+        # best-effort and must not block the shutdown sequence.
         if not notify_manager.is_online(uid_me):
-            await _broadcast_presence(uid_me, online=False)
+            try:
+                await _broadcast_presence(uid_me, online=False)
+            except Exception:
+                pass
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -390,9 +395,13 @@ async def _get_match_partner_ids(uid: str) -> list[str]:
 
 async def _broadcast_presence(uid: str, online: bool) -> None:
     """Fan-out a presence event to all matched partners of *uid* via notify_manager."""
+    import asyncio as _asyncio
     try:
         partner_ids = await _get_match_partner_ids(uid)
-    except Exception as exc:
+    except _asyncio.CancelledError:
+        # Server is shutting down — let the cancellation propagate cleanly.
+        raise
+    except BaseException as exc:
         _log.debug("_broadcast_presence | DB error for user=%s: %s", uid[:8], exc)
         return
     payload = {"type": "presence", "user_id": uid, "online": online}

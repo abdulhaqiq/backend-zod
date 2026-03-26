@@ -280,6 +280,331 @@ RIYADH_CITIES = [
     ("Diriyah", "Saudi Arabia"),
 ]
 
+# ── Dubai / UAE seed data ─────────────────────────────────────────────────────
+DXB_BASE_LAT   = 25.2048
+DXB_BASE_LNG   = 55.2708
+DXB_MAX_RADIUS = 80  # km — covers Dubai, Sharjah, Abu Dhabi corridor
+
+DUBAI_MALE_NAMES = [
+    "Zayed", "Hamdan", "Rashid", "Khalid", "Mohammed",
+    "Omar", "Saif", "Ahmad", "Tariq", "Yousef",
+    "Bilal", "Hassan", "Kareem", "Nabil", "Faris",
+    "Ryan", "Jake", "Marcus", "Daniel", "Luca",
+]
+DUBAI_FEMALE_NAMES = [
+    "Fatima", "Mariam", "Latifa", "Hind", "Shamma",
+    "Aisha", "Noura", "Sara", "Dana", "Reem",
+    "Jessica", "Sophie", "Emma", "Priya", "Ananya",
+    "Nadia", "Layla", "Yasmin", "Zara", "Hana",
+]
+DUBAI_LAST_NAMES = [
+    "Al Maktoum", "Al Nahyan", "Al Rashid", "Al Mansoori", "Al Falasi",
+    "Al Mazrouei", "Al Kaabi", "Al Qubaisi", "Patel", "Sharma",
+    "Williams", "Thompson", "Chen", "Kim", "Singh",
+    "Fernandez", "Russo", "Müller", "Ahmed", "Hassan",
+]
+DUBAI_DATE_BIOS = [
+    "Dubai-based architect designing the skylines of tomorrow 🏙️",
+    "Brunch weekends, Burj views, and a serious coffee habit ☕🌆",
+    "Finance professional by week, desert safari addict by weekend 🏜️",
+    "Ex-London, now loving the Dubai sun — 5 years and counting ☀️",
+    "Foodie exploring every hidden gem from Deira to JBR 🍽️",
+    "Pilot based in DXB — the world is my backyard ✈️🌍",
+    "Startup founder building the next unicorn in Dubai Internet City 🦄",
+    "Yoga on the beach at sunrise, rooftop dinners at sunset 🧘‍♀️🌅",
+    "Fashion buyer who splits her time between Dubai and Milan 👗✨",
+    "Engineer at Expo City, building sustainable futures 🌱🏗️",
+    "Sushi > everything. Let's argue about this over dinner 🍣",
+    "Marathon runner who trains along the Marina canal 🏃‍♂️",
+    "Interior designer obsessed with blending Arabic heritage and modernism 🕌🛋️",
+    "DJ by night, digital marketer by day — always chasing the vibe 🎧",
+    "Beach volleyball, salsa nights, and way too many brunches 🏐💃",
+]
+DUBAI_CITIES = [
+    ("Dubai", "UAE"),
+    ("Dubai, Downtown", "UAE"),
+    ("Dubai, Marina", "UAE"),
+    ("Dubai, JBR", "UAE"),
+    ("Dubai, Business Bay", "UAE"),
+    ("Dubai, DIFC", "UAE"),
+    ("Dubai, Jumeirah", "UAE"),
+    ("Dubai, Palm Jumeirah", "UAE"),
+    ("Sharjah", "UAE"),
+    ("Abu Dhabi", "UAE"),
+    ("Abu Dhabi, Al Reem Island", "UAE"),
+    ("Al Ain", "UAE"),
+]
+
+# ── Mumbai / India seed data ──────────────────────────────────────────────────
+MUM_BASE_LAT   = 19.0760
+MUM_BASE_LNG   = 72.8777
+MUM_MAX_RADIUS = 50  # km — Mumbai metro area
+
+MUMBAI_MALE_NAMES = [
+    "Arjun", "Rohan", "Vikram", "Aarav", "Kabir",
+    "Siddharth", "Aditya", "Rahul", "Dev", "Nikhil",
+    "Ishaan", "Karan", "Varun", "Shreyas", "Armaan",
+]
+MUMBAI_FEMALE_NAMES = [
+    "Ananya", "Priya", "Divya", "Nisha", "Anika",
+    "Isha", "Shreya", "Pooja", "Meera", "Kavya",
+    "Riya", "Tara", "Simran", "Aditi", "Sana",
+]
+MUMBAI_LAST_NAMES = [
+    "Sharma", "Patel", "Mehta", "Joshi", "Kapoor",
+    "Singh", "Verma", "Gupta", "Malhotra", "Nair",
+    "Iyer", "Rao", "Desai", "Shah", "Shetty",
+]
+MUMBAI_DATE_BIOS = [
+    "Marine Drive sunsets and chai from the tapri — Mumbai at its finest ☕🌊",
+    "Bollywood junkie who can quote every SRK film on demand 🎬",
+    "Architect designing Mumbai's next iconic skyline 🏙️",
+    "Startup founder in Bandra — building India's next big thing 🚀",
+    "South Mumbai girl with a Versova soul 🌅",
+    "Foodie exploring everything from Juhu chaat to Colaba bistros 🍛",
+    "IIM grad who gave up consulting for tech entrepreneurship 💡",
+    "Cricket on Sundays, jazz at Blue Frog on weekends 🏏🎷",
+    "Fashion designer blending Indian textile heritage with modern cuts 👗",
+    "Investment banker who unwinds with long Bandstand walks 🌊",
+    "Dancer, dreamer, and dedicated dosa enthusiast 🕺🥘",
+    "Doctor at KEM who reads fiction to decompress 📚🏥",
+    "Content creator with 200k followers — life is short, create more 📱✨",
+    "Traveller who has seen 30 countries but keeps coming back to Mumbai 🌍❤️",
+    "Engineer at a unicorn startup, weekends are for trekking Sahyadri 🏔️",
+]
+MUMBAI_CITIES = [
+    ("Mumbai", "India"),
+    ("Mumbai, Bandra", "India"),
+    ("Mumbai, Andheri", "India"),
+    ("Mumbai, Juhu", "India"),
+    ("Mumbai, Colaba", "India"),
+    ("Mumbai, Powai", "India"),
+    ("Mumbai, Lower Parel", "India"),
+    ("Navi Mumbai", "India"),
+    ("Thane", "India"),
+    ("Pune", "India"),
+]
+
+# ── Istanbul / Turkey seed data ───────────────────────────────────────────────
+IST_BASE_LAT   = 41.0082
+IST_BASE_LNG   = 28.9784
+IST_MAX_RADIUS = 60  # km
+
+ISTANBUL_MALE_NAMES = [
+    "Mehmet", "Ahmet", "Mustafa", "Emre", "Burak",
+    "Kerem", "Serkan", "Tolga", "Cem", "Berk",
+    "Furkan", "Yusuf", "Osman", "Ibrahim", "Selim",
+]
+ISTANBUL_FEMALE_NAMES = [
+    "Zeynep", "Elif", "Ayşe", "Fatma", "Merve",
+    "Selin", "Büşra", "Derya", "Cansu", "Beren",
+    "Naz", "İrem", "Tuğba", "Ceren", "Dilara",
+]
+ISTANBUL_LAST_NAMES = [
+    "Yılmaz", "Kaya", "Demir", "Çelik", "Şahin",
+    "Doğan", "Aydın", "Arslan", "Koç", "Kurt",
+    "Özturk", "Polat", "Erdoğan", "Güneş", "Aslan",
+]
+ISTANBUL_DATE_BIOS = [
+    "Bosphorus sunsets over Turkish tea — my version of paradise 🌊🍵",
+    "Architect splitting time between Istanbul and Berlin 🏛️✈️",
+    "Street food connoisseur — balık ekmek to midye dolma, I eat everything 🐟",
+    "Startup founder in Levent — building fintech for 80M Turks 🚀",
+    "History graduate who gives unofficial tours of Istanbul for fun 🕌📖",
+    "Barista by passion, software engineer by profession ☕💻",
+    "Yoga at sunrise, hammam at sunset, Beyoğlu by night 🧘‍♀️✨",
+    "Fashion designer with an atelier in Nişantaşı 👗",
+    "Photographer chasing golden hour across Galata and Karaköy 📸",
+    "Doctor at Şişli who finds peace in jazz and good wine 🎷🍷",
+    "Serial traveller who has visited 45 countries from the Istanbul hub ✈️🌍",
+    "Film director currently in post-production for my third short 🎬",
+    "Tech investor by day, oud player by night 🎵💼",
+    "Chef blending Ottoman cuisine with modern French technique 🍽️",
+    "Journalist covering the intersection of tech and democracy 📰💡",
+]
+ISTANBUL_CITIES = [
+    ("Istanbul", "Turkey"),
+    ("Istanbul, Kadıköy", "Turkey"),
+    ("Istanbul, Beşiktaş", "Turkey"),
+    ("Istanbul, Beyoğlu", "Turkey"),
+    ("Istanbul, Şişli", "Turkey"),
+    ("Istanbul, Üsküdar", "Turkey"),
+    ("Istanbul, Bakırköy", "Turkey"),
+    ("Ankara", "Turkey"),
+    ("İzmir", "Turkey"),
+]
+
+
+def make_dubai_date_profile(idx: int):
+    is_male = idx % 2 == 0
+    first_name = random.choice(DUBAI_MALE_NAMES if is_male else DUBAI_FEMALE_NAMES)
+    last_name  = random.choice(DUBAI_LAST_NAMES)
+    gender_id  = random.choice([223] if is_male else [224, 225])
+    photos_pool = MALE_PHOTOS if is_male else FEMALE_PHOTOS
+    photos = random.sample(photos_pool, random.randint(2, 4))
+    lat, lng = random_coords_near(DXB_BASE_LAT, DXB_BASE_LNG, DXB_MAX_RADIUS)
+    city_name, country = random.choice(DUBAI_CITIES)
+    dob = random_dob(22, 38)
+    interests = pick(INTEREST_IDS, random.randint(3, 7))
+    languages = pick(LANGUAGE_IDS, random.randint(1, 3))
+    lifestyle = {
+        "exercise": random.choice(EXERCISE_IDS),
+        "drinking": random.choice(DRINKING_IDS),
+        "smoking":  random.choice(SMOKING_IDS),
+        "diet":     random.choice(DIET_IDS),
+    }
+    return {
+        "id":                 str(uuid.uuid4()),
+        "full_name":          f"{first_name} {last_name}",
+        "bio":                random.choice(DUBAI_DATE_BIOS),
+        "is_active":          True,
+        "is_verified":        random.random() < 0.68,
+        "is_onboarded":       True,
+        "created_at":         datetime.now(timezone.utc) - timedelta(days=random.randint(1, 120)),
+        "updated_at":         datetime.now(timezone.utc),
+        "date_of_birth":      dob,
+        "latitude":           lat,
+        "longitude":          lng,
+        "city":               city_name,
+        "country":            country,
+        "address":            f"{city_name}, {country}",
+        "height_cm":          random.randint(155, 195),
+        "gender_id":          gender_id,
+        "education_level_id": random.choice(EDUCATION_IDS),
+        "looking_for_id":     random.choice(LOOKING_FOR_IDS),
+        "family_plans_id":    random.choice(FAMILY_PLANS_IDS),
+        "have_kids_id":       random.choice(HAVE_KIDS_IDS),
+        "star_sign_id":       random.choice(STAR_SIGN_IDS),
+        "religion_id":        random.choice(RELIGION_IDS),
+        "subscription_tier":  random.choices(["free", "pro"], weights=[60, 40])[0],
+        "verification_status": random.choices(["unverified", "verified"], weights=[30, 70])[0],
+        "photos":             json.dumps(photos),
+        "interests":          json.dumps([{"id": i} for i in interests]),
+        "languages":          json.dumps([{"id": i} for i in languages]),
+        "lifestyle":          json.dumps(lifestyle),
+        "prompts":            json.dumps(random.choice(PROMPT_POOLS)),
+        "purpose":            json.dumps([{"id": random.choice(LOOKING_FOR_IDS)}]),
+        "filter_max_distance_km": None,
+        "filter_age_min":     None,
+        "filter_age_max":     None,
+        "filter_verified_only": False,
+        "_mode": "date",
+    }
+
+
+def make_mumbai_date_profile(idx: int):
+    is_male = idx % 2 == 0
+    first_name = random.choice(MUMBAI_MALE_NAMES if is_male else MUMBAI_FEMALE_NAMES)
+    last_name  = random.choice(MUMBAI_LAST_NAMES)
+    gender_id  = random.choice([223] if is_male else [224, 225])
+    photos_pool = MALE_PHOTOS if is_male else FEMALE_PHOTOS
+    photos = random.sample(photos_pool, random.randint(2, 4))
+    lat, lng = random_coords_near(MUM_BASE_LAT, MUM_BASE_LNG, MUM_MAX_RADIUS)
+    city_name, country = random.choice(MUMBAI_CITIES)
+    dob = random_dob(22, 35)
+    interests = pick(INTEREST_IDS, random.randint(3, 7))
+    languages = pick(LANGUAGE_IDS, random.randint(1, 3))
+    lifestyle = {
+        "exercise": random.choice(EXERCISE_IDS),
+        "drinking": random.choice(DRINKING_IDS),
+        "smoking":  random.choice(SMOKING_IDS),
+        "diet":     random.choice(DIET_IDS),
+    }
+    return {
+        "id":                 str(uuid.uuid4()),
+        "full_name":          f"{first_name} {last_name}",
+        "bio":                random.choice(MUMBAI_DATE_BIOS),
+        "is_active":          True,
+        "is_verified":        random.random() < 0.65,
+        "is_onboarded":       True,
+        "created_at":         datetime.now(timezone.utc) - timedelta(days=random.randint(1, 100)),
+        "updated_at":         datetime.now(timezone.utc),
+        "date_of_birth":      dob,
+        "latitude":           lat,
+        "longitude":          lng,
+        "city":               city_name,
+        "country":            country,
+        "address":            f"{city_name}, {country}",
+        "height_cm":          random.randint(152, 188),
+        "gender_id":          gender_id,
+        "education_level_id": random.choice(EDUCATION_IDS),
+        "looking_for_id":     random.choice(LOOKING_FOR_IDS),
+        "family_plans_id":    random.choice(FAMILY_PLANS_IDS),
+        "have_kids_id":       random.choice(HAVE_KIDS_IDS),
+        "star_sign_id":       random.choice(STAR_SIGN_IDS),
+        "religion_id":        random.choice(RELIGION_IDS),
+        "subscription_tier":  random.choices(["free", "pro"], weights=[70, 30])[0],
+        "verification_status": random.choices(["unverified", "verified"], weights=[40, 60])[0],
+        "photos":             json.dumps(photos),
+        "interests":          json.dumps([{"id": i} for i in interests]),
+        "languages":          json.dumps([{"id": i} for i in languages]),
+        "lifestyle":          json.dumps(lifestyle),
+        "prompts":            json.dumps(random.choice(PROMPT_POOLS)),
+        "purpose":            json.dumps([{"id": random.choice(LOOKING_FOR_IDS)}]),
+        "filter_max_distance_km": None,
+        "filter_age_min":     None,
+        "filter_age_max":     None,
+        "filter_verified_only": False,
+        "_mode": "date",
+    }
+
+
+def make_istanbul_date_profile(idx: int):
+    is_male = idx % 2 == 0
+    first_name = random.choice(ISTANBUL_MALE_NAMES if is_male else ISTANBUL_FEMALE_NAMES)
+    last_name  = random.choice(ISTANBUL_LAST_NAMES)
+    gender_id  = random.choice([223] if is_male else [224, 225])
+    photos_pool = MALE_PHOTOS if is_male else FEMALE_PHOTOS
+    photos = random.sample(photos_pool, random.randint(2, 4))
+    lat, lng = random_coords_near(IST_BASE_LAT, IST_BASE_LNG, IST_MAX_RADIUS)
+    city_name, country = random.choice(ISTANBUL_CITIES)
+    dob = random_dob(22, 37)
+    interests = pick(INTEREST_IDS, random.randint(3, 7))
+    languages = pick(LANGUAGE_IDS, random.randint(1, 3))
+    lifestyle = {
+        "exercise": random.choice(EXERCISE_IDS),
+        "drinking": random.choice(DRINKING_IDS),
+        "smoking":  random.choice(SMOKING_IDS),
+        "diet":     random.choice(DIET_IDS),
+    }
+    return {
+        "id":                 str(uuid.uuid4()),
+        "full_name":          f"{first_name} {last_name}",
+        "bio":                random.choice(ISTANBUL_DATE_BIOS),
+        "is_active":          True,
+        "is_verified":        random.random() < 0.65,
+        "is_onboarded":       True,
+        "created_at":         datetime.now(timezone.utc) - timedelta(days=random.randint(1, 150)),
+        "updated_at":         datetime.now(timezone.utc),
+        "date_of_birth":      dob,
+        "latitude":           lat,
+        "longitude":          lng,
+        "city":               city_name,
+        "country":            country,
+        "address":            f"{city_name}, {country}",
+        "height_cm":          random.randint(155, 192),
+        "gender_id":          gender_id,
+        "education_level_id": random.choice(EDUCATION_IDS),
+        "looking_for_id":     random.choice(LOOKING_FOR_IDS),
+        "family_plans_id":    random.choice(FAMILY_PLANS_IDS),
+        "have_kids_id":       random.choice(HAVE_KIDS_IDS),
+        "star_sign_id":       random.choice(STAR_SIGN_IDS),
+        "religion_id":        random.choice(RELIGION_IDS),
+        "subscription_tier":  random.choices(["free", "pro"], weights=[65, 35])[0],
+        "verification_status": random.choices(["unverified", "verified"], weights=[35, 65])[0],
+        "photos":             json.dumps(photos),
+        "interests":          json.dumps([{"id": i} for i in interests]),
+        "languages":          json.dumps([{"id": i} for i in languages]),
+        "lifestyle":          json.dumps(lifestyle),
+        "prompts":            json.dumps(random.choice(PROMPT_POOLS)),
+        "purpose":            json.dumps([{"id": random.choice(LOOKING_FOR_IDS)}]),
+        "filter_max_distance_km": None,
+        "filter_age_min":     None,
+        "filter_age_max":     None,
+        "filter_verified_only": False,
+        "_mode": "date",
+    }
+
 
 def random_coords_near(base_lat: float, base_lng: float, max_km: float):
     """Generate a random lat/lng within max_km of the base point."""
@@ -669,16 +994,21 @@ async def seed():
     print(f"likes table: {has_likes}, matches table: {has_matches}")
 
     # ── Generate profiles ─────────────────────────────────────────────────────
-    random.seed(42)
+    # Use random seed=None so every run produces unique UUIDs + fresh variation
+    random.seed(None)
     date_profiles  = [make_date_profile(i) for i in range(25)]
     work_profiles  = [make_work_profile(i) for i in range(25)]
-    ryd_date       = [make_riyadh_date_profile(i) for i in range(15)]
-    ryd_work       = [make_riyadh_work_profile(i) for i in range(5)]
+    ryd_date       = [make_riyadh_date_profile(i) for i in range(20)]
+    ryd_work       = [make_riyadh_work_profile(i) for i in range(10)]
     us_date        = [make_us_date_profile(i) for i in range(15)]
-    all_profiles   = date_profiles + work_profiles + ryd_date + ryd_work + us_date
+    dxb_date       = [make_dubai_date_profile(i) for i in range(20)]
+    mum_date       = [make_mumbai_date_profile(i) for i in range(20)]
+    ist_date       = [make_istanbul_date_profile(i) for i in range(15)]
+    all_profiles   = date_profiles + work_profiles + ryd_date + ryd_work + us_date + dxb_date + mum_date + ist_date
 
     print(f"Inserting {len(all_profiles)} profiles  "
-          f"(25 London date + 25 London work + 15 Riyadh date + 5 Riyadh work + 15 Western US date)…")
+          f"(25 London date + 25 London work + 20 Riyadh date + 10 Riyadh work "
+          f"+ 15 US date + 20 Dubai date + 20 Mumbai date + 15 Istanbul date)…")
 
     insert_sql = """
     INSERT INTO users (
@@ -808,9 +1138,12 @@ async def seed():
     print("\n🎉 Seed complete!")
     print(f"   • 25 date profiles  (London)")
     print(f"   • 25 work profiles  (London)")
-    print(f"   • 15 date profiles  (Riyadh)")
-    print(f"   • 5  work profiles  (Riyadh)")
-    print(f"   • 15 date profiles  (Western US — incl. Abdul Kumshey + western female names)")
+    print(f"   • 20 date profiles  (Riyadh)")
+    print(f"   • 10 work profiles  (Riyadh)")
+    print(f"   • 15 date profiles  (Western US)")
+    print(f"   • 20 date profiles  (Dubai / UAE)")
+    print(f"   • 20 date profiles  (Mumbai / India)")
+    print(f"   • 15 date profiles  (Istanbul / Turkey)")
     print(f"   • ~30 mutual likes seeded (where likes table exists)")
 
 

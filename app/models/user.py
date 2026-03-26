@@ -126,6 +126,11 @@ class User(Base):
     notif_promotions:   Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notif_dating_tips:  Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # ── Admin overrides ───────────────────────────────────────────────────────
+    # When True the distance filter is completely skipped for this user so they
+    # see profiles from any location regardless of filter_max_distance_km.
+    bypass_location_filter: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         Mapped[int | None]  = mapped_column(Integer, nullable=True)
     filter_age_max:         Mapped[int | None]  = mapped_column(Integer, nullable=True)

@@ -104,6 +104,9 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_wants_to_work BOOLEAN"
         ))
         await conn.execute(_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS bypass_location_filter BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(_text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_new_match BOOLEAN NOT NULL DEFAULT TRUE"
         ))
         await conn.execute(_text(
@@ -225,9 +228,54 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _log.warning("Travel mode expiry loop error (non-critical): %s", exc)
 
+    async def _enable_bypass_location_for_tester():
+        """
+        On every startup: ensure the owner account has full admin access and
+        location-filter bypass so they can use all admin endpoints and see
+        profiles from anywhere — no separate admin account needed.
+        """
+        from sqlalchemy import select
+        from app.db.session import AsyncSessionLocal
+        from app.models.user import User
+
+        _OWNER_PHONE = "9148880196"
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User).where(User.phone == _OWNER_PHONE)
+                )
+                user = result.scalar_one_or_none()
+                if user:
+                    changed = False
+                    if not user.is_admin:
+                        user.is_admin = True
+                        changed = True
+                    if not user.bypass_location_filter:
+                        user.bypass_location_filter = True
+                        changed = True
+                    # Clear all hard filter limits so the feed shows everyone
+                    if user.filter_max_distance_km is not None:
+                        user.filter_max_distance_km = None
+                        changed = True
+                    if user.filter_age_min is not None:
+                        user.filter_age_min = None
+                        changed = True
+                    if user.filter_age_max is not None:
+                        user.filter_age_max = None
+                        changed = True
+                    if changed:
+                        await db.commit()
+                        _log.info(
+                            "Owner account %s (phone %s): is_admin=True, bypass_location_filter=True, all filters cleared",
+                            user.id, _OWNER_PHONE,
+                        )
+        except Exception as exc:
+            _log.warning("Could not configure owner account privileges: %s", exc)
+
     _bg_tasks = {
         asyncio.create_task(_recover_stale_attempts()),
         asyncio.create_task(_expire_travel_modes()),
+        asyncio.create_task(_enable_bypass_location_for_tester()),
     }
     # Keep strong references so GC doesn't discard them before they finish
     for _t in _bg_tasks:
@@ -330,16 +378,23 @@ _SCAN_GATE_ALLOW = (
 
 @app.middleware("http")
 async def scan_required_gate(request: Request, call_next):
+    import asyncio as _asyncio
     path = request.url.path
 
     # Fast-path: always allow exempt routes without touching the DB
     if any(path.startswith(p) for p in _SCAN_GATE_ALLOW):
-        return await call_next(request)
+        try:
+            return await call_next(request)
+        except _asyncio.CancelledError:
+            raise  # server shutdown — propagate cleanly without logging as ERROR
 
     # Extract Bearer token (no-op if missing — other middleware handles 401)
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        return await call_next(request)
+        try:
+            return await call_next(request)
+        except _asyncio.CancelledError:
+            raise
 
     token = auth_header.removeprefix("Bearer ").strip()
     try:
@@ -352,12 +407,17 @@ async def scan_required_gate(request: Request, call_next):
         return await call_next(request)
 
     # Single lightweight query — only fetch the two flag columns
-    from sqlalchemy import select, text as _text2
-    async with AsyncSessionLocal() as db:
-        row = (await db.execute(
-            _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
-            {"uid": str(uid)},
-        )).fetchone()
+    from sqlalchemy import text as _text2
+    try:
+        async with AsyncSessionLocal() as db:
+            row = (await db.execute(
+                _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
+                {"uid": str(uid)},
+            )).fetchone()
+    except _asyncio.CancelledError:
+        raise  # shutdown — propagate without noise
+    except Exception:
+        return await call_next(request)
 
     if row is None:
         return await call_next(request)
@@ -381,7 +441,10 @@ async def scan_required_gate(request: Request, call_next):
             },
         )
 
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    except _asyncio.CancelledError:
+        raise  # shutdown — propagate cleanly
 
 
 app.include_router(api_router)

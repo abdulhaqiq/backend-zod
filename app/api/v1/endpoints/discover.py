@@ -419,6 +419,7 @@ async def _fetch_discover_profiles(
     await _ensure_cache(db)
 
     is_pro = me.subscription_tier == "pro"
+    _bypass_distance = getattr(me, 'bypass_location_filter', False)
 
     # ── Opposite-gender filter (straight platform) ────────────────────────────
     # Man (223) sees Women (224), Woman (224) sees Men (223).
@@ -457,31 +458,31 @@ async def _fetch_discover_profiles(
         .limit(limit * 5)   # over-fetch so chip-away post-filters leave enough candidates
     )
 
-    # ── Exclude already-swiped profiles ───────────────────────────────────────
-    swiped_result = await db.execute(
-        text("SELECT swiped_id FROM swipes WHERE swiper_id = CAST(:uid AS uuid) AND mode = :mode")
-        .bindparams(uid=str(me.id), mode=mode)
-    )
-    swiped_ids = [row[0] for row in swiped_result.fetchall()]
-    if swiped_ids:
-        stmt = stmt.where(User.id.not_in(swiped_ids))
+    # ── Exclude already-swiped / already-matched profiles ────────────────────
+    # Skipped for bypass users (e.g. the owner/tester account) so profiles
+    # always reappear regardless of prior swipe history.
+    if not _bypass_distance:
+        swiped_result = await db.execute(
+            text("SELECT swiped_id FROM swipes WHERE swiper_id = CAST(:uid AS uuid) AND mode = :mode")
+            .bindparams(uid=str(me.id), mode=mode)
+        )
+        swiped_ids = [row[0] for row in swiped_result.fetchall()]
+        if swiped_ids:
+            stmt = stmt.where(User.id.not_in(swiped_ids))
 
-    # ── Exclude already-matched profiles ─────────────────────────────────────
-    # Matches are stored with stable ordering (smaller UUID first), so we need
-    # to check both columns.
-    matched_result = await db.execute(
-        text("""
-            SELECT CASE
-                WHEN user1_id = CAST(:uid AS uuid) THEN user2_id
-                ELSE user1_id
-            END AS other_id
-            FROM matches
-            WHERE user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid)
-        """).bindparams(uid=str(me.id))
-    )
-    matched_ids = [row[0] for row in matched_result.fetchall()]
-    if matched_ids:
-        stmt = stmt.where(User.id.not_in(matched_ids))
+        matched_result = await db.execute(
+            text("""
+                SELECT CASE
+                    WHEN user1_id = CAST(:uid AS uuid) THEN user2_id
+                    ELSE user1_id
+                END AS other_id
+                FROM matches
+                WHERE user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid)
+            """).bindparams(uid=str(me.id))
+        )
+        matched_ids = [row[0] for row in matched_result.fetchall()]
+        if matched_ids:
+            stmt = stmt.where(User.id.not_in(matched_ids))
 
     # ── Resolve origin: travel city (if active) or real GPS ──────────────────
     # This is the single source of truth for ALL distance filtering below.
@@ -491,7 +492,14 @@ async def _fetch_discover_profiles(
     # When we have an origin and a max_km cap is set, filter in SQL so we don't
     # fetch thousands of far-away rows only to drop them in Python.
     # null filter_max_distance_km means "any distance" — no SQL filter.
-    if _origin_lat is not None and _origin_lon is not None and me.filter_max_distance_km is not None:
+    # bypass_location_filter=True (admin override) skips ALL distance filtering
+    # so the user sees profiles from any location worldwide.
+    if (
+        not _bypass_distance
+        and _origin_lat is not None
+        and _origin_lon is not None
+        and me.filter_max_distance_km is not None
+    ):
         _max_km = float(me.filter_max_distance_km)
         stmt = stmt.where(
             text(
@@ -714,9 +722,9 @@ async def _fetch_discover_profiles(
         dist_km: float | None = None
         if has_my_location and u.latitude is not None and u.longitude is not None:
             dist_km = _haversine_km(me_lat, me_lon, u.latitude, u.longitude)
-            if max_km is not None and dist_km > max_km:
+            if not _bypass_distance and max_km is not None and dist_km > max_km:
                 continue
-        elif max_km is not None and has_my_location and (u.latitude is None or u.longitude is None):
+        elif not _bypass_distance and max_km is not None and has_my_location and (u.latitude is None or u.longitude is None):
             continue
 
         their_score = score_rows.get(u.id) or heuristic_score_obj(u)

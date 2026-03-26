@@ -1,13 +1,15 @@
 """
 Admin endpoints (internal use only — authenticated users with admin flag or dev builds).
 
-  GET  /admin/verifications        — all verification attempts across all users
-  GET  /admin/verifications/{id}   — single attempt detail
+  GET  /admin/verifications                      — all verification attempts across all users
+  GET  /admin/verifications/{id}                 — single attempt detail
+  POST /admin/users/bypass-location-filter       — toggle worldwide location bypass for a user
 """
 import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,3 +91,47 @@ async def get_verification_detail(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
     user: User | None = await db.get(User, attempt.user_id)
     return _attempt_dict(attempt, user)
+
+
+# ── Location filter bypass ─────────────────────────────────────────────────────
+
+class BypassLocationRequest(BaseModel):
+    phone: str
+    enabled: bool = True   # True = bypass ON (worldwide), False = restore normal
+
+
+@router.post(
+    "/users/bypass-location-filter",
+    summary="Enable or disable worldwide location bypass for a user (by phone)",
+)
+async def set_bypass_location_filter(
+    body: BypassLocationRequest,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    When enabled=True the target user's discover feed ignores all distance
+    filtering — they see profiles from any location worldwide regardless of
+    what filter_max_distance_km is set to.
+    """
+    result = await db.execute(select(User).where(User.phone == body.phone))
+    target: User | None = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No user found with phone {body.phone}",
+        )
+
+    target.bypass_location_filter = body.enabled
+    db.add(target)
+    await db.commit()
+
+    _log.info(
+        "Admin %s set bypass_location_filter=%s for user %s (phone %s)",
+        current_user.id, body.enabled, target.id, body.phone,
+    )
+    return {
+        "user_id": str(target.id),
+        "phone": target.phone,
+        "bypass_location_filter": target.bypass_location_filter,
+    }
