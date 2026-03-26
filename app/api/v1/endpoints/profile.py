@@ -199,10 +199,12 @@ async def update_me(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="gender_id must be 223 (Male) or 224 (Female).",
             )
-        # Photo minimum enforcement — must keep at least 2 photos at all times
+        # Photo minimum enforcement — only block *removals* that drop below 2.
+        # Allow adding photos freely (including going from 0→1 during re-setup).
         if field == "photos" and value is not None:
             filled = [u for u in value if u]
-            if current_user.is_onboarded and len(filled) < 2:
+            existing_count = len(current_user.photos or [])
+            if current_user.is_onboarded and len(filled) < 2 and len(filled) < existing_count:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="Your profile must have at least 2 photos.",

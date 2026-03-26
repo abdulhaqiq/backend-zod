@@ -43,14 +43,13 @@ async def _get_feature_limit(tier: str, feature_key: str, db: AsyncSession, fall
         select(SubscriptionPlan).where(
             SubscriptionPlan.is_active.is_(True),
             SubscriptionPlan.name.icontains(tier_keyword),
-            SubscriptionPlan.interval == "monthly",
-        ).limit(1)
+        ).order_by(SubscriptionPlan.sort_order.desc())
     )
-    plan = result.scalar_one_or_none()
-    if plan and plan.features:
-        for feat in plan.features:
-            if isinstance(feat, dict) and feat.get("key") == feature_key:
-                return int(feat.get("limit", fallback))
+    for plan in result.scalars().all():
+        if plan.features:
+            for feat in plan.features:
+                if isinstance(feat, dict) and feat.get("key") == feature_key:
+                    return int(feat.get("limit", fallback))
     return fallback
 
 # Lazy import to avoid circular — resolved at call time
@@ -484,6 +483,18 @@ async def _fetch_discover_profiles(
         if matched_ids:
             stmt = stmt.where(User.id.not_in(matched_ids))
 
+        # ── Exclude blocked users (both directions) ───────────────────────────
+        blocked_result = await db.execute(
+            text("""
+                SELECT blocked_id FROM user_blocks WHERE blocker_id = CAST(:uid AS uuid)
+                UNION
+                SELECT blocker_id FROM user_blocks WHERE blocked_id = CAST(:uid AS uuid)
+            """).bindparams(uid=str(me.id))
+        )
+        blocked_ids = [row[0] for row in blocked_result.fetchall()]
+        if blocked_ids:
+            stmt = stmt.where(User.id.not_in(blocked_ids))
+
     # ── Resolve origin: travel city (if active) or real GPS ──────────────────
     # This is the single source of truth for ALL distance filtering below.
     _origin_lat, _origin_lon = _resolve_origin_coords(me)
@@ -681,22 +692,15 @@ async def _fetch_discover_profiles(
     candidate_ids = [u.id for u in candidates]
 
     # ── Compatibility scores ──────────────────────────────────────────────────
+    _had_rollback = False
     try:
         my_score = await get_or_create_score(me, db)
     except Exception:
-        # Roll back the aborted transaction so the connection stays usable.
         await db.rollback()
-        # After rollback SQLAlchemy expires all ORM objects — refresh them all
-        # asynchronously before any attribute access below.
-        try:
-            await db.refresh(me)
-        except Exception:
-            pass
-        for u in candidates:
-            try:
-                await db.refresh(u)
-            except Exception:
-                pass
+        _had_rollback = True
+        # Rollback expires every attribute on `me`. Refresh so heuristic_score_obj
+        # (sync, accesses many User columns) can read them without MissingGreenlet.
+        await db.refresh(me)
         my_score = heuristic_score_obj(me)  # type: ignore[assignment]
     score_rows = {}
     if candidate_ids:
@@ -707,9 +711,26 @@ async def _fetch_discover_profiles(
             for sr in score_result.scalars().all():
                 score_rows[sr.user_id] = sr
         except Exception:
-            # Deadlock or other transient DB error — roll back the aborted
-            # transaction and proceed with heuristic scores for all candidates.
             await db.rollback()
+            _had_rollback = True
+
+    # ── Reload `me` and candidates after any rollback ────────────────────────
+    # db.rollback() expires ALL tracked ORM objects. If we then access any
+    # attribute (e.g. u.latitude, me.filter_max_distance_km) inside a plain
+    # sync loop, SQLAlchemy tries to lazy-load via asyncpg → MissingGreenlet.
+    # Fix: after any rollback, reload `me` once and all candidates in one batch
+    # query so every attribute is populated before the sync ranking loop below.
+    if _had_rollback and candidate_ids:
+        try:
+            fresh = await db.execute(select(User).where(User.id.in_(candidate_ids)))
+            candidates = list(fresh.scalars().all())
+        except Exception:
+            pass
+    if _had_rollback:
+        try:
+            await db.refresh(me)
+        except Exception:
+            pass
 
     # ── Collect valid candidates, compute smart ranking score ─────────────────
     # smart_score = 60% compatibility + 40% multi-dim soft preferences.

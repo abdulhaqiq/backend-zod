@@ -177,33 +177,72 @@ async def get_my_features(
     combined with live quota state (super_likes_remaining, reset date).
     """
     tier = current_user.subscription_tier  # "free" | "pro" | "premium_plus"
+    now  = datetime.now(timezone.utc)
 
-    # Look up the canonical monthly plan for this tier
+    # ── Free users: no plan lookup needed ────────────────────────────────────
+    if tier == "free":
+        return {
+            "tier":                      "free",
+            "super_likes_limit":         0,
+            "super_likes_remaining":     0,
+            "super_likes_reset_at":      None,
+            "super_likes_resets_in_days": None,
+            "profile_boosts_limit":      0,
+            "features":                  [],
+        }
+
+    # ── Paid tiers: hardcoded safety defaults ─────────────────────────────────
+    DEFAULTS = {
+        "pro":          {"sl_limit": 5,  "boost_limit": 1},
+        "premium_plus": {"sl_limit": 10, "boost_limit": 2},
+    }
+    defaults = DEFAULTS[tier]  # safe — we've already handled "free" above
+
+    # ── Look up the best structured plan for this tier ────────────────────────
     tier_keyword = "Premium+" if tier == "premium_plus" else "Pro"
     result = await db.execute(
         select(SubscriptionPlan).where(
             SubscriptionPlan.is_active.is_(True),
             SubscriptionPlan.name.icontains(tier_keyword),
-            SubscriptionPlan.interval == "monthly",
-        ).limit(1)
+        ).order_by(SubscriptionPlan.sort_order.desc())
     )
-    plan = result.scalar_one_or_none()
 
-    # Only keep structured dict features (discard legacy plain strings)
-    raw_features: list[Any] = list(plan.features) if plan and plan.features else []
-    features: list[dict] = [f for f in raw_features if isinstance(f, dict)]
+    # Walk sorted plans; pick the first one that has proper structured dict features
+    features: list[dict] = []
+    for p in result.scalars().all():
+        raw: list[Any] = list(p.features) if p.features else []
+        dicts = [f for f in raw if isinstance(f, dict) and "key" in f]
+        if dicts:
+            features = dicts
+            break
 
-    # Extract key limits from structured features
-    sl_limit    = next((int(f["limit"]) for f in features if f.get("key") == "super_likes"),    0)
-    boost_limit = next((int(f["limit"]) for f in features if f.get("key") == "profile_boosts"), 0)
+    # Extract limits — fall back to hardcoded defaults only if the feature is absent
+    sl_limit    = next((int(f["limit"]) for f in features if f.get("key") == "super_likes"),    defaults["sl_limit"])
+    boost_limit = next((int(f["limit"]) for f in features if f.get("key") == "profile_boosts"), defaults["boost_limit"])
 
-    # Compute days until super like reset
-    now      = datetime.now(timezone.utc)
+    # ── Auto-initialise super_likes_remaining on first Pro access ─────────────
+    # Triggers once when reset_at is NULL (never been set), seeding the weekly quota.
+    if current_user.super_likes_reset_at is None:
+        current_user.super_likes_remaining = sl_limit
+        current_user.super_likes_reset_at  = now
+        await db.commit()
+
+    # ── Weekly reset: refill if 7 days have elapsed since last reset ──────────
     reset_at = current_user.super_likes_reset_at
-    resets_in_days: int | None = None
     if reset_at is not None:
         reset_at_aware = reset_at if reset_at.tzinfo else reset_at.replace(tzinfo=timezone.utc)
-        next_reset     = reset_at_aware + timedelta(days=7)
+        if (now - reset_at_aware).total_seconds() >= 7 * 24 * 3600:
+            current_user.super_likes_remaining = sl_limit
+            current_user.super_likes_reset_at  = now
+            await db.commit()
+
+    # ── Days until next weekly reset ─────────────────────────────────────────
+    resets_in_days: int | None = None
+    if current_user.super_likes_reset_at is not None:
+        reset_aware = current_user.super_likes_reset_at
+        if reset_aware.tzinfo is None:
+            reset_aware = reset_aware.replace(tzinfo=timezone.utc)
+        next_reset     = reset_aware + timedelta(days=7)
         delta          = (next_reset - now).total_seconds()
         resets_in_days = max(0, int(delta / 86400))
 
@@ -254,8 +293,16 @@ async def verify_purchase(
     is_pro, expires_at = _extract_entitlement(rc_data)
 
     current_user.revenuecat_customer_id = body.revenuecat_customer_id
-    current_user.subscription_tier = "pro" if is_pro else "free"
+    new_tier = "pro" if is_pro else "free"
+    upgrading = (new_tier == "pro" and current_user.subscription_tier != "pro")
+    current_user.subscription_tier = new_tier
     current_user.subscription_expires_at = expires_at
+
+    # Seed super likes when a user first becomes Pro
+    if upgrading and current_user.super_likes_remaining == 0 and current_user.super_likes_reset_at is None:
+        current_user.super_likes_remaining = 5  # Pro default
+        current_user.super_likes_reset_at  = datetime.now(timezone.utc)
+
     await db.commit()
 
     return {
@@ -432,6 +479,10 @@ async def admin_grant(
     user.subscription_tier = body.tier
     if body.tier == "free":
         user.subscription_expires_at = None
+    elif old_tier != body.tier and user.super_likes_remaining == 0 and user.super_likes_reset_at is None:
+        # Seed super likes when manually granting Pro for the first time
+        user.super_likes_remaining = 5
+        user.super_likes_reset_at  = datetime.now(timezone.utc)
 
     await db.commit()
     logger.info(
