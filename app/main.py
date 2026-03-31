@@ -25,6 +25,10 @@ import app.models.user_report  # noqa: F401
 import app.models.message  # noqa: F401
 import app.models.message_reaction  # noqa: F401
 import app.models.tod_round  # noqa: F401
+import app.models.verification  # noqa: F401
+import app.models.lookup  # noqa: F401
+import app.models.card  # noqa: F401
+import app.models.mini_game  # noqa: F401
 
 
 @asynccontextmanager
@@ -256,7 +260,12 @@ app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://zod.ailoo.co",
+        "https://dev.zod.ailoo.co",
+        "http://localhost:8081",
+        "http://localhost:19006",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -273,6 +282,8 @@ _APP_KEY_PUBLIC = (
     # WebSocket connections use the WS constructor, not fetch — can't send custom headers
     "/api/v1/ws",
     "/ws",
+    # RevenueCat webhook — authenticated by its own Authorization header, not app key
+    "/api/v1/subscription/webhook",
 )
 
 

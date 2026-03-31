@@ -170,7 +170,7 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
         "name":       u.full_name,
         "age":        None if u.hide_age else age,
         "verified":   u.verification_status == "verified",
-        "premium":    u.subscription_tier == "pro",
+        "premium":    u.subscription_tier in ("pro", "premium_plus"),
         "location":   u.city,
         "distance":   None if u.hide_distance else dist_str,
         "university": u.university,
@@ -418,7 +418,7 @@ async def _fetch_discover_profiles(
 ) -> list[dict]:
     await _ensure_cache(db)
 
-    is_pro = me.subscription_tier == "pro"
+    is_pro = me.subscription_tier in ("pro", "premium_plus")
     _bypass_distance = getattr(me, 'bypass_location_filter', False)
 
     # ── Opposite-gender filter (straight platform) ────────────────────────────
@@ -1143,7 +1143,7 @@ async def get_liked_you(
         p["is_super_like"] = str(u.id) in super_set
         profiles.append(p)
 
-    is_pro = current_user.subscription_tier == "pro"
+    is_pro = current_user.subscription_tier in ("pro", "premium_plus")
     return {
         "profiles": profiles,
         "total": len(profiles),

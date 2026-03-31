@@ -61,19 +61,29 @@ async def _rc_get_customer(customer_id: str) -> dict:
     return r.json()
 
 
-def _extract_entitlement(rc_data: dict) -> tuple[bool, datetime | None]:
-    """Return (is_pro, expires_at) from RevenueCat subscriber payload."""
+def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
+    """Return (is_active, tier, expires_at) from RevenueCat subscriber payload.
+
+    Checks both 'premium' and 'pro' entitlements; premium takes precedence.
+    tier is one of: 'premium_plus' | 'pro' | 'free'
+    """
     subscriber = rc_data.get("subscriber", {})
     entitlements = subscriber.get("entitlements", {})
-    pro = entitlements.get("pro") or entitlements.get("Pro")
-    if not pro:
-        return False, None
-    expires_str = pro.get("expires_date")
-    if not expires_str:
-        return True, None  # lifetime
-    expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-    is_active = expires_at > datetime.now(timezone.utc)
-    return is_active, expires_at
+    now = datetime.now(timezone.utc)
+
+    for rc_key, tier in [("premium", "premium_plus"), ("Premium", "premium_plus"),
+                          ("pro", "pro"), ("Pro", "pro")]:
+        ent = entitlements.get(rc_key)
+        if not ent:
+            continue
+        expires_str = ent.get("expires_date")
+        if not expires_str:
+            return True, tier, None  # lifetime
+        expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+        if expires_at > now:
+            return True, tier, expires_at
+
+    return False, "free", None
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -93,7 +103,7 @@ class PlanResponse(BaseModel):
     name: str
     tier: str                # "pro" | "premium_plus"
     apple_product_id: str
-    interval: str            # "weekly" | "monthly" | "sixmonth" | "annual"
+    interval: str            # "weekly" | "monthly" | "threemonth" | "annual"
     price_display: str       # e.g. "$9.99/mo"
     price_usd: float
     badge: str | None        # e.g. "Best Value"
@@ -107,7 +117,7 @@ class PlanResponse(BaseModel):
 class PlanCreateRequest(BaseModel):
     name: str = Field(..., max_length=64)
     apple_product_id: str = Field(..., max_length=128)
-    interval: str = Field(..., pattern="^(weekly|monthly|sixmonth|annual)$")
+    interval: str = Field(..., pattern="^(weekly|monthly|threemonth|annual)$")
     price_display: str = Field(..., max_length=32)
     price_usd: float = Field(..., gt=0)
     badge: str | None = Field(None, max_length=32)
@@ -120,7 +130,7 @@ class PlanCreateRequest(BaseModel):
 class PlanUpdateRequest(BaseModel):
     name: str | None = Field(None, max_length=64)
     apple_product_id: str | None = Field(None, max_length=128)
-    interval: str | None = Field(None, pattern="^(weekly|monthly|sixmonth|annual)$")
+    interval: str | None = Field(None, pattern="^(weekly|monthly|threemonth|annual)$")
     price_display: str | None = Field(None, max_length=32)
     price_usd: float | None = Field(None, gt=0)
     badge: str | None = None
@@ -346,14 +356,14 @@ async def get_status(current_user: User = Depends(get_current_user)):
     # Normalise to timezone-aware so comparison never throws
     if expires is not None and expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
-    # Expire pro if past date
-    if current_user.subscription_tier == "pro" and expires and expires < now:
+    # Expire paid tier if past date
+    if current_user.subscription_tier in ("pro", "premium_plus") and expires and expires < now:
         tier = "free"
     else:
         tier = current_user.subscription_tier
     return {
         "tier": tier,
-        "is_pro": tier == "pro",
+        "is_pro": tier in ("pro", "premium_plus"),
         "expires_at": current_user.subscription_expires_at,
     }
 
@@ -372,24 +382,24 @@ async def verify_purchase(
         raise HTTPException(501, "RevenueCat not configured — set REVENUECAT_SECRET_KEY")
 
     rc_data = await _rc_get_customer(body.revenuecat_customer_id)
-    is_pro, expires_at = _extract_entitlement(rc_data)
+    is_active, new_tier, expires_at = _extract_entitlement(rc_data)
 
     current_user.revenuecat_customer_id = body.revenuecat_customer_id
-    new_tier = "pro" if is_pro else "free"
-    upgrading = (new_tier == "pro" and current_user.subscription_tier != "pro")
+    old_tier = current_user.subscription_tier
     current_user.subscription_tier = new_tier
     current_user.subscription_expires_at = expires_at
 
-    # Seed super likes when a user first becomes Pro
+    # Seed super likes when a user first becomes paid
+    upgrading = new_tier in ("pro", "premium_plus") and old_tier not in ("pro", "premium_plus")
     if upgrading and current_user.super_likes_remaining == 0 and current_user.super_likes_reset_at is None:
-        current_user.super_likes_remaining = 5  # Pro default
+        current_user.super_likes_remaining = 10 if new_tier == "premium_plus" else 5
         current_user.super_likes_reset_at  = datetime.now(timezone.utc)
 
     await db.commit()
 
     return {
         "tier": current_user.subscription_tier,
-        "is_pro": is_pro,
+        "is_pro": new_tier in ("pro", "premium_plus"),
         "expires_at": expires_at,
     }
 
@@ -437,8 +447,20 @@ async def revenuecat_webhook(
             datetime.fromtimestamp(int(expires_str) / 1000, tz=timezone.utc)
             if expires_str else None
         )
-        user.subscription_tier = "pro"
+        # Determine tier from the entitlement_ids in the event
+        entitlement_ids: list = event.get("entitlement_ids") or []
+        if any("premium" in e.lower() for e in entitlement_ids):
+            new_tier = "premium_plus"
+        else:
+            new_tier = "pro"
+        old_tier = user.subscription_tier
+        user.subscription_tier = new_tier
         user.subscription_expires_at = expires_at
+        # Seed super likes on first upgrade
+        upgrading = new_tier in ("pro", "premium_plus") and old_tier not in ("pro", "premium_plus")
+        if upgrading and user.super_likes_remaining == 0 and user.super_likes_reset_at is None:
+            user.super_likes_remaining = 10 if new_tier == "premium_plus" else 5
+            user.super_likes_reset_at  = datetime.now(timezone.utc)
     elif event_type in ("CANCELLATION", "EXPIRATION", "BILLING_ISSUE"):
         user.subscription_tier = "free"
 
