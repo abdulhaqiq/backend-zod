@@ -96,6 +96,15 @@ class User(Base):
     super_likes_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     super_likes_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Daily free likes (free tier — 20 per day, resets each UTC day) ─────────
+    daily_likes_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    daily_likes_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── AI Credits (shared wallet for all AI features) ────────────────────────
+    # Pro: 10/month, Premium+: 25/month, Free: 0. Also purchasable as consumable.
+    ai_credits_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ai_credits_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # ── Preferences ───────────────────────────────────────────────────────────
     dark_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     best_photo_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

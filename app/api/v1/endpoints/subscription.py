@@ -165,6 +165,13 @@ class MyFeaturesResponse(BaseModel):
     super_likes_resets_in_days: int | None
     profile_boosts_limit: int
     features: list[dict]   # full structured feature list from the canonical plan
+    # Free-tier daily like quota
+    daily_likes_limit: int
+    daily_likes_used: int
+    daily_likes_remaining: int
+    # AI Credits wallet
+    ai_credits_balance: int
+    ai_credits_monthly: int   # monthly grant for this tier (0 for free)
 
 
 @router.get("/my-features", response_model=MyFeaturesResponse, summary="Get the current user's plan limits and remaining quotas")
@@ -179,16 +186,32 @@ async def get_my_features(
     tier = current_user.subscription_tier  # "free" | "pro" | "premium_plus"
     now  = datetime.now(timezone.utc)
 
+    FREE_DAILY_LIKE_LIMIT = 20
+    AI_CREDITS_MONTHLY = {"free": 0, "pro": 10, "premium_plus": 25}
+
     # ── Free users: no plan lookup needed ────────────────────────────────────
     if tier == "free":
+        # Auto-reset daily likes counter if it's a new UTC day
+        daily_reset = current_user.daily_likes_reset_at
+        if daily_reset is None or daily_reset.date() < now.date():
+            current_user.daily_likes_used = 0
+            current_user.daily_likes_reset_at = now
+            await db.commit()
+        daily_used      = current_user.daily_likes_used
+        daily_remaining = max(0, FREE_DAILY_LIKE_LIMIT - daily_used)
         return {
-            "tier":                      "free",
-            "super_likes_limit":         0,
-            "super_likes_remaining":     0,
-            "super_likes_reset_at":      None,
+            "tier":                       "free",
+            "super_likes_limit":          0,
+            "super_likes_remaining":      0,
+            "super_likes_reset_at":       None,
             "super_likes_resets_in_days": None,
-            "profile_boosts_limit":      0,
-            "features":                  [],
+            "profile_boosts_limit":       0,
+            "features":                   [],
+            "daily_likes_limit":          FREE_DAILY_LIKE_LIMIT,
+            "daily_likes_used":           daily_used,
+            "daily_likes_remaining":      daily_remaining,
+            "ai_credits_balance":         current_user.ai_credits_balance,
+            "ai_credits_monthly":         0,
         }
 
     # ── Paid tiers: hardcoded safety defaults ─────────────────────────────────
@@ -197,6 +220,42 @@ async def get_my_features(
         "premium_plus": {"sl_limit": 10, "boost_limit": 2},
     }
     defaults = DEFAULTS[tier]  # safe — we've already handled "free" above
+
+    # Complete canonical feature list used when the DB plan has no structured features.
+    FALLBACK_FEATURES: dict[str, list[dict]] = {
+        "pro": [
+            {"key": "unlimited_likes",    "label": "Unlimited likes",    "icon": "heart",            "type": "bool",     "value": True},
+            {"key": "see_who_liked_you",  "label": "See who liked you",  "icon": "eye",              "type": "bool",     "value": True},
+            {"key": "rewind",             "label": "Rewind last swipe",  "icon": "refresh-circle",   "type": "bool",     "value": True},
+            {"key": "super_likes",        "label": "Super Likes",        "icon": "star",             "type": "quantity", "limit": 5,  "period": "weekly",  "display": "5/wk"},
+            {"key": "profile_boosts",     "label": "Profile Boosts",     "icon": "rocket",           "type": "quantity", "limit": 1,  "period": "monthly", "display": "1/mo"},
+            {"key": "advanced_filters",   "label": "Advanced filters",   "icon": "options",          "type": "bool",     "value": True},
+            {"key": "ai_smart_matching",  "label": "AI Smart Matching",  "icon": "sparkles",         "type": "bool",     "value": True},
+            {"key": "ai_credits",         "label": "AI Credits",         "icon": "flash",            "type": "quantity", "limit": 10, "period": "monthly", "display": "10/mo"},
+            {"key": "travel_mode",        "label": "Travel Mode",        "icon": "airplane",         "type": "bool",     "value": True},
+            {"key": "priority_visibility","label": "Priority visibility","icon": "trending-up",      "type": "bool",     "value": True},
+            {"key": "read_receipts",      "label": "Read receipts",      "icon": "chatbubble",       "type": "bool",     "value": False},
+            {"key": "no_ads",             "label": "No ads",             "icon": "ban",              "type": "bool",     "value": True},
+            {"key": "incognito",          "label": "Incognito browsing", "icon": "eye-off",          "type": "bool",     "value": False},
+            {"key": "vip_support",        "label": "VIP support",        "icon": "shield-checkmark", "type": "bool",     "value": False},
+        ],
+        "premium_plus": [
+            {"key": "unlimited_likes",    "label": "Unlimited likes",    "icon": "heart",            "type": "bool",     "value": True},
+            {"key": "see_who_liked_you",  "label": "See who liked you",  "icon": "eye",              "type": "bool",     "value": True},
+            {"key": "rewind",             "label": "Rewind last swipe",  "icon": "refresh-circle",   "type": "bool",     "value": True},
+            {"key": "super_likes",        "label": "Super Likes",        "icon": "star",             "type": "quantity", "limit": 10, "period": "weekly",  "display": "10/wk"},
+            {"key": "profile_boosts",     "label": "Profile Boosts",     "icon": "rocket",           "type": "quantity", "limit": 2,  "period": "monthly", "display": "2/mo"},
+            {"key": "advanced_filters",   "label": "Advanced filters",   "icon": "options",          "type": "bool",     "value": True},
+            {"key": "ai_smart_matching",  "label": "AI Smart Matching",  "icon": "sparkles",         "type": "label",    "display": "Priority"},
+            {"key": "ai_credits",         "label": "AI Credits",         "icon": "flash",            "type": "quantity", "limit": 25, "period": "monthly", "display": "25/mo"},
+            {"key": "travel_mode",        "label": "Travel Mode",        "icon": "airplane",         "type": "bool",     "value": True},
+            {"key": "priority_visibility","label": "Priority visibility","icon": "trending-up",      "type": "label",    "display": "2×"},
+            {"key": "read_receipts",      "label": "Read receipts",      "icon": "chatbubble",       "type": "bool",     "value": True},
+            {"key": "no_ads",             "label": "No ads",             "icon": "ban",              "type": "bool",     "value": True},
+            {"key": "incognito",          "label": "Incognito browsing", "icon": "eye-off",          "type": "bool",     "value": True},
+            {"key": "vip_support",        "label": "VIP support",        "icon": "shield-checkmark", "type": "bool",     "value": True},
+        ],
+    }
 
     # ── Look up the best structured plan for this tier ────────────────────────
     tier_keyword = "Premium+" if tier == "premium_plus" else "Pro"
@@ -215,6 +274,10 @@ async def get_my_features(
         if dicts:
             features = dicts
             break
+
+    # If DB has no structured features, use the canonical hardcoded list
+    if not features:
+        features = FALLBACK_FEATURES.get(tier, [])
 
     # Extract limits — fall back to hardcoded defaults only if the feature is absent
     sl_limit    = next((int(f["limit"]) for f in features if f.get("key") == "super_likes"),    defaults["sl_limit"])
@@ -246,14 +309,33 @@ async def get_my_features(
         delta          = (next_reset - now).total_seconds()
         resets_in_days = max(0, int(delta / 86400))
 
+    # ── Monthly AI credits auto-grant ─────────────────────────────────────────
+    monthly_grant = AI_CREDITS_MONTHLY.get(tier, 0)
+    ai_reset = current_user.ai_credits_reset_at
+    ai_reset_aware = ai_reset.replace(tzinfo=timezone.utc) if ai_reset and ai_reset.tzinfo is None else ai_reset
+    new_month = (
+        ai_reset_aware is None
+        or ai_reset_aware.year < now.year
+        or ai_reset_aware.month < now.month
+    )
+    if new_month and monthly_grant > 0:
+        current_user.ai_credits_balance += monthly_grant
+        current_user.ai_credits_reset_at = now
+        await db.commit()
+
     return {
-        "tier":                      tier,
-        "super_likes_limit":         sl_limit,
-        "super_likes_remaining":     current_user.super_likes_remaining,
-        "super_likes_reset_at":      current_user.super_likes_reset_at,
+        "tier":                       tier,
+        "super_likes_limit":          sl_limit,
+        "super_likes_remaining":      current_user.super_likes_remaining,
+        "super_likes_reset_at":       current_user.super_likes_reset_at,
         "super_likes_resets_in_days": resets_in_days,
-        "profile_boosts_limit":      boost_limit,
-        "features":                  features,
+        "profile_boosts_limit":       boost_limit,
+        "features":                   features,
+        "daily_likes_limit":          -1,   # -1 = unlimited for paid tiers
+        "daily_likes_used":           0,
+        "daily_likes_remaining":      -1,   # -1 = unlimited
+        "ai_credits_balance":         current_user.ai_credits_balance,
+        "ai_credits_monthly":         monthly_grant,
     }
 
 
@@ -447,6 +529,106 @@ async def update_plan(
     await db.refresh(plan)
     logger.info("Admin updated plan %s: %s", plan_id, list(update_data.keys()))
     return {"id": str(plan.id), "name": plan.name, "is_active": plan.is_active}
+
+
+# ─── AI Credits consumable purchase ──────────────────────────────────────────
+
+# Pack definitions — must match App Store product IDs
+_AI_CREDIT_PACKS: dict[str, int] = {
+    "com.zod.ai.credits.10": 10,
+    "com.zod.ai.credits.25": 25,
+    "com.zod.ai.credits.50": 50,
+}
+
+
+class AiCreditsTopupRequest(BaseModel):
+    pack_id: str                   # e.g. "com.zod.ai.credits.10"
+    revenuecat_customer_id: str    # RC customer ID to verify the transaction
+
+
+class AiCreditsTopupResponse(BaseModel):
+    credits_added: int
+    new_balance: int
+
+
+@router.post(
+    "/ai-credits/topup",
+    response_model=AiCreditsTopupResponse,
+    summary="Top up AI credits via consumable IAP (validated through RevenueCat)",
+)
+async def topup_ai_credits(
+    body: AiCreditsTopupRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """
+    Called after a successful consumable IAP purchase.
+    Verifies the transaction via RevenueCat, then credits the user's AI wallet.
+    """
+    credits_to_add = _AI_CREDIT_PACKS.get(body.pack_id)
+    if credits_to_add is None:
+        raise HTTPException(400, f"Unknown pack_id: {body.pack_id!r}. Valid packs: {list(_AI_CREDIT_PACKS)}")
+
+    # Verify with RevenueCat that this customer has a non-subscription purchase
+    # for this product. For consumables, RC records them under non_subscriptions.
+    if settings.REVENUECAT_SECRET_KEY:
+        try:
+            rc_data = await _rc_get_customer(body.revenuecat_customer_id)
+            subscriber = rc_data.get("subscriber", {})
+            non_subs: dict = subscriber.get("non_subscriptions", {})
+            if body.pack_id not in non_subs:
+                raise HTTPException(402, "RevenueCat: purchase not found for this product.")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("RC topup verification warning: %s", exc)
+
+    current_user.revenuecat_customer_id = body.revenuecat_customer_id
+    current_user.ai_credits_balance += credits_to_add
+    await db.commit()
+
+    logger.info(
+        "AI credits topup: user %s +%d credits (pack=%s) → balance=%d",
+        current_user.id, credits_to_add, body.pack_id, current_user.ai_credits_balance,
+    )
+    return {"credits_added": credits_to_add, "new_balance": current_user.ai_credits_balance}
+
+
+# ─── AI Credits spend (used by any AI feature) ───────────────────────────────
+
+class AiCreditsSpendRequest(BaseModel):
+    amount: int = Field(..., ge=1, le=100)
+    reason: str = Field(..., max_length=128)   # e.g. "ai_match_score", "ai_bio_rewrite"
+
+
+class AiCreditsSpendResponse(BaseModel):
+    spent: int
+    new_balance: int
+
+
+@router.post(
+    "/ai-credits/spend",
+    response_model=AiCreditsSpendResponse,
+    summary="Deduct AI credits for a feature action",
+)
+async def spend_ai_credits(
+    body: AiCreditsSpendRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Deduct `amount` credits from the user's AI wallet. Returns 402 if insufficient."""
+    if current_user.ai_credits_balance < body.amount:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient AI credits (have {current_user.ai_credits_balance}, need {body.amount}).",
+        )
+    current_user.ai_credits_balance -= body.amount
+    await db.commit()
+    logger.info(
+        "AI credits spent: user %s -%d (%s) → balance=%d",
+        current_user.id, body.amount, body.reason, current_user.ai_credits_balance,
+    )
+    return {"spent": body.amount, "new_balance": current_user.ai_credits_balance}
 
 
 # ─── Admin: manually grant / revoke Pro ───────────────────────────────────────

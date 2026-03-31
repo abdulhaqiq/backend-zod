@@ -77,6 +77,8 @@ async def lifespan(app: FastAPI):
             PRIMARY KEY (blocker_id, blocked_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON user_blocks (blocker_id)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_balance INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_reset_at TIMESTAMPTZ",
     ]
     for _sql in _MIGRATIONS:
         try:

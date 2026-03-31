@@ -193,6 +193,7 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
         "purpose": _rel_labels(u.purpose),
         "last_active_at": u.updated_at.isoformat() if u.updated_at else None,
         "has_voice": bool(u.voice_prompts),
+        "voice_prompts": list(u.voice_prompts or []),
         "mood": {"emoji": u.mood_emoji, "text": u.mood_text} if u.mood_text else None,
         "compatibility": compat,  # {percent, tier, breakdown} or None
         "halal": {
@@ -789,6 +790,28 @@ async def record_swipe(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="mode must be 'date' or 'work'")
 
+    FREE_DAILY_LIKE_LIMIT = 20
+
+    # ── Daily like gate: free-tier users are capped at 20 right-swipes per day ─
+    is_free = current_user.subscription_tier == "free"
+    if is_free and body.direction in ("right", "super"):
+        now_utc = datetime.now(timezone.utc)
+        dl_reset = current_user.daily_likes_reset_at
+        # Auto-reset when UTC day has rolled over (or never been set)
+        if dl_reset is None or dl_reset.date() < now_utc.date():
+            current_user.daily_likes_used = 0
+            current_user.daily_likes_reset_at = now_utc
+            db.add(current_user)
+        if current_user.daily_likes_used >= FREE_DAILY_LIKE_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You've used all {FREE_DAILY_LIKE_LIMIT} free likes for today. Upgrade to Pro for unlimited likes.",
+                headers={"X-Error-Code": "daily_limit_reached"},
+            )
+        # Increment optimistically (decremented back if swipe insertion fails)
+        current_user.daily_likes_used += 1
+        db.add(current_user)
+
     # ── Super-like gate: Pro subscribers only, 10 per calendar month ─────────
     if body.direction == "super":
         if current_user.subscription_tier not in ("pro", "premium_plus"):
@@ -972,11 +995,18 @@ async def record_swipe(
                         data={"type": "liked_you", "other_user_id": str(current_user.id)},
                     )
 
+    # Compute daily likes remaining for free users to return to client
+    daily_likes_remaining: int | None = None
+    if is_free and body.direction in ("right", "super"):
+        daily_likes_remaining = max(0, FREE_DAILY_LIKE_LIMIT - current_user.daily_likes_used)
+
     return {
         "recorded": True,
         "match": is_match,
         "super": is_super,
         "super_likes_remaining": current_user.super_likes_remaining if is_super else None,
+        "daily_likes_remaining": daily_likes_remaining,
+        "daily_likes_limit": FREE_DAILY_LIKE_LIMIT if is_free else None,
     }
 
 
