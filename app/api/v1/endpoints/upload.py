@@ -43,7 +43,7 @@ MAX_AUDIO_MB = 20
 MAX_AUDIO_SECONDS = 35  # a little over 30 to allow for encoding overhead
 
 
-FACE_MATCH_THRESHOLD = 80.0   # AWS Rekognition CompareFaces similarity threshold
+FACE_MATCH_THRESHOLD = 60.0   # AWS Rekognition CompareFaces similarity threshold (selfie vs profile photos)
 
 
 
@@ -1122,7 +1122,11 @@ async def upload_photo_endpoint(
         # ── Selfie anchor check (verified users) ─────────────────────────────
         # If the user has a verified selfie on file, every new profile photo
         # must match it. This prevents adding celebrity/fake photos post-verification.
-        PROFILE_MATCH_THRESHOLD = 60.0
+        # 60% is appropriate here because the selfie is a controlled, close-up shot.
+        SELFIE_ANCHOR_THRESHOLD = 60.0
+        # Cross-photo consistency (profile photo vs other profile photos) uses a
+        # lower bar because different photos naturally vary in angle/lighting/expression.
+        CROSS_PHOTO_THRESHOLD = 40.0
 
         if analysis.has_face and current_user.is_verified:
             try:
@@ -1140,7 +1144,7 @@ async def upload_photo_endpoint(
                         _match_against_photos, contents, [selfie_url]
                     )
                     _log.info("[SELFIE ANCHOR] new photo vs verified selfie → %.1f%% (cmp=%d)", selfie_pct, selfie_cmp)
-                    if selfie_cmp > 0 and selfie_pct < PROFILE_MATCH_THRESHOLD:
+                    if selfie_cmp > 0 and selfie_pct < SELFIE_ANCHOR_THRESHOLD:
                         raise HTTPException(
                             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="This photo doesn't match your verified identity. Please upload a photo of yourself.",
@@ -1156,9 +1160,9 @@ async def upload_photo_endpoint(
                 best_pct, compared = await asyncio.to_thread(
                     _match_against_photos, contents, existing_urls
                 )
-                print(f"[FACE MATCH] best={best_pct:.1f}% vs {compared} photos | threshold={PROFILE_MATCH_THRESHOLD}%", flush=True)
+                print(f"[FACE MATCH] best={best_pct:.1f}% vs {compared} photos | threshold={CROSS_PHOTO_THRESHOLD}%", flush=True)
 
-                if compared > 0 and best_pct < PROFILE_MATCH_THRESHOLD:
+                if compared > 0 and best_pct < CROSS_PHOTO_THRESHOLD:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                         detail="This photo doesn't appear to be the same person as your other photos. Please upload a photo of yourself.",
