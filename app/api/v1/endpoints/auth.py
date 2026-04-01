@@ -124,6 +124,15 @@ async def _issue_token_pair(
         ip_address=device.ip_address if device else None,
         last_used_at=now,
     ))
+
+    # Keep the user's device_id fresh so device-level blocks stay accurate.
+    # We only overwrite when a real device_id is present (never blank it out).
+    if device and device.device_id:
+        result = await db.execute(select(User).where(User.id == user_id))
+        user_row = result.scalar_one_or_none()
+        if user_row:
+            user_row.device_id = device.device_id
+
     await db.flush()
 
     return TokenResponse(

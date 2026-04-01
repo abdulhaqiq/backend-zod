@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -90,12 +91,28 @@ async def get_current_user_allow_inactive(
 
 async def get_pro_user(
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> User:
     """
     Dependency that requires a valid Bearer token AND an active paid subscription
     (Pro or Premium+). Raises HTTP 403 for free-tier users.
+
+    Also auto-expires stale paid tiers if subscription_expires_at has passed,
+    persisting the downgrade to DB so every subsequent request sees the correct tier.
     """
-    if current_user.subscription_tier not in ("pro", "premium_plus"):
+    tier = current_user.subscription_tier
+    expires = current_user.subscription_expires_at
+
+    if tier in ("pro", "premium_plus") and expires is not None:
+        now = datetime.now(timezone.utc)
+        exp_aware = expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)
+        if exp_aware < now:
+            current_user.subscription_tier = "free"
+            current_user.subscription_expires_at = None
+            await db.commit()
+            tier = "free"
+
+    if tier not in ("pro", "premium_plus"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This feature requires a Pro or Premium+ subscription. Upgrade to unlock it.",

@@ -122,6 +122,12 @@ class User(Base):
     work_who_to_show_id: Mapped[int | None] = mapped_column(Integer, nullable=True)          # FK → lookup_options (category=work_who_to_show)
     work_priority_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
+    # ── Device fingerprint ───────────────────────────────────────────────────
+    # Updated on every successful login. Used to enforce device-level blocks:
+    # if a blocked user creates a new account from the same device they are
+    # still excluded from the blocker's feed.
+    device_id: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+
     # ── Push notifications ────────────────────────────────────────────────────
     push_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
 

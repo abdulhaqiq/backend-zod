@@ -496,6 +496,26 @@ async def _fetch_discover_profiles(
         if blocked_ids:
             stmt = stmt.where(User.id.not_in(blocked_ids))
 
+        # ── Exclude by device_id (survives account deletion + re-creation) ───
+        # If a blocked user deletes their account and signs up again on the same
+        # physical device, their new account inherits the same device_id and is
+        # still hidden from this user's feed.
+        blocked_devices_result = await db.execute(
+            text("""
+                SELECT blocked_device_id
+                FROM user_blocks
+                WHERE blocker_id = CAST(:uid AS uuid)
+                  AND blocked_device_id IS NOT NULL
+            """).bindparams(uid=str(me.id))
+        )
+        blocked_device_ids = [row[0] for row in blocked_devices_result.fetchall()]
+        if blocked_device_ids and me.device_id not in blocked_device_ids:
+            # Exclude anyone whose current device_id was ever blocked by this user
+            stmt = stmt.where(
+                (User.device_id.is_(None)) |
+                (User.device_id.not_in(blocked_device_ids))
+            )
+
     # ── Resolve origin: travel city (if active) or real GPS ──────────────────
     # This is the single source of truth for ALL distance filtering below.
     _origin_lat, _origin_lon = _resolve_origin_coords(me)

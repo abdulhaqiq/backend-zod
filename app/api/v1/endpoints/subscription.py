@@ -61,6 +61,32 @@ async def _rc_get_customer(customer_id: str) -> dict:
     return r.json()
 
 
+async def _expire_if_needed(user: User, db: AsyncSession) -> str:
+    """
+    Check if a paid subscription has lapsed; if so, downgrade to 'free' in DB.
+    Returns the current (possibly updated) tier string.
+    Called by status, get_pro_user, and verify so expiry is always enforced.
+    """
+    tier = user.subscription_tier
+    if tier not in ("pro", "premium_plus"):
+        return tier
+    expires = user.subscription_expires_at
+    if expires is None:
+        return tier  # lifetime / no-expiry grant
+    now = datetime.now(timezone.utc)
+    expires_aware = expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)
+    if expires_aware < now:
+        logger.info(
+            "Auto-expiring subscription for user %s (tier=%s, expired=%s)",
+            user.id, tier, expires_aware,
+        )
+        user.subscription_tier = "free"
+        user.subscription_expires_at = None
+        await db.commit()
+        return "free"
+    return tier
+
+
 def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
     """Return (is_active, tier, expires_at) from RevenueCat subscriber payload.
 
@@ -142,7 +168,7 @@ class PlanUpdateRequest(BaseModel):
 
 class GrantRequest(BaseModel):
     user_id: str
-    tier: str = Field("pro", pattern="^(free|pro)$")
+    tier: str = Field("pro", pattern="^(free|pro|premium_plus)$")
     note: str | None = None  # internal reason (e.g. "comp account", "support ticket")
 
 
@@ -350,17 +376,12 @@ async def get_my_features(
 
 
 @router.get("/status", response_model=StatusResponse, summary="Get current subscription status")
-async def get_status(current_user: User = Depends(get_current_user)):
-    now = datetime.now(timezone.utc)
-    expires = current_user.subscription_expires_at
-    # Normalise to timezone-aware so comparison never throws
-    if expires is not None and expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    # Expire paid tier if past date
-    if current_user.subscription_tier in ("pro", "premium_plus") and expires and expires < now:
-        tier = "free"
-    else:
-        tier = current_user.subscription_tier
+async def get_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Persist expiry to DB so all other endpoints see the correct tier
+    tier = await _expire_if_needed(current_user, db)
     return {
         "tier": tier,
         "is_pro": tier in ("pro", "premium_plus"),
@@ -461,8 +482,39 @@ async def revenuecat_webhook(
         if upgrading and user.super_likes_remaining == 0 and user.super_likes_reset_at is None:
             user.super_likes_remaining = 10 if new_tier == "premium_plus" else 5
             user.super_likes_reset_at  = datetime.now(timezone.utc)
-    elif event_type in ("CANCELLATION", "EXPIRATION", "BILLING_ISSUE"):
+
+    elif event_type == "EXPIRATION":
+        # Subscription period actually ended — downgrade now.
         user.subscription_tier = "free"
+        user.subscription_expires_at = None
+
+    elif event_type == "CANCELLATION":
+        # User turned off auto-renew but subscription is still active until the period ends.
+        # Do NOT downgrade here — the EXPIRATION webhook will fire when it actually lapses.
+        # Update the expiry date if provided so the auto-expire logic has the right value.
+        expires_str = event.get("expiration_at_ms")
+        if expires_str:
+            user.subscription_expires_at = datetime.fromtimestamp(
+                int(expires_str) / 1000, tz=timezone.utc
+            )
+        logger.info(
+            "User %s cancelled auto-renew — remains active until %s",
+            user.id, user.subscription_expires_at,
+        )
+
+    elif event_type == "BILLING_ISSUE":
+        # Payment failed — Apple gives a grace period before expiring.
+        # Keep the current tier active; update expiry to the grace-period end date if provided.
+        # EXPIRATION will fire once the grace period lapses.
+        expires_str = event.get("grace_period_expiration_at_ms") or event.get("expiration_at_ms")
+        if expires_str:
+            user.subscription_expires_at = datetime.fromtimestamp(
+                int(expires_str) / 1000, tz=timezone.utc
+            )
+        logger.info(
+            "User %s billing issue — grace period until %s",
+            user.id, user.subscription_expires_at,
+        )
 
     await db.commit()
     logger.info("User %s subscription → %s", user.id, user.subscription_tier)
@@ -683,9 +735,11 @@ async def admin_grant(
     user.subscription_tier = body.tier
     if body.tier == "free":
         user.subscription_expires_at = None
+        user.super_likes_remaining = 0
+        user.super_likes_reset_at  = None
     elif old_tier != body.tier and user.super_likes_remaining == 0 and user.super_likes_reset_at is None:
-        # Seed super likes when manually granting Pro for the first time
-        user.super_likes_remaining = 5
+        # Seed super likes when manually granting Pro / Premium+ for the first time
+        user.super_likes_remaining = 10 if body.tier == "premium_plus" else 5
         user.super_likes_reset_at  = datetime.now(timezone.utc)
 
     await db.commit()

@@ -8,7 +8,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
@@ -29,6 +29,7 @@ VALID_REPORT_REASONS = {
     "hate_speech",
     "scam",
     "other",
+    "blocked_by_user",   # auto-generated when a user blocks someone
 }
 
 
@@ -77,16 +78,44 @@ async def block_user(
     if body.blocked_id == str(current_user.id):
         raise HTTPException(status_code=400, detail="You cannot block yourself.")
 
+    # Fetch the blocked user so we can capture their current device_id.
+    # This means even if they delete their account and create a new one from
+    # the same physical device, they are still excluded from the blocker's feed.
+    blocked_result = await db.execute(
+        select(User).where(User.id == body.blocked_id)
+    )
+    blocked_user = blocked_result.scalar_one_or_none()
+    blocked_device_id = blocked_user.device_id if blocked_user else None
+
     await db.execute(
         text("""
-            INSERT INTO user_blocks (blocker_id, blocked_id)
-            VALUES (CAST(:blocker AS uuid), CAST(:blocked AS uuid))
-            ON CONFLICT DO NOTHING
+            INSERT INTO user_blocks (blocker_id, blocked_id, blocked_device_id)
+            VALUES (CAST(:blocker AS uuid), CAST(:blocked AS uuid), :device_id)
+            ON CONFLICT (blocker_id, blocked_id) DO UPDATE
+                SET blocked_device_id = EXCLUDED.blocked_device_id
         """),
-        {"blocker": str(current_user.id), "blocked": body.blocked_id},
+        {
+            "blocker":    str(current_user.id),
+            "blocked":    body.blocked_id,
+            "device_id":  blocked_device_id,
+        },
     )
+
+    # Also create a moderation report so admins can see who is being blocked
+    # and act within 24 hours per App Store guideline 1.2.
+    report = UserReport(
+        reporter_id=current_user.id,
+        reported_id=body.blocked_id,
+        reason="blocked_by_user",
+        custom_reason="User was blocked — automatically flagged for moderation review.",
+    )
+    db.add(report)
+
     await db.commit()
-    _log.info("Block recorded: blocker=%s blocked=%s", current_user.id, body.blocked_id)
+    _log.info(
+        "Block recorded: blocker=%s blocked=%s device=%s",
+        current_user.id, body.blocked_id, blocked_device_id or "unknown",
+    )
     return {"detail": "User blocked."}
 
 
