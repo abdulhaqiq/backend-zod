@@ -33,9 +33,18 @@ import app.models.mini_game  # noqa: F401
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create all tables on startup (no-op for existing tables)
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+    # Create all tables on startup (no-op for existing tables).
+    # Wrapped in try/except so a transient DB timeout doesn't prevent startup
+    # when tables already exist (e.g. connecting to a remote production DB).
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+    except Exception as _create_exc:
+        import logging as _clog
+        _clog.getLogger(__name__).warning(
+            "create_all skipped (non-critical — tables likely already exist): %s",
+            _create_exc.__class__.__name__,
+        )
 
     # Incremental column migrations — each runs in its own short transaction so the
     # AccessExclusiveLock is released immediately and can't deadlock with live queries.
