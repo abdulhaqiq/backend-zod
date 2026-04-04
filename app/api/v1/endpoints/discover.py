@@ -204,18 +204,24 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
             "blurPhotos":       u.blur_photos_halal,
             "halalMode":        u.halal_mode_enabled,
         },
-        # Work profile fields (populated for work mode)
+        # Work profile fields
+        "work_headline":  u.work_headline,
+        "work_persona":   u.work_persona,
+        "work_experience": list(u.work_experience or []),
+        "education":      list(u.education or []),
         "work": {
-            "matchingGoals":   [x["label"] for x in _labels(u.work_matching_goals)],
-            "commitmentLevel": _label(u.work_commitment_level_id),
-            "equitySplit":     _label(u.work_equity_split_id),
-            "industries":      [x["label"] for x in _labels(u.work_industries)],
-            "skills":          [x["label"] for x in _labels(u.work_skills)],
-            "areYouHiring":    u.work_are_you_hiring,
-            "schedulingUrl":   u.work_scheduling_url,
-            "prompts":         list(u.work_prompts or []),
-            "photos":          list(u.work_photos or []),
-        } if (u.work_matching_goals or u.work_commitment_level_id) else None,
+            "matchingGoals":    [x["label"] for x in _labels(u.work_matching_goals)],
+            "commitmentLevel":  _label(u.work_commitment_level_id),
+            "equitySplit":      _label(u.work_equity_split_id),
+            "industries":       [x["label"] for x in _labels(u.work_industries)],
+            "skills":           [x["label"] for x in _labels(u.work_skills)],
+            "areYouHiring":     u.work_are_you_hiring,
+            "schedulingUrl":    u.work_scheduling_url,
+            "linkedInUrl":      u.linkedin_url,
+            "linkedInVerified": u.linkedin_verified,
+            "prompts":          list(u.work_prompts or []),
+            "photos":           list(u.work_photos or []),
+        } if (u.work_mode_enabled or u.work_matching_goals or u.work_commitment_level_id or u.linkedin_url) else None,
     }
 
 
@@ -447,7 +453,8 @@ async def _fetch_discover_profiles(
         base_filters.append(
             (User.halal_mode_enabled.is_(False)) | (User.halal_mode_enabled.is_(None))
         )
-    if opposite_gender_id is not None:
+    # Work mode is gender-neutral (co-founder / networking matching).
+    if opposite_gender_id is not None and mode != "work":
         base_filters.append(User.gender_id == opposite_gender_id)
 
     stmt = (
@@ -545,11 +552,9 @@ async def _fetch_discover_profiles(
             ).bindparams(lat=_origin_lat, lon=_origin_lon, max_km=_max_km)
         )
 
-    # Work mode: only show users who have a work profile set up
+    # Work mode: only show users who have explicitly enabled work mode
     if mode == "work":
-        stmt = stmt.where(
-            User.work_matching_goals.isnot(None) | User.work_commitment_level_id.isnot(None)
-        )
+        stmt = stmt.where(User.work_mode_enabled.is_(True))
 
     # ── Verified-only filter (face-verified profiles only) ───────────────────
     # is_verified=True is given to ALL phone-signed-in users so it can't be
@@ -810,11 +815,12 @@ async def record_swipe(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="mode must be 'date' or 'work'")
 
-    FREE_DAILY_LIKE_LIMIT = 20
+    FREE_DAILY_LIKE_LIMIT    = 20
+    DAILY_WORK_CONNECT_LIMIT = 20
 
     # ── Daily like gate: free-tier users are capped at 20 right-swipes per day ─
     is_free = current_user.subscription_tier == "free"
-    if is_free and body.direction in ("right", "super"):
+    if is_free and body.direction in ("right", "super") and body.mode != "work":
         now_utc = datetime.now(timezone.utc)
         dl_reset = current_user.daily_likes_reset_at
         # Auto-reset when UTC day has rolled over (or never been set)
@@ -830,6 +836,23 @@ async def record_swipe(
             )
         # Increment optimistically (decremented back if swipe insertion fails)
         current_user.daily_likes_used += 1
+        db.add(current_user)
+
+    # ── Daily work connect gate: all users capped at 20 connects per day ────────
+    if body.mode == "work" and body.direction in ("right", "super"):
+        now_utc  = datetime.now(timezone.utc)
+        wc_reset = current_user.daily_work_connects_reset_at
+        if wc_reset is None or wc_reset.date() < now_utc.date():
+            current_user.daily_work_connects_used     = 0
+            current_user.daily_work_connects_reset_at = now_utc
+            db.add(current_user)
+        if current_user.daily_work_connects_used >= DAILY_WORK_CONNECT_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You've used all {DAILY_WORK_CONNECT_LIMIT} work connects for today. Resets at midnight UTC.",
+                headers={"X-Error-Code": "work_connect_limit_reached"},
+            )
+        current_user.daily_work_connects_used += 1
         db.add(current_user)
 
     # ── Super-like gate: Pro subscribers only, 10 per calendar month ─────────
@@ -1017,16 +1040,23 @@ async def record_swipe(
 
     # Compute daily likes remaining for free users to return to client
     daily_likes_remaining: int | None = None
-    if is_free and body.direction in ("right", "super"):
+    if is_free and body.direction in ("right", "super") and body.mode != "work":
         daily_likes_remaining = max(0, FREE_DAILY_LIKE_LIMIT - current_user.daily_likes_used)
+
+    # Always return work connect counts when in work mode
+    work_connects_used      = current_user.daily_work_connects_used if body.mode == "work" else None
+    work_connects_remaining = max(0, DAILY_WORK_CONNECT_LIMIT - current_user.daily_work_connects_used) if body.mode == "work" else None
 
     return {
         "recorded": True,
         "match": is_match,
         "super": is_super,
-        "super_likes_remaining": current_user.super_likes_remaining if is_super else None,
-        "daily_likes_remaining": daily_likes_remaining,
-        "daily_likes_limit": FREE_DAILY_LIKE_LIMIT if is_free else None,
+        "super_likes_remaining":  current_user.super_likes_remaining if is_super else None,
+        "daily_likes_remaining":  daily_likes_remaining,
+        "daily_likes_limit":      FREE_DAILY_LIKE_LIMIT if is_free else None,
+        "work_connects_used":     work_connects_used,
+        "work_connects_remaining": work_connects_remaining,
+        "work_connects_limit":    DAILY_WORK_CONNECT_LIMIT if body.mode == "work" else None,
     }
 
 
@@ -1168,6 +1198,34 @@ async def get_liked_you(
         "profiles": profiles,
         "total": len(profiles),
         "is_pro": is_pro,
+    }
+
+
+@router.get("/work/daily-status", summary="Return today's work connect usage for the current user")
+async def get_work_daily_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Returns how many work connects the user has used today and the daily limit."""
+    DAILY_WORK_CONNECT_LIMIT = 20
+    now_utc  = datetime.now(timezone.utc)
+    wc_reset = current_user.daily_work_connects_reset_at
+
+    # Auto-reset if a new UTC day has begun
+    if wc_reset is None or wc_reset.date() < now_utc.date():
+        current_user.daily_work_connects_used     = 0
+        current_user.daily_work_connects_reset_at = now_utc
+        db.add(current_user)
+        await db.commit()
+
+    used      = current_user.daily_work_connects_used
+    remaining = max(0, DAILY_WORK_CONNECT_LIMIT - used)
+    return {
+        "connects_used":      used,
+        "connects_remaining": remaining,
+        "connects_limit":     DAILY_WORK_CONNECT_LIMIT,
+        "resets_at":          (now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                               + __import__('datetime').timedelta(days=1)).isoformat(),
     }
 
 

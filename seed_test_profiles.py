@@ -783,6 +783,7 @@ def make_work_profile(idx: int):
         "work_skills":        json.dumps([{"id": i} for i in skills]),
         "work_are_you_hiring": random.random() < 0.35,
         "work_experience":    json.dumps(work_experience),
+        "work_mode_enabled":  True,
         "filter_max_distance_km": random.choice([50, 80, None]),
         "filter_age_min":     None,
         "filter_age_max":     None,
@@ -921,6 +922,7 @@ def make_riyadh_work_profile(idx: int):
         "work_skills":        json.dumps([{"id": i} for i in skills]),
         "work_are_you_hiring": random.random() < 0.40,
         "work_experience":    json.dumps(work_experience),
+        "work_mode_enabled":  True,
         "filter_max_distance_km": None,
         "filter_age_min":     None,
         "filter_age_max":     None,
@@ -1032,6 +1034,7 @@ async def seed():
         work_photos, work_prompts, work_matching_goals,
         work_commitment_level_id, work_equity_split_id,
         work_industries, work_skills, work_are_you_hiring, work_experience,
+        work_mode_enabled,
         filter_max_distance_km, filter_age_min, filter_age_max, filter_verified_only
     ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,
@@ -1041,7 +1044,8 @@ async def seed():
         $31::jsonb,$32::jsonb,$33::jsonb,
         $34,$35,
         $36::jsonb,$37::jsonb,$38,$39::jsonb,
-        $40,$41,$42,$43
+        $40,
+        $41,$42,$43,$44
     )
     ON CONFLICT DO NOTHING
     """
@@ -1068,6 +1072,7 @@ async def seed():
                 p.get("work_skills") or "null",
                 p.get("work_are_you_hiring"),
                 p.get("work_experience") or "null",
+                p.get("work_mode_enabled", False),
                 p.get("filter_max_distance_km"),
                 p.get("filter_age_min"),
                 p.get("filter_age_max"),

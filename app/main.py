@@ -1,10 +1,15 @@
 from contextlib import asynccontextmanager
+import logging
 import uuid as _uuid
 
+from asyncpg.exceptions import ConnectionDoesNotExistError, TooManyConnectionsError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from jose import JWTError
+from sqlalchemy.exc import DBAPIError
+
+_main_log = logging.getLogger(__name__)
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -68,6 +73,7 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_verified BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS blur_photos_halal BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS halal_mode_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_mode_enabled BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_sect JSONB",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_prayer_frequency JSONB",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_marriage_timeline JSONB",
@@ -92,6 +98,106 @@ async def lifespan(app: FastAPI):
         "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON user_blocks (blocker_id)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_balance INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_reset_at TIMESTAMPTZ",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_import_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_import_reset_at TIMESTAMPTZ",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_headline VARCHAR(256)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_persona VARCHAR(32)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_num_founders_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_primary_role_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_years_experience_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS work_job_search_status_id INTEGER",
+        # ── Seed new work lookup categories (idempotent) ──────────────────────
+        """
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM lookup_options WHERE category = 'work_role') THEN
+            INSERT INTO lookup_options (category, subcategory, emoji, label, sort_order, is_active) VALUES
+              ('work_role','Leadership','🚀','Founder / Co-Founder',0,true),
+              ('work_role','Leadership','👑','CEO',1,true),
+              ('work_role','Leadership','🔧','CTO',2,true),
+              ('work_role','Leadership','⚙️','COO',3,true),
+              ('work_role','Leadership','💰','CFO',4,true),
+              ('work_role','Leadership','🎯','CPO – Chief Product Officer',5,true),
+              ('work_role','Leadership','📣','CMO – Chief Marketing Officer',6,true),
+              ('work_role','Leadership','📈','CRO – Chief Revenue Officer',7,true),
+              ('work_role','Engineering','💻','Software Engineer – Frontend',10,true),
+              ('work_role','Engineering','🖥️','Software Engineer – Backend',11,true),
+              ('work_role','Engineering','🔄','Software Engineer – Full Stack',12,true),
+              ('work_role','Engineering','📱','Mobile Engineer',13,true),
+              ('work_role','Engineering','🔧','Hardware Engineer',14,true),
+              ('work_role','Engineering','🌐','Network Engineer',15,true),
+              ('work_role','Engineering','☁️','DevOps / Infrastructure',16,true),
+              ('work_role','Engineering','🤖','AI / ML Engineer',17,true),
+              ('work_role','Engineering','🔒','Security Engineer',18,true),
+              ('work_role','Engineering','📊','Data Engineer',19,true),
+              ('work_role','Product','🎯','Product Manager',20,true),
+              ('work_role','Product','🎨','Product Designer',21,true),
+              ('work_role','Product','📊','Product Analyst',22,true),
+              ('work_role','Design','🎨','UX Designer',30,true),
+              ('work_role','Design','✏️','UI Designer',31,true),
+              ('work_role','Design','🖼️','Brand / Visual Designer',32,true),
+              ('work_role','Sales','📞','SDR / BDR',40,true),
+              ('work_role','Sales','💼','Account Executive',41,true),
+              ('work_role','Sales','🏆','Sales Manager',42,true),
+              ('work_role','Sales','👔','VP Sales / Head of Sales',43,true),
+              ('work_role','Marketing','📈','Growth Marketing',50,true),
+              ('work_role','Marketing','✍️','Content Marketing',51,true),
+              ('work_role','Marketing','📣','Brand Marketing',52,true),
+              ('work_role','Marketing','📊','Performance Marketing',53,true),
+              ('work_role','Marketing','🌐','SEO Specialist',54,true),
+              ('work_role','Marketing','👥','Community Manager',55,true),
+              ('work_role','Customer','🤝','Customer Success Manager',60,true),
+              ('work_role','Customer','📞','Customer Support Lead',61,true),
+              ('work_role','Customer','🔑','Account Manager',62,true),
+              ('work_role','Operations','⚙️','Operations Manager',70,true),
+              ('work_role','Operations','📋','Chief of Staff',71,true),
+              ('work_role','Operations','🗂️','Project Manager',72,true),
+              ('work_role','Finance','💹','Finance Manager',80,true),
+              ('work_role','Finance','📊','Financial Analyst',81,true),
+              ('work_role','Finance','🧾','Accounting',82,true),
+              ('work_role','Data','📊','Data Analyst',90,true),
+              ('work_role','Data','🔬','Data Scientist',91,true),
+              ('work_role','Data','📈','BI Analyst',92,true),
+              ('work_role','People & HR','👥','HR Manager',100,true),
+              ('work_role','People & HR','🔍','Recruiter',101,true),
+              ('work_role','People & HR','💚','People Ops Manager',102,true),
+              ('work_role','Business Dev','🤝','Business Development Manager',110,true),
+              ('work_role','Business Dev','🤲','Partnerships Manager',111,true);
+          END IF;
+        END $$
+        """,
+        """
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM lookup_options WHERE category = 'work_num_founders') THEN
+            INSERT INTO lookup_options (category, emoji, label, sort_order, is_active) VALUES
+              ('work_num_founders','1️⃣','Solo Founder',0,true),
+              ('work_num_founders','2️⃣','2 Founders',1,true),
+              ('work_num_founders','3️⃣','3 Founders',2,true),
+              ('work_num_founders','4️⃣','4+ Founders',3,true);
+          END IF;
+        END $$
+        """,
+        """
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM lookup_options WHERE category = 'work_years_experience') THEN
+            INSERT INTO lookup_options (category, emoji, label, sort_order, is_active) VALUES
+              ('work_years_experience','🌱','Less than 1 year',0,true),
+              ('work_years_experience','📅','1–2 years',1,true),
+              ('work_years_experience','📆','3–5 years',2,true),
+              ('work_years_experience','🔥','6–10 years',3,true),
+              ('work_years_experience','⭐','10+ years',4,true);
+          END IF;
+        END $$
+        """,
+        """
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM lookup_options WHERE category = 'work_job_search_status') THEN
+            INSERT INTO lookup_options (category, emoji, label, sort_order, is_active) VALUES
+              ('work_job_search_status','🔍','Actively looking',0,true),
+              ('work_job_search_status','🌟','Open to opportunities',1,true),
+              ('work_job_search_status','✋','Not looking right now',2,true);
+          END IF;
+        END $$
+        """,
     ]
     for _sql in _MIGRATIONS:
         try:
@@ -248,11 +354,17 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
+import logging as _logging
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse as _JSONResponse
+
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.core.limiter import limiter
+
+_main_log = _logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -266,6 +378,32 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# Log Pydantic request validation errors so we can debug 422s
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    _main_log.warning(
+        "422 RequestValidationError on %s %s — errors: %s",
+        request.method, request.url.path, exc.errors(),
+    )
+    return _JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+# Return a clean 503 for any DB connection errors that slip past the retry in
+# get_db() rather than letting them surface as raw 500 tracebacks.
+@app.exception_handler(DBAPIError)
+async def db_connection_error_handler(request: Request, exc: DBAPIError):
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, (ConnectionDoesNotExistError, TooManyConnectionsError)):
+        _main_log.warning(
+            "503 DB connection error on %s %s: %s",
+            request.method, request.url.path, type(orig).__name__,
+        )
+        return _JSONResponse(
+            status_code=503,
+            content={"detail": "Database temporarily unavailable. Please retry."},
+        )
+    raise exc
 
 app.add_middleware(
     CORSMiddleware,

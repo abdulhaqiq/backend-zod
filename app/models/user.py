@@ -44,6 +44,10 @@ class User(Base):
     linkedin_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     linkedin_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # LinkedIn import usage tracking (per-month quota enforcement)
+    linkedin_import_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    linkedin_import_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Password only for email/password accounts
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
@@ -100,6 +104,10 @@ class User(Base):
     daily_likes_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     daily_likes_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Daily work connects (all tiers — 20 per day, resets each UTC day) ───────
+    daily_work_connects_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    daily_work_connects_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # ── AI Credits (shared wallet for all AI features) ────────────────────────
     # Pro: 10/month, Premium+: 25/month, Free: 0. Also purchasable as consumable.
     ai_credits_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -121,6 +129,12 @@ class User(Base):
     work_scheduling_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     work_who_to_show_id: Mapped[int | None] = mapped_column(Integer, nullable=True)          # FK → lookup_options (category=work_who_to_show)
     work_priority_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    work_headline: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    work_persona: Mapped[str | None] = mapped_column(String(32), nullable=True)              # founder | job_seeker | both
+    work_num_founders_id: Mapped[int | None] = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=work_num_founders)
+    work_primary_role_id: Mapped[int | None] = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=work_role)
+    work_years_experience_id: Mapped[int | None] = mapped_column(Integer, nullable=True)     # FK → lookup_options (category=work_years_experience)
+    work_job_search_status_id: Mapped[int | None] = mapped_column(Integer, nullable=True)    # FK → lookup_options (category=work_job_search_status)
 
     # ── Device fingerprint ───────────────────────────────────────────────────
     # Updated on every successful login. Used to enforce device-level blocks:
@@ -201,6 +215,7 @@ class User(Base):
     wali_verified:        Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
     blur_photos_halal:    Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
     halal_mode_enabled:   Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
+    work_mode_enabled:    Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
 
     # ── Halal discover filters ─────────────────────────────────────────────────
     filter_sect:              Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=sect

@@ -607,16 +607,16 @@ async def update_plan(
 
 # ─── AI Credits consumable purchase ──────────────────────────────────────────
 
-# Pack definitions — must match App Store product IDs
+# Pack definitions — must match App Store Connect & RevenueCat product IDs
 _AI_CREDIT_PACKS: dict[str, int] = {
-    "com.zod.ai.credits.10": 10,
-    "com.zod.ai.credits.25": 25,
-    "com.zod.ai.credits.50": 50,
+    "com.zod.ai.credits.101": 10,
+    "com.zod.ai.credits.25":  25,
+    "com.zod.ai.credits.50":  50,
 }
 
 
 class AiCreditsTopupRequest(BaseModel):
-    pack_id: str                   # e.g. "com.zod.ai.credits.10"
+    pack_id: str                   # e.g. "com.zod.ai.credits.101"
     revenuecat_customer_id: str    # RC customer ID to verify the transaction
 
 

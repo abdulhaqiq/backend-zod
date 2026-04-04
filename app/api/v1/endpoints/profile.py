@@ -57,6 +57,10 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "work_are_you_hiring", "work_commitment_level_id", "work_skills",
     "work_equity_split_id", "work_industries", "work_scheduling_url",
     "work_who_to_show_id", "work_priority_startup",
+    "work_headline", "work_persona",
+    "work_num_founders_id", "work_primary_role_id",
+    "work_years_experience_id", "work_job_search_status_id",
+    "linkedin_url",
     # Discover filter preferences
     "filter_age_min", "filter_age_max", "filter_max_distance_km",
     "filter_verified_only", "filter_star_signs", "filter_interests",
@@ -77,7 +81,7 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "notif_promotions", "notif_dating_tips",
     # Halal profile fields
     "sect_id", "prayer_frequency_id", "marriage_timeline_id",
-    "wali_email", "blur_photos_halal", "halal_mode_enabled",
+    "wali_email", "blur_photos_halal", "halal_mode_enabled", "work_mode_enabled",
     # Halal filters
     "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
     "filter_wali_verified_only", "filter_wants_to_work",
@@ -116,6 +120,7 @@ async def update_me(
     db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
     update_data = payload.model_dump(exclude_unset=True)
+    _log.info("PATCH /profile/me — fields: %s", list(update_data.keys()))
 
     # Hard-strip immutable identity fields — phone, apple_id, id can never be
     # changed via this endpoint, regardless of what the request body contains.
@@ -155,6 +160,12 @@ async def update_me(
             )
 
     if not update_data:
+        _log.warning(
+            "PATCH /profile/me returned 422 — empty payload after model_dump. "
+            "Raw payload keys: %s  User: %s",
+            list(payload.model_dump(exclude_none=True).keys()),
+            current_user.id,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No fields provided to update.",

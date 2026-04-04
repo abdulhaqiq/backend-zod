@@ -28,6 +28,7 @@ LinkedIn API notes
 """
 
 import re
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,6 +41,13 @@ from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
 from app.services.linkedin_scraper import LinkedInScraperService, ScrapedLinkedInProfile
+
+# Monthly import limits per subscription tier (None = unlimited)
+_MONTHLY_LIMITS: dict[str, int | None] = {
+    "free": 1,
+    "pro": 2,
+    "premium_plus": None,
+}
 
 router = APIRouter(prefix="/linkedin", tags=["linkedin"])
 
@@ -379,6 +387,8 @@ async def import_linkedin_education(
 class EnrichResponse(BaseModel):
     scraped: ScrapedLinkedInProfile
     updated_fields: list[str]
+    imports_used: int
+    imports_limit: int | None  # None = unlimited
 
 
 @router.post("/enrich", response_model=EnrichResponse)
@@ -389,36 +399,63 @@ async def enrich_profile_from_linkedin(
     """
     Scrape the authenticated user's LinkedIn profile and update their DB record.
 
-    Requires the user to have previously verified their LinkedIn account
-    (linkedin_verified=True and linkedin_url set).
-
-    Updated fields (only when the DB field is currently empty/None):
-      - work_experience  ← scraped positions
+    Updated fields (always overwritten on import):
+      - work_experience  ← scraped positions (with company_logo + description)
       - education        ← scraped education
-      - bio              ← scraped about/summary
-      - city             ← scraped city / location
-      - full_name        ← scraped name
+      - bio              ← scraped about/summary (only if currently empty)
+      - city             ← scraped city / location (only if currently empty)
+      - full_name        ← scraped name (only if currently empty)
 
-    Fields that already have values are left untouched so users don't lose
-    manual edits.
+    Monthly import limits: free=1, pro=2, premium_plus=unlimited.
     """
-    if not current_user.linkedin_verified or not current_user.linkedin_url:
+    if not current_user.linkedin_url:
         raise HTTPException(
             status_code=400,
             detail=(
-                "LinkedIn account not verified. "
-                "Complete LinkedIn verification first via POST /linkedin/verify."
+                "No LinkedIn URL on file. "
+                "Enter your LinkedIn username in Work Settings and save first."
             ),
         )
 
+    # ── Monthly usage limit check ──────────────────────────────────────────
+    tier = getattr(current_user, "subscription_tier", "free") or "free"
+    limit: int | None = _MONTHLY_LIMITS.get(tier, 1)
+
+    now = datetime.now(timezone.utc)
+    reset_at = getattr(current_user, "linkedin_import_reset_at", None)
+    import_count = getattr(current_user, "linkedin_import_count", 0) or 0
+
+    # Reset counter when we've rolled into a new calendar month
+    if not reset_at or reset_at.month != now.month or reset_at.year != now.year:
+        import_count = 0
+        current_user.linkedin_import_count = 0
+        current_user.linkedin_import_reset_at = now
+
+    if limit is not None and import_count >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "import_limit_reached",
+                "limit": limit,
+                "tier": tier,
+                "message": f"You've used all {limit} LinkedIn import(s) this month.",
+            },
+        )
+
+    # ── Scrape ─────────────────────────────────────────────────────────────
     service = LinkedInScraperService()
     scraped = await service.scrape(current_user.linkedin_url)
 
     if scraped.error and not scraped.full_name and not scraped.positions:
-        raise HTTPException(
-            status_code=422,
-            detail=f"LinkedIn scrape failed: {scraped.error}",
+        is_blocked = "999" in scraped.error or "blocked" in scraped.error.lower()
+        detail = (
+            "LinkedIn is blocking direct scraping. "
+            "Add PROXYCURL_API_KEY or RAPIDAPI_KEY to the server .env for reliable import, "
+            "or connect your LinkedIn account via OAuth."
+            if is_blocked
+            else f"LinkedIn scrape failed: {scraped.error}"
         )
+        raise HTTPException(status_code=422, detail=detail)
 
     updated_fields: list[str] = []
 
@@ -426,14 +463,17 @@ async def enrich_profile_from_linkedin(
         current_user.full_name = scraped.full_name
         updated_fields.append("full_name")
 
-    if scraped.positions and not current_user.work_experience:
+    # Always overwrite work_experience on import so logos + description stay fresh
+    if scraped.positions:
         current_user.work_experience = [
             {
-                "job_title": p.title,
-                "company": p.company,
-                "start_year": p.start_year,
-                "end_year": p.end_year,
-                "current": p.current,
+                "job_title":    p.title,
+                "company":      p.company,
+                "company_logo": p.company_logo,
+                "start_year":   p.start_year,
+                "end_year":     p.end_year,
+                "current":      p.current,
+                "description":  p.description,
             }
             for p in scraped.positions
             if p.title or p.company
@@ -441,13 +481,14 @@ async def enrich_profile_from_linkedin(
         if current_user.work_experience:
             updated_fields.append("work_experience")
 
-    if scraped.education and not current_user.education:
+    # Always overwrite education on import
+    if scraped.education:
         current_user.education = [
             {
                 "institution": e.institution,
-                "course": e.field,
-                "degree": e.degree,
-                "grad_year": e.grad_year,
+                "course":      e.field,
+                "degree":      e.degree,
+                "grad_year":   e.grad_year,
             }
             for e in scraped.education
             if e.institution or e.field
@@ -465,11 +506,17 @@ async def enrich_profile_from_linkedin(
             current_user.city = city_val
             updated_fields.append("city")
 
-    if updated_fields:
-        db.add(current_user)
-        await db.commit()
+    # ── Increment import counter and persist ───────────────────────────────
+    current_user.linkedin_import_count = import_count + 1
+    db.add(current_user)
+    await db.commit()
 
-    return EnrichResponse(scraped=scraped, updated_fields=updated_fields)
+    return EnrichResponse(
+        scraped=scraped,
+        updated_fields=updated_fields,
+        imports_used=current_user.linkedin_import_count,
+        imports_limit=limit,
+    )
 
 
 # ─── Scraper: admin raw-scrape any LinkedIn URL ──────────────────────────────

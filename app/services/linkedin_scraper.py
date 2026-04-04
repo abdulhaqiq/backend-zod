@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 class ScrapedPosition(BaseModel):
     title: str = ""
     company: str = ""
+    company_logo: str = ""
     start_year: str = ""
     start_month: str = ""
     end_year: str = ""
@@ -91,6 +92,8 @@ def _clean_url(url: str) -> str:
         url = "https://" + url
     if "linkedin.com/in/" not in url:
         raise ValueError(f"Not a LinkedIn profile URL: {url}")
+    # Ensure www. is present — Apify and most scrapers require the canonical form
+    url = re.sub(r"https://linkedin\.com/", "https://www.linkedin.com/", url)
     # Strip query-string / UTM params
     url = re.split(r"[?#]", url)[0]
     return url
@@ -205,7 +208,141 @@ async def _scrape_proxycurl(url: str) -> ScrapedLinkedInProfile:
     )
 
 
-# ── Tier 2 – RapidAPI (Fresh LinkedIn Profile Data) ──────────────────────────
+# ── Tier 1 – Apify LinkedIn Profile Scraper ──────────────────────────────────
+
+_APIFY_ACTOR = "harvestapi~linkedin-profile-scraper"
+_APIFY_RUN_URL = f"https://api.apify.com/v2/acts/{_APIFY_ACTOR}/run-sync-get-dataset-items"
+
+
+async def _scrape_apify(url: str) -> ScrapedLinkedInProfile:
+    """
+    Scrape via harvestapi/linkedin-profile-scraper on Apify.
+    Input: {"urls": ["https://www.linkedin.com/in/username"]}
+    Docs:  https://apify.com/harvestapi/linkedin-profile-scraper
+    """
+
+    def _year(raw: Any) -> str:
+        if not raw:
+            return ""
+        m = re.search(r"\b(19|20)\d{2}\b", str(raw))
+        return m.group(0) if m else ""
+
+    def _is_present(end_date: Any) -> bool:
+        if end_date is None:
+            return True
+        if isinstance(end_date, dict):
+            return str(end_date.get("text", "")).lower() == "present"
+        return str(end_date).lower() == "present"
+
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        res = await client.post(
+            _APIFY_RUN_URL,
+            params={"token": settings.APIFY_API_TOKEN, "timeout": 90, "memory": 256},
+            json={"urls": [url]},
+            headers={"Content-Type": "application/json"},
+        )
+
+    if res.status_code == 401:
+        raise PermissionError("Invalid Apify API token.")
+    if res.status_code == 402:
+        raise PermissionError("Apify usage limit reached.")
+    if res.status_code not in (200, 201):
+        raise RuntimeError(f"Apify returned HTTP {res.status_code}: {res.text[:300]}")
+
+    body = res.json()
+    items: list[dict] = body if isinstance(body, list) else []
+    if not items:
+        raise ValueError("Apify returned no data for this profile URL.")
+
+    d = items[0]
+    if "error" in d and not d.get("firstName"):
+        raise RuntimeError(f"Apify actor error: {d['error']}")
+
+    # ── Name ──────────────────────────────────────────────────────────────────
+    first_name = d.get("firstName") or ""
+    last_name  = d.get("lastName") or ""
+    full_name  = d.get("name") or f"{first_name} {last_name}".strip()
+
+    # ── Headline, bio, location ───────────────────────────────────────────────
+    headline = d.get("headline") or ""
+    about    = d.get("about") or d.get("summary") or ""
+    loc_obj  = d.get("location") or {}
+    if isinstance(loc_obj, dict):
+        location = loc_obj.get("linkedinText") or (loc_obj.get("parsed") or {}).get("text") or ""
+        city     = (loc_obj.get("parsed") or {}).get("city") or location.split(",")[0].strip()
+    else:
+        location = str(loc_obj)
+        city     = location.split(",")[0].strip()
+    picture = d.get("photo") or (d.get("profilePicture") or {}).get("url") or ""
+
+    # ── Work experience ───────────────────────────────────────────────────────
+    positions: list[ScrapedPosition] = []
+    for exp in d.get("experience") or []:
+        if not isinstance(exp, dict):
+            continue
+        title        = exp.get("position") or exp.get("title") or ""
+        company      = exp.get("companyName") or exp.get("company") or ""
+        company_logo = (exp.get("companyLogo") or {}).get("url") or ""
+        start        = _year((exp.get("startDate") or {}).get("year"))
+        end_raw      = exp.get("endDate")
+        current      = _is_present(end_raw)
+        end          = "" if current else _year((end_raw or {}).get("year"))
+        description  = exp.get("description") or ""
+        if title or company:
+            positions.append(ScrapedPosition(
+                title=title, company=company, company_logo=company_logo,
+                start_year=start, end_year=end, current=current,
+                description=description,
+            ))
+
+    # ── Education ─────────────────────────────────────────────────────────────
+    education: list[ScrapedEducation] = []
+    for edu in d.get("education") or d.get("educations") or []:
+        if not isinstance(edu, dict):
+            continue
+        institution = edu.get("schoolName") or edu.get("institution") or ""
+        field       = edu.get("fieldOfStudy") or edu.get("field") or ""
+        degree      = edu.get("degreeName") or edu.get("degree") or ""
+        end_raw     = edu.get("endDate")
+        grad_year   = _year((end_raw or {}).get("year") if isinstance(end_raw, dict) else end_raw)
+        if institution or field:
+            education.append(ScrapedEducation(
+                institution=institution, field=field,
+                degree=degree, grad_year=grad_year,
+            ))
+
+    # ── Skills ────────────────────────────────────────────────────────────────
+    skills: list[str] = []
+    for s in d.get("topSkills") or []:
+        name = s.get("name") if isinstance(s, dict) else str(s)
+        if name:
+            skills.append(name)
+    for exp in d.get("experience") or []:
+        for s in exp.get("skills") or []:
+            if isinstance(s, str) and s and s not in skills:
+                skills.append(s)
+
+    return ScrapedLinkedInProfile(
+        full_name=full_name,
+        first_name=first_name,
+        last_name=last_name,
+        headline=headline,
+        about=about,
+        location=location,
+        city=city,
+        profile_picture=picture,
+        positions=positions,
+        education=education,
+        skills=skills,
+        linkedin_url=url,
+        source="apify",
+    )
+
+
+# ── Tier 2 – Proxycurl ───────────────────────────────────────────────────────
+
+
+# ── Tier 3 – RapidAPI (Fresh LinkedIn Profile Data) ──────────────────────────
 
 
 _RAPIDAPI_HOST = "fresh-linkedin-profile-data.p.rapidapi.com"
@@ -485,6 +622,82 @@ async def _scrape_direct(url: str) -> ScrapedLinkedInProfile:
     return _parse_html_profile(res.text, url)
 
 
+async def _scrape_google_cache(linkedin_url: str) -> ScrapedLinkedInProfile:
+    """
+    Attempt to get LinkedIn profile data via Google's search result snippet.
+    Google often returns name, headline, and location in structured search results
+    for LinkedIn public profiles — no API key needed.
+    This is a best-effort fallback when LinkedIn blocks direct access.
+    """
+    username = linkedin_url.rstrip("/").split("/in/")[-1].split("/")[0]
+    search_url = f"https://www.google.com/search?q=site:linkedin.com/in/{username}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        res = await client.get(search_url)
+
+    if res.status_code != 200:
+        raise RuntimeError(f"Google search returned HTTP {res.status_code}.")
+
+    html = res.text
+
+    # Extract name from the <h3> title of the LinkedIn result
+    full_name = ""
+    name_match = re.search(
+        rf'<h3[^>]*>([^<]+)\s*[-–|]\s*LinkedIn</h3>',
+        html, re.IGNORECASE
+    )
+    if name_match:
+        full_name = name_match.group(1).strip()
+
+    # Fallback: og:title-style patterns in search snippets
+    if not full_name:
+        alt = re.search(r'"([A-Z][a-zA-Z\s\-\'\.]{2,40})\s*[-–|]\s*LinkedIn', html)
+        if alt:
+            full_name = alt.group(1).strip()
+
+    # Extract headline from the search description snippet
+    headline = location = ""
+    snippet_match = re.search(
+        r'<div[^>]*class="[^"]*(?:VwiC3b|s3v9rd|IsZvec)[^"]*"[^>]*>(.*?)</div>',
+        html, re.DOTALL
+    )
+    if snippet_match:
+        raw = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()
+        # LinkedIn snippets look like "Job Title at Company · City, Country"
+        parts = raw.split(" · ")
+        if parts:
+            headline = parts[0].strip()
+        if len(parts) > 1:
+            location = parts[-1].strip()
+
+    if not full_name and not headline:
+        raise ValueError("Could not extract profile data from Google search results.")
+
+    # Build a minimal profile from what we found
+    positions: list[ScrapedPosition] = []
+    if headline:
+        job_title, company = _parse_headline(headline) if " at " in headline or " @ " in headline else (headline, "")
+        if job_title:
+            positions.append(ScrapedPosition(title=job_title, company=company, current=True))
+
+    return ScrapedLinkedInProfile(
+        full_name=full_name,
+        headline=headline,
+        location=location,
+        positions=positions,
+        linkedin_url=linkedin_url,
+        source="google_cache",
+    )
+
+
 # ── Main service ──────────────────────────────────────────────────────────────
 
 
@@ -493,51 +706,28 @@ class LinkedInScraperService:
     Multi-tier LinkedIn profile scraper.
 
     Tries tiers in priority order and returns the first successful result.
-    Configure API keys in .env:
-
-        PROXYCURL_API_KEY=...   # Tier 1 (https://nubela.co/proxycurl)
-        RAPIDAPI_KEY=...        # Tier 2 (RapidAPI Fresh LinkedIn Profile Data)
-
-    Tier 3 (direct HTML) is always attempted as a last resort.
+    Requires APIFY_API_TOKEN in .env.
+    Actor: https://apify.com/apify/linkedin-profile-scraper
     """
 
     async def scrape(self, linkedin_url: str) -> ScrapedLinkedInProfile:
         url = _clean_url(linkedin_url)
-        errors: list[str] = []
 
-        # Tier 1 — Proxycurl
-        if settings.PROXYCURL_API_KEY:
-            try:
-                profile = await _scrape_proxycurl(url)
-                if profile.full_name or profile.positions:
-                    log.info("LinkedIn scrape via Proxycurl: %s", url)
-                    return profile
-            except Exception as exc:
-                log.warning("Proxycurl scrape failed for %s: %s", url, exc)
-                errors.append(f"proxycurl: {exc}")
+        if not settings.APIFY_API_TOKEN:
+            return ScrapedLinkedInProfile(
+                linkedin_url=url,
+                error="APIFY_API_TOKEN not configured. Add it to the server .env file.",
+                source="none",
+            )
 
-        # Tier 2 — RapidAPI
-        if settings.RAPIDAPI_KEY:
-            try:
-                profile = await _scrape_rapidapi(url)
-                if profile.full_name or profile.positions:
-                    log.info("LinkedIn scrape via RapidAPI: %s", url)
-                    return profile
-            except Exception as exc:
-                log.warning("RapidAPI scrape failed for %s: %s", url, exc)
-                errors.append(f"rapidapi: {exc}")
-
-        # Tier 3 — Direct HTML
         try:
-            profile = await _scrape_direct(url)
-            log.info("LinkedIn scrape via direct HTML: %s", url)
+            profile = await _scrape_apify(url)
+            log.info("LinkedIn scrape via Apify: %s (source=%s)", url, profile.source)
             return profile
         except Exception as exc:
-            log.warning("Direct HTML scrape failed for %s: %s", url, exc)
-            errors.append(f"direct: {exc}")
-
-        return ScrapedLinkedInProfile(
-            linkedin_url=url,
-            error="; ".join(errors) or "All scraper tiers failed.",
-            source="none",
-        )
+            log.warning("Apify scrape failed for %s: %s", url, exc)
+            return ScrapedLinkedInProfile(
+                linkedin_url=url,
+                error=str(exc),
+                source="none",
+            )

@@ -78,9 +78,11 @@ class Settings(BaseSettings):
     LINKEDIN_CLIENT_SECRET: str = ""
 
     # LinkedIn Scraper APIs
-    # Tier 1 — Proxycurl (https://nubela.co/proxycurl)  ~$0.01/call, best quality
+    # Tier 1 — Apify LinkedIn Profile Scraper (https://apify.com/apify/linkedin-profile-scraper)
+    APIFY_API_TOKEN: str = ""
+    # Tier 2 — Proxycurl (https://nubela.co/proxycurl)  ~$0.01/call, best quality
     PROXYCURL_API_KEY: str = ""
-    # Tier 2 — RapidAPI Fresh LinkedIn Profile Data (https://rapidapi.com/freshdata-freshdata-default/api/fresh-linkedin-profile-data)
+    # Tier 3 — RapidAPI Fresh LinkedIn Profile Data (https://rapidapi.com/freshdata-freshdata-default/api/fresh-linkedin-profile-data)
     RAPIDAPI_KEY: str = ""
 
     # RevenueCat

@@ -94,6 +94,12 @@ class ProfileUpdateRequest(BaseModel):
     work_scheduling_url: str | None = Field(None, max_length=512)
     work_who_to_show_id: int | None = None                # lookup_options (category=work_who_to_show)
     work_priority_startup: bool | None = None
+    work_headline: str | None = Field(None, max_length=256)
+    work_persona: str | None = Field(None, pattern="^(founder|job_seeker|both)$")
+    work_num_founders_id: int | None = None               # lookup_options (category=work_num_founders)
+    work_primary_role_id: int | None = None               # lookup_options (category=work_role)
+    work_years_experience_id: int | None = None           # lookup_options (category=work_years_experience)
+    work_job_search_status_id: int | None = None          # lookup_options (category=work_job_search_status)
 
     # ── Notification preferences ──────────────────────────────────────────────
     notif_new_match:     bool | None = None
@@ -112,6 +118,10 @@ class ProfileUpdateRequest(BaseModel):
     wali_email:           str | None = Field(None, max_length=255)
     blur_photos_halal:    bool | None = None
     halal_mode_enabled:   bool | None = None
+    work_mode_enabled:    bool | None = None
+
+    # ── LinkedIn ──────────────────────────────────────────────────────────────
+    linkedin_url: str | None = Field(None, max_length=512)
 
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         int | None = Field(None, ge=18, le=80)
@@ -212,6 +222,7 @@ class MeResponse(BaseModel):
     wali_verified:        bool
     blur_photos_halal:    bool
     halal_mode_enabled:   bool
+    work_mode_enabled:    bool
 
     voice_prompts: list[dict[str, Any]] | None
     work_experience: list[dict[str, Any]] | None
@@ -237,6 +248,12 @@ class MeResponse(BaseModel):
     work_scheduling_url: str | None
     work_who_to_show_id: int | None
     work_priority_startup: bool | None
+    work_headline: str | None
+    work_persona: str | None
+    work_num_founders_id: int | None
+    work_primary_role_id: int | None
+    work_years_experience_id: int | None
+    work_job_search_status_id: int | None
 
     # ── Discover filter preferences ───────────────────────────────────────────
     filter_age_min:         int | None
@@ -297,6 +314,8 @@ class MeResponse(BaseModel):
     face_scan_required: bool
     id_scan_required:   bool = False
     subscription_tier: str     # free | pro
+    linkedin_import_count: int = 0
+    linkedin_import_reset_at: datetime | None = None
     super_likes_remaining: int
     is_active: bool
     is_verified: bool
