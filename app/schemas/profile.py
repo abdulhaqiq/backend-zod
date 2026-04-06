@@ -181,6 +181,8 @@ class FilterUpdateRequest(BaseModel):
     filter_marriage_timeline:  list[int] | None = None
     filter_wali_verified_only: bool | None = None
     filter_wants_to_work:      bool | None = None
+    # Work-mode filters (single JSONB blob)
+    work_filter_settings:      dict | None = None
 
 
 class MeResponse(BaseModel):
@@ -280,6 +282,8 @@ class MeResponse(BaseModel):
     filter_marriage_timeline:  list[int] | None
     filter_wali_verified_only: bool
     filter_wants_to_work:      bool | None
+    # Work-mode filters
+    work_filter_settings:      dict | None
 
     university:               str | None
     university_email:         str | None

@@ -217,6 +217,14 @@ class User(Base):
     halal_mode_enabled:   Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
     work_mode_enabled:    Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
 
+    # ── Work discover filters ──────────────────────────────────────────────────
+    # Single JSONB blob keeps all work-mode filter prefs without proliferating columns.
+    # Schema: { distance_km, verified_only, hiring_only, priority_startup,
+    #           industries, skills, commitment_levels, who_to_see,
+    #           job_search_statuses, years_experience,
+    #           matching_goals, equity_prefs, stages, roles, num_founders }
+    work_filter_settings: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     # ── Halal discover filters ─────────────────────────────────────────────────
     filter_sect:              Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=sect
     filter_prayer_frequency:  Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=prayer_frequency

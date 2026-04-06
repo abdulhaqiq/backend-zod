@@ -377,6 +377,8 @@ _FILTER_FIELDS: frozenset[str] = frozenset({
     # Halal-specific filters (free tier — available to all Muslims)
     "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
     "filter_wali_verified_only", "filter_wants_to_work",
+    # Work-mode filters (stored as single JSONB blob)
+    "work_filter_settings",
 })
 
 _PRO_FILTER_FIELDS: frozenset[str] = frozenset({

@@ -556,6 +556,118 @@ async def _fetch_discover_profiles(
     if mode == "work":
         stmt = stmt.where(User.work_mode_enabled.is_(True))
 
+    # ── Work-mode discover filters ────────────────────────────────────────────
+    # Applied when mode=work and the user has saved work filter preferences.
+    if mode == "work" and me.work_filter_settings:
+        wf = me.work_filter_settings  # dict
+
+        # Distance (overrides the global filter_max_distance_km for work mode)
+        wf_distance = wf.get("distance_km")
+        if (
+            wf_distance is not None
+            and not _bypass_distance
+            and _origin_lat is not None
+            and _origin_lon is not None
+        ):
+            wf_max_km = float(wf_distance)
+            stmt = stmt.where(
+                text(
+                    "latitude IS NOT NULL AND longitude IS NOT NULL AND "
+                    "2 * 6371 * ASIN(SQRT("
+                    "  POWER(SIN(RADIANS(latitude  - :wlat) / 2), 2) + "
+                    "  COS(RADIANS(:wlat)) * COS(RADIANS(latitude)) * "
+                    "  POWER(SIN(RADIANS(longitude - :wlon) / 2), 2)"
+                    ")) <= :wmaxkm"
+                ).bindparams(wlat=_origin_lat, wlon=_origin_lon, wmaxkm=wf_max_km)
+            )
+
+        # Verified-only
+        if wf.get("verified_only"):
+            stmt = stmt.where(User.verification_status == "verified")
+
+        # Actively hiring only
+        if wf.get("hiring_only"):
+            stmt = stmt.where(User.work_are_you_hiring.is_(True))
+
+        # Priority startup experience
+        if wf.get("priority_startup"):
+            stmt = stmt.where(User.work_priority_startup.is_(True))
+
+        # Industries (at least one overlap)
+        wf_industries = [int(i) for i in wf.get("industries", []) if str(i).isdigit()] if wf.get("industries") else []
+        if wf_industries:
+            ids_lit = ",".join(str(i) for i in wf_industries)
+            stmt = stmt.where(
+                text(
+                    f"EXISTS (SELECT 1 FROM jsonb_array_elements(work_industries) _wi"
+                    f" WHERE (_wi)::int = ANY(ARRAY[{ids_lit}]))"
+                )
+            )
+
+        # Skills (at least one overlap)
+        wf_skills = [int(i) for i in wf.get("skills", []) if str(i).isdigit()] if wf.get("skills") else []
+        if wf_skills:
+            ids_lit = ",".join(str(i) for i in wf_skills)
+            stmt = stmt.where(
+                text(
+                    f"EXISTS (SELECT 1 FROM jsonb_array_elements(work_skills) _ws"
+                    f" WHERE (_ws)::int = ANY(ARRAY[{ids_lit}]))"
+                )
+            )
+
+        # Commitment level (match any selected)
+        wf_commitment = [int(i) for i in wf.get("commitment_levels", []) if str(i).isdigit()] if wf.get("commitment_levels") else []
+        if wf_commitment:
+            stmt = stmt.where(User.work_commitment_level_id.in_(wf_commitment))
+
+        # Who to see (work_who_to_show_id)
+        wf_who = [int(i) for i in wf.get("who_to_see", []) if str(i).isdigit()] if wf.get("who_to_see") else []
+        if wf_who:
+            stmt = stmt.where(User.work_who_to_show_id.in_(wf_who))
+
+        # Job search status (match any selected)
+        wf_job_status = [int(i) for i in wf.get("job_search_statuses", []) if str(i).isdigit()] if wf.get("job_search_statuses") else []
+        if wf_job_status:
+            stmt = stmt.where(User.work_job_search_status_id.in_(wf_job_status))
+
+        # Years of experience (match any selected)
+        wf_yoe = [int(i) for i in wf.get("years_experience", []) if str(i).isdigit()] if wf.get("years_experience") else []
+        if wf_yoe:
+            stmt = stmt.where(User.work_years_experience_id.in_(wf_yoe))
+
+        # ── Pro-only work filters ─────────────────────────────────────────────
+        if is_pro:
+            # Matching goals (at least one overlap)
+            wf_goals = [int(i) for i in wf.get("matching_goals", []) if str(i).isdigit()] if wf.get("matching_goals") else []
+            if wf_goals:
+                ids_lit = ",".join(str(i) for i in wf_goals)
+                stmt = stmt.where(
+                    text(
+                        f"EXISTS (SELECT 1 FROM jsonb_array_elements(work_matching_goals) _wg"
+                        f" WHERE (_wg)::int = ANY(ARRAY[{ids_lit}]))"
+                    )
+                )
+
+            # Equity split preference (match any selected)
+            wf_equity = [int(i) for i in wf.get("equity_prefs", []) if str(i).isdigit()] if wf.get("equity_prefs") else []
+            if wf_equity:
+                stmt = stmt.where(User.work_equity_split_id.in_(wf_equity))
+
+            # Startup stage
+            wf_stages = [int(i) for i in wf.get("stages", []) if str(i).isdigit()] if wf.get("stages") else []
+            if wf_stages:
+                stmt = stmt.where(User.work_stage_id.in_(wf_stages))
+
+            # Primary role
+            wf_roles = [int(i) for i in wf.get("roles", []) if str(i).isdigit()] if wf.get("roles") else []
+            if wf_roles:
+                stmt = stmt.where(User.work_primary_role_id.in_(wf_roles))
+
+            # Number of founders
+            wf_founders = [int(i) for i in wf.get("num_founders", []) if str(i).isdigit()] if wf.get("num_founders") else []
+            if wf_founders:
+                stmt = stmt.where(User.work_num_founders_id.in_(wf_founders))
+
     # ── Verified-only filter (face-verified profiles only) ───────────────────
     # is_verified=True is given to ALL phone-signed-in users so it can't be
     # used here.  verification_status='verified' means the user passed face
