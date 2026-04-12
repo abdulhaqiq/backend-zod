@@ -29,12 +29,13 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.ai_credits_transaction import AiCreditsTransaction
 from app.models.subscription_plan import SubscriptionPlan
 from app.models.user import User
 
@@ -46,14 +47,56 @@ RC_BASE = "https://api.revenuecat.com/v1"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+async def _log_subscription_event(
+    db: AsyncSession,
+    user_id,
+    event_type: str,
+    tier: str,
+    rc_customer_id: str | None = None,
+    apple_product_id: str | None = None,
+    plan_name: str | None = None,
+    interval: str | None = None,
+    price_usd: float | None = None,
+    starts_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    cancelled_at: datetime | None = None,
+) -> None:
+    """Insert a row into the subscriptions history table."""
+    await db.execute(
+        text("""
+            INSERT INTO subscriptions
+              (user_id, event_type, tier, revenuecat_customer_id,
+               apple_product_id, plan_name, interval, price_usd,
+               starts_at, expires_at, cancelled_at)
+            VALUES
+              (CAST(:uid AS uuid), :event_type, :tier, :rc_id,
+               :apple_product_id, :plan_name, :interval, :price_usd,
+               :starts_at, :expires_at, :cancelled_at)
+        """).bindparams(
+            uid=str(user_id),
+            event_type=event_type,
+            tier=tier,
+            rc_id=rc_customer_id,
+            apple_product_id=apple_product_id,
+            plan_name=plan_name,
+            interval=interval,
+            price_usd=price_usd,
+            starts_at=starts_at,
+            expires_at=expires_at,
+            cancelled_at=cancelled_at,
+        )
+    )
+
 async def _rc_get_customer(customer_id: str) -> dict:
-    """Fetch subscriber info from RevenueCat REST API."""
+    """Fetch subscriber info from RevenueCat REST API (server-to-server)."""
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
             f"{RC_BASE}/subscribers/{customer_id}",
             headers={
                 "Authorization": f"Bearer {settings.REVENUECAT_SECRET_KEY}",
-                "X-Platform": "ios",
+                # Do NOT send X-Platform here — this is a server-to-server call.
+                # Sending X-Platform: ios makes RevenueCat treat it as a mobile
+                # SDK request and reject the secret key (error 7243).
             },
         )
     if r.status_code != 200:
@@ -92,6 +135,8 @@ def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
 
     Checks both 'premium' and 'pro' entitlements; premium takes precedence.
     tier is one of: 'premium_plus' | 'pro' | 'free'
+    expires_at is always a naive UTC datetime (no tzinfo) to match the DB column
+    type TIMESTAMP WITHOUT TIME ZONE.
     """
     subscriber = rc_data.get("subscriber", {})
     entitlements = subscriber.get("entitlements", {})
@@ -107,7 +152,8 @@ def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
             return True, tier, None  # lifetime
         expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
         if expires_at > now:
-            return True, tier, expires_at
+            # Strip timezone — DB column is TIMESTAMP WITHOUT TIME ZONE
+            return True, tier, expires_at.replace(tzinfo=None)
 
     return False, "free", None
 
@@ -357,6 +403,12 @@ async def get_my_features(
     if new_month and monthly_grant > 0:
         current_user.ai_credits_balance += monthly_grant
         current_user.ai_credits_reset_at = now
+        db.add(AiCreditsTransaction(
+            user_id=current_user.id,
+            amount=monthly_grant,
+            reason="monthly_grant",
+            balance_after=current_user.ai_credits_balance,
+        ))
         await db.commit()
 
     return {
@@ -416,6 +468,17 @@ async def verify_purchase(
         current_user.super_likes_remaining = 10 if new_tier == "premium_plus" else 5
         current_user.super_likes_reset_at  = datetime.now(timezone.utc)
 
+    # Log to subscriptions history
+    await _log_subscription_event(
+        db,
+        user_id=current_user.id,
+        event_type="INITIAL_PURCHASE" if upgrading else "VERIFY",
+        tier=new_tier,
+        rc_customer_id=body.revenuecat_customer_id,
+        starts_at=datetime.now(timezone.utc),
+        expires_at=expires_at,
+    )
+
     await db.commit()
 
     return {
@@ -465,7 +528,7 @@ async def revenuecat_webhook(
     if event_type in ("INITIAL_PURCHASE", "RENEWAL", "PRODUCT_CHANGE", "UNCANCELLATION"):
         expires_str = event.get("expiration_at_ms")
         expires_at = (
-            datetime.fromtimestamp(int(expires_str) / 1000, tz=timezone.utc)
+            datetime.fromtimestamp(int(expires_str) / 1000, tz=timezone.utc).replace(tzinfo=None)
             if expires_str else None
         )
         # Determine tier from the entitlement_ids in the event
@@ -482,24 +545,44 @@ async def revenuecat_webhook(
         if upgrading and user.super_likes_remaining == 0 and user.super_likes_reset_at is None:
             user.super_likes_remaining = 10 if new_tier == "premium_plus" else 5
             user.super_likes_reset_at  = datetime.now(timezone.utc)
+        await _log_subscription_event(
+            db, user_id=user.id, event_type=event_type, tier=new_tier,
+            rc_customer_id=rc_customer_id,
+            apple_product_id=event.get("product_id"),
+            starts_at=datetime.now(timezone.utc),
+            expires_at=expires_at,
+        )
 
     elif event_type == "EXPIRATION":
         # Subscription period actually ended — downgrade now.
         user.subscription_tier = "free"
         user.subscription_expires_at = None
+        await _log_subscription_event(
+            db, user_id=user.id, event_type="EXPIRATION", tier="free",
+            rc_customer_id=rc_customer_id,
+            apple_product_id=event.get("product_id"),
+        )
 
     elif event_type == "CANCELLATION":
         # User turned off auto-renew but subscription is still active until the period ends.
         # Do NOT downgrade here — the EXPIRATION webhook will fire when it actually lapses.
         # Update the expiry date if provided so the auto-expire logic has the right value.
         expires_str = event.get("expiration_at_ms")
+        cancelled_at = datetime.now(timezone.utc)
         if expires_str:
             user.subscription_expires_at = datetime.fromtimestamp(
                 int(expires_str) / 1000, tz=timezone.utc
-            )
+            ).replace(tzinfo=None)
         logger.info(
             "User %s cancelled auto-renew — remains active until %s",
             user.id, user.subscription_expires_at,
+        )
+        await _log_subscription_event(
+            db, user_id=user.id, event_type="CANCELLATION", tier=user.subscription_tier,
+            rc_customer_id=rc_customer_id,
+            apple_product_id=event.get("product_id"),
+            expires_at=user.subscription_expires_at,
+            cancelled_at=cancelled_at,
         )
 
     elif event_type == "BILLING_ISSUE":
@@ -510,10 +593,16 @@ async def revenuecat_webhook(
         if expires_str:
             user.subscription_expires_at = datetime.fromtimestamp(
                 int(expires_str) / 1000, tz=timezone.utc
-            )
+            ).replace(tzinfo=None)
         logger.info(
             "User %s billing issue — grace period until %s",
             user.id, user.subscription_expires_at,
+        )
+        await _log_subscription_event(
+            db, user_id=user.id, event_type="BILLING_ISSUE", tier=user.subscription_tier,
+            rc_customer_id=rc_customer_id,
+            apple_product_id=event.get("product_id"),
+            expires_at=user.subscription_expires_at,
         )
 
     await db.commit()
@@ -609,7 +698,7 @@ async def update_plan(
 
 # Pack definitions — must match App Store Connect & RevenueCat product IDs
 _AI_CREDIT_PACKS: dict[str, int] = {
-    "com.zod.ai.credits.101": 10,
+    "com.zod.ai.credits.110": 10,
     "com.zod.ai.credits.25":  25,
     "com.zod.ai.credits.50":  50,
 }
@@ -643,22 +732,24 @@ async def topup_ai_credits(
     if credits_to_add is None:
         raise HTTPException(400, f"Unknown pack_id: {body.pack_id!r}. Valid packs: {list(_AI_CREDIT_PACKS)}")
 
-    # Verify with RevenueCat that this customer has a non-subscription purchase
-    # for this product. For consumables, RC records them under non_subscriptions.
-    if settings.REVENUECAT_SECRET_KEY:
-        try:
-            rc_data = await _rc_get_customer(body.revenuecat_customer_id)
-            subscriber = rc_data.get("subscriber", {})
-            non_subs: dict = subscriber.get("non_subscriptions", {})
-            if body.pack_id not in non_subs:
-                raise HTTPException(402, "RevenueCat: purchase not found for this product.")
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.warning("RC topup verification warning: %s", exc)
+    # Verify with RevenueCat — no bypasses allowed.
+    if not settings.REVENUECAT_SECRET_KEY:
+        raise HTTPException(501, "RevenueCat not configured — set REVENUECAT_SECRET_KEY")
+
+    rc_data = await _rc_get_customer(body.revenuecat_customer_id)
+    subscriber = rc_data.get("subscriber", {})
+    non_subs: dict = subscriber.get("non_subscriptions", {})
+    if body.pack_id not in non_subs:
+        raise HTTPException(402, "RevenueCat: purchase not found for this product.")
 
     current_user.revenuecat_customer_id = body.revenuecat_customer_id
     current_user.ai_credits_balance += credits_to_add
+    db.add(AiCreditsTransaction(
+        user_id=current_user.id,
+        amount=credits_to_add,
+        reason="topup",
+        balance_after=current_user.ai_credits_balance,
+    ))
     await db.commit()
 
     logger.info(
@@ -697,6 +788,12 @@ async def spend_ai_credits(
             detail=f"Insufficient AI credits (have {current_user.ai_credits_balance}, need {body.amount}).",
         )
     current_user.ai_credits_balance -= body.amount
+    db.add(AiCreditsTransaction(
+        user_id=current_user.id,
+        amount=-body.amount,
+        reason=body.reason or "spend",
+        balance_after=current_user.ai_credits_balance,
+    ))
     await db.commit()
     logger.info(
         "AI credits spent: user %s -%d (%s) → balance=%d",
@@ -753,3 +850,63 @@ async def admin_grant(
         "tier": user.subscription_tier,
         "previous_tier": old_tier,
     }
+
+
+@router.get("/admin/all", summary="[Admin] List all subscription events with user details")
+async def list_all_subscriptions(
+    _: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """
+    Returns the full subscriptions history table, newest first, joined with user info.
+    Useful for seeing who subscribed, which plan, when, and current status.
+    """
+    result = await db.execute(
+        text("""
+            SELECT
+                s.id,
+                s.event_type,
+                s.tier,
+                s.plan_name,
+                s.apple_product_id,
+                s.interval,
+                s.price_usd,
+                s.starts_at,
+                s.expires_at,
+                s.cancelled_at,
+                s.created_at,
+                u.id        AS user_id,
+                u.phone,
+                u.full_name,
+                u.subscription_tier AS current_tier,
+                u.subscription_expires_at AS current_expires_at
+            FROM subscriptions s
+            JOIN users u ON u.id = s.user_id
+            ORDER BY s.created_at DESC
+            LIMIT :limit OFFSET :offset
+        """).bindparams(limit=limit, offset=offset)
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "event_type": r[1],
+            "tier": r[2],
+            "plan_name": r[3],
+            "apple_product_id": r[4],
+            "interval": r[5],
+            "price_usd": float(r[6]) if r[6] is not None else None,
+            "starts_at": r[7].isoformat() if r[7] else None,
+            "expires_at": r[8].isoformat() if r[8] else None,
+            "cancelled_at": r[9].isoformat() if r[9] else None,
+            "created_at": r[10].isoformat() if r[10] else None,
+            "user_id": str(r[11]),
+            "phone": r[12],
+            "full_name": r[13],
+            "current_tier": r[14],
+            "current_expires_at": r[15].isoformat() if r[15] else None,
+        }
+        for r in rows
+    ]

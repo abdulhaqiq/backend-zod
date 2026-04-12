@@ -228,7 +228,7 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
 # ── Smart preference scoring ──────────────────────────────────────────────────
 
 # Default soft max distance when user hasn't set one (used only for scoring, not filtering)
-_DEFAULT_SOFT_MAX_KM = 50.0
+_DEFAULT_SOFT_MAX_KM = 80.0
 
 
 def _age_from_dob(dob: date | None) -> int | None:
@@ -425,7 +425,10 @@ async def _fetch_discover_profiles(
     await _ensure_cache(db)
 
     is_pro = me.subscription_tier in ("pro", "premium_plus")
-    _bypass_distance = getattr(me, 'bypass_location_filter', False)
+    # bypass_location_filter is an admin flag that removes the distance filter when
+    # the user hasn't explicitly set one. If the user explicitly chose a distance
+    # (filter_max_distance_km is not None), always honour it — even for admins.
+    _bypass_distance = getattr(me, 'bypass_location_filter', False) and me.filter_max_distance_km is None
 
     # ── Opposite-gender filter (straight platform) ────────────────────────────
     # Man (223) sees Women (224), Woman (224) sees Men (223).
@@ -530,16 +533,16 @@ async def _fetch_discover_profiles(
     # ── Distance filter pushed into SQL (Haversine bounding-box + exact check) ─
     # When we have an origin and a max_km cap is set, filter in SQL so we don't
     # fetch thousands of far-away rows only to drop them in Python.
-    # null filter_max_distance_km means "any distance" — no SQL filter.
+    # null filter_max_distance_km defaults to 20 km (matches the client slider default).
     # bypass_location_filter=True (admin override) skips ALL distance filtering
     # so the user sees profiles from any location worldwide.
+    _effective_max_km = float(me.filter_max_distance_km) if me.filter_max_distance_km is not None else 20.0
     if (
         not _bypass_distance
         and _origin_lat is not None
         and _origin_lon is not None
-        and me.filter_max_distance_km is not None
     ):
-        _max_km = float(me.filter_max_distance_km)
+        _max_km = _effective_max_km
         stmt = stmt.where(
             text(
                 # Haversine entirely in SQL — no PostGIS required.
@@ -681,11 +684,16 @@ async def _fetch_discover_profiles(
         if me.filter_age_max:
             max_age = me.filter_age_max
             min_dob = date(today.year - max_age - 1, today.month, today.day)
-            stmt = stmt.where(User.date_of_birth >= min_dob)
+            # Use > (not >=) to exclude people who are already max_age+1 today
+            stmt = stmt.where(User.date_of_birth > min_dob)
         if me.filter_age_min:
             min_age = me.filter_age_min
             max_dob = date(today.year - min_age, today.month, today.day)
             stmt = stmt.where(User.date_of_birth <= max_dob)
+
+    # ── Religion filter (standard mode) ──────────────────────────────────────
+    if me.filter_religions:
+        stmt = stmt.where(User.religion_id.in_(me.filter_religions))
 
     # ── Star sign filter ──────────────────────────────────────────────────────
     if me.filter_star_signs:
@@ -820,7 +828,7 @@ async def _fetch_discover_profiles(
     # reflect travel city when travel_mode_enabled, otherwise real GPS.
     me_lat = _origin_lat
     me_lon = _origin_lon
-    max_km = me.filter_max_distance_km
+    max_km = _effective_max_km  # default 20 when user hasn't set a preference
 
     has_my_location = me_lat is not None and me_lon is not None
 
@@ -937,35 +945,73 @@ async def record_swipe(
         dl_reset = current_user.daily_likes_reset_at
         # Auto-reset when UTC day has rolled over (or never been set)
         if dl_reset is None or dl_reset.date() < now_utc.date():
+            await db.execute(
+                text(
+                    "UPDATE users SET daily_likes_used = 0, daily_likes_reset_at = :now "
+                    "WHERE id = CAST(:uid AS uuid)"
+                ).bindparams(now=now_utc, uid=str(current_user.id))
+            )
             current_user.daily_likes_used = 0
             current_user.daily_likes_reset_at = now_utc
-            db.add(current_user)
         if current_user.daily_likes_used >= FREE_DAILY_LIKE_LIMIT:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"You've used all {FREE_DAILY_LIKE_LIMIT} free likes for today. Upgrade to Pro for unlimited likes.",
                 headers={"X-Error-Code": "daily_limit_reached"},
             )
-        # Increment optimistically (decremented back if swipe insertion fails)
-        current_user.daily_likes_used += 1
-        db.add(current_user)
+        # Atomic increment to prevent race condition with concurrent rapid swipes
+        result = await db.execute(
+            text(
+                "UPDATE users SET daily_likes_used = daily_likes_used + 1 "
+                "WHERE id = CAST(:uid AS uuid) AND daily_likes_used < :limit "
+                "RETURNING daily_likes_used"
+            ).bindparams(uid=str(current_user.id), limit=FREE_DAILY_LIKE_LIMIT)
+        )
+        updated = result.scalar_one_or_none()
+        if updated is None:
+            # Another concurrent request already hit the limit
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You've used all {FREE_DAILY_LIKE_LIMIT} free likes for today. Upgrade to Pro for unlimited likes.",
+                headers={"X-Error-Code": "daily_limit_reached"},
+            )
+        current_user.daily_likes_used = updated
 
     # ── Daily work connect gate: all users capped at 20 connects per day ────────
     if body.mode == "work" and body.direction in ("right", "super"):
         now_utc  = datetime.now(timezone.utc)
         wc_reset = current_user.daily_work_connects_reset_at
         if wc_reset is None or wc_reset.date() < now_utc.date():
-            current_user.daily_work_connects_used     = 0
+            await db.execute(
+                text(
+                    "UPDATE users SET daily_work_connects_used = 0, daily_work_connects_reset_at = :now "
+                    "WHERE id = CAST(:uid AS uuid)"
+                ).bindparams(now=now_utc, uid=str(current_user.id))
+            )
+            current_user.daily_work_connects_used = 0
             current_user.daily_work_connects_reset_at = now_utc
-            db.add(current_user)
         if current_user.daily_work_connects_used >= DAILY_WORK_CONNECT_LIMIT:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"You've used all {DAILY_WORK_CONNECT_LIMIT} work connects for today. Resets at midnight UTC.",
                 headers={"X-Error-Code": "work_connect_limit_reached"},
             )
-        current_user.daily_work_connects_used += 1
-        db.add(current_user)
+        # Atomic increment to prevent race condition
+        wc_result = await db.execute(
+            text(
+                "UPDATE users SET daily_work_connects_used = daily_work_connects_used + 1 "
+                "WHERE id = CAST(:uid AS uuid) AND daily_work_connects_used < :limit "
+                "RETURNING daily_work_connects_used"
+            ).bindparams(uid=str(current_user.id), limit=DAILY_WORK_CONNECT_LIMIT)
+        )
+        wc_updated = wc_result.scalar_one_or_none()
+        if wc_updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You've used all {DAILY_WORK_CONNECT_LIMIT} work connects for today. Resets at midnight UTC.",
+                headers={"X-Error-Code": "work_connect_limit_reached"},
+            )
+        current_user.daily_work_connects_used = wc_updated
 
     # ── Super-like gate: Pro subscribers only, 10 per calendar month ─────────
     if body.direction == "super":
@@ -1278,6 +1324,11 @@ async def get_liked_you(
                   WHERE (m.user1_id = l.liker_id AND m.user2_id = CAST(:uid AS uuid))
                      OR (m.user2_id = l.liker_id AND m.user1_id = CAST(:uid AS uuid))
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM swipes sw
+                  WHERE sw.swiper_id = CAST(:uid AS uuid)
+                    AND sw.swiped_id = l.liker_id
+              )
             ORDER BY l.created_at DESC
             LIMIT 50
         """).bindparams(uid=uid)
@@ -1396,6 +1447,112 @@ async def get_ai_picks(
         p["shared_interests"] = shared
 
     return {"profiles": top10, "total": len(top10)}
+
+
+_DAILY_REVERT_LIMIT = 3
+_REVERT_WINDOW_SECONDS = 5 * 60   # 5 minutes
+
+
+class RevertBody(BaseModel):
+    swiped_id: str
+    mode: str = "date"
+
+
+@router.post("/revert", summary="Undo the last left-swipe within the 5-minute window (free: 3/day)")
+async def revert_swipe(
+    body: RevertBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Removes a left-swipe so the profile can reappear in the user's feed.
+
+    Rules:
+    • The swipe must exist, be a *left* swipe, and be ≤ 5 minutes old.
+    • Free users may revert at most 3 times per UTC day.
+    • Pro / Premium+ users have no daily limit.
+    """
+    now = datetime.now(timezone.utc)
+    is_pro = current_user.subscription_tier in ("pro", "premium_plus")
+
+    # ── Reset daily counter if a new UTC day has started ─────────────────────
+    reset_needed = (
+        current_user.daily_revert_reset_at is None
+        or (now - current_user.daily_revert_reset_at).total_seconds() >= 86400
+    )
+    if reset_needed:
+        current_user.daily_revert_used = 0
+        current_user.daily_revert_reset_at = now
+
+    # ── Enforce free-user daily cap ───────────────────────────────────────────
+    if not is_pro and current_user.daily_revert_used >= _DAILY_REVERT_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Daily revert limit of {_DAILY_REVERT_LIMIT} reached. Resets at midnight UTC.",
+        )
+
+    # ── Find the swipe ────────────────────────────────────────────────────────
+    row = (
+        await db.execute(
+            text("""
+                SELECT created_at
+                FROM swipes
+                WHERE swiper_id = CAST(:uid   AS uuid)
+                  AND swiped_id = CAST(:swiped AS uuid)
+                  AND direction = 'left'
+                  AND mode      = :mode
+            """).bindparams(
+                uid=str(current_user.id),
+                swiped=body.swiped_id,
+                mode=body.mode,
+            )
+        )
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No left-swipe found for this profile in the requested mode.",
+        )
+
+    swipe_time: datetime = row[0]
+    if swipe_time.tzinfo is None:
+        swipe_time = swipe_time.replace(tzinfo=timezone.utc)
+    elapsed = (now - swipe_time).total_seconds()
+    if elapsed > _REVERT_WINDOW_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The 5-minute revert window has expired for this swipe.",
+        )
+
+    # ── Delete the swipe ──────────────────────────────────────────────────────
+    await db.execute(
+        text("""
+            DELETE FROM swipes
+            WHERE swiper_id = CAST(:uid   AS uuid)
+              AND swiped_id = CAST(:swiped AS uuid)
+              AND mode      = :mode
+        """).bindparams(
+            uid=str(current_user.id),
+            swiped=body.swiped_id,
+            mode=body.mode,
+        )
+    )
+
+    current_user.daily_revert_used += 1
+    db.add(current_user)
+    await db.commit()
+
+    used = current_user.daily_revert_used
+    remaining = None if is_pro else max(0, _DAILY_REVERT_LIMIT - used)
+
+    return {
+        "reverted": True,
+        "swiped_id": body.swiped_id,
+        "reverts_used": used,
+        "reverts_remaining": remaining,
+        "reverts_limit": None if is_pro else _DAILY_REVERT_LIMIT,
+    }
 
 
 @router.get("/feed", summary="Get paginated discovery feed based on saved filters")

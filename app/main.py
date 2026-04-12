@@ -1,6 +1,9 @@
 from contextlib import asynccontextmanager
 import logging
+import time
 import uuid as _uuid
+from datetime import datetime, timezone
+from typing import Dict, Tuple
 
 from asyncpg.exceptions import ConnectionDoesNotExistError, TooManyConnectionsError
 from fastapi import FastAPI, Request
@@ -25,6 +28,7 @@ import app.models.pickup_line  # noqa: F401
 import app.models.subscription_plan  # noqa: F401
 import app.models.user_score  # noqa: F401
 import app.models.user_compatibility  # noqa: F401
+import app.models.ai_credits_transaction  # noqa: F401
 import app.models.gift_card  # noqa: F401
 import app.models.user_report  # noqa: F401
 import app.models.message  # noqa: F401
@@ -97,6 +101,25 @@ async def lifespan(app: FastAPI):
         )""",
         "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON user_blocks (blocker_id)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_balance INTEGER NOT NULL DEFAULT 0",
+        # subscriptions table — full event history for every purchase, renewal, cancellation
+        """CREATE TABLE IF NOT EXISTS subscriptions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            plan_name VARCHAR(128),
+            apple_product_id VARCHAR(256),
+            tier VARCHAR(32) NOT NULL,
+            interval VARCHAR(32),
+            price_usd NUMERIC(10,2),
+            revenuecat_customer_id VARCHAR(256),
+            event_type VARCHAR(64) NOT NULL,
+            starts_at TIMESTAMPTZ,
+            expires_at TIMESTAMPTZ,
+            cancelled_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_rc_customer ON subscriptions(revenuecat_customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_created ON subscriptions(created_at DESC)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits_reset_at TIMESTAMPTZ",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_import_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_import_reset_at TIMESTAMPTZ",
@@ -198,6 +221,11 @@ async def lifespan(app: FastAPI):
           END IF;
         END $$
         """,
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trust_score INTEGER NOT NULL DEFAULT 10",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_blacklisted BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_religions JSONB",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
     ]
     for _sql in _MIGRATIONS:
         try:
@@ -296,6 +324,61 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _log.warning("Travel mode expiry loop error (non-critical): %s", exc)
 
+    async def _expire_subscriptions():
+        """
+        Every 15 minutes: downgrade users whose subscription_expires_at has passed.
+        This is a safety net — the RevenueCat EXPIRATION webhook is the primary signal,
+        but webhooks can be delayed or missed. Also logs an EXPIRED event to subscriptions table.
+        """
+        from sqlalchemy import text as _text3
+        while True:
+            await asyncio.sleep(900)  # check every 15 minutes
+            try:
+                async with AsyncSessionLocal() as db:
+                    now = datetime.now(timezone.utc)
+                    # Find all paid users whose subscription has lapsed
+                    result = await db.execute(
+                        _text3("""
+                            SELECT id, subscription_tier, subscription_expires_at, revenuecat_customer_id
+                            FROM users
+                            WHERE subscription_tier IN ('pro', 'premium_plus')
+                              AND subscription_expires_at IS NOT NULL
+                              AND subscription_expires_at < :now
+                        """).bindparams(now=now)
+                    )
+                    expired_users = result.fetchall()
+                    if expired_users:
+                        ids = [str(row[0]) for row in expired_users]
+                        # Log EXPIRED events
+                        for row in expired_users:
+                            await db.execute(
+                                _text3("""
+                                    INSERT INTO subscriptions
+                                      (user_id, event_type, tier, revenuecat_customer_id, expires_at)
+                                    VALUES
+                                      (CAST(:uid AS uuid), 'AUTO_EXPIRED', 'free', :rc_id, :expires_at)
+                                """).bindparams(
+                                    uid=str(row[0]),
+                                    rc_id=row[3],
+                                    expires_at=row[2],
+                                )
+                            )
+                        # Bulk downgrade
+                        await db.execute(
+                            _text3("""
+                                UPDATE users
+                                SET subscription_tier = 'free', subscription_expires_at = NULL
+                                WHERE id = ANY(CAST(:ids AS uuid[]))
+                            """).bindparams(ids=ids)
+                        )
+                        await db.commit()
+                        _log.info(
+                            "Auto-expired %d subscription(s): %s",
+                            len(expired_users), ids,
+                        )
+            except Exception as exc:
+                _log.warning("Subscription expiry loop error (non-critical): %s", exc)
+
     async def _enable_bypass_location_for_tester():
         """
         On every startup: ensure the owner account has full admin access and
@@ -321,16 +404,10 @@ async def lifespan(app: FastAPI):
                     if not user.bypass_location_filter:
                         user.bypass_location_filter = True
                         changed = True
-                    # Clear all hard filter limits so the feed shows everyone
-                    if user.filter_max_distance_km is not None:
-                        user.filter_max_distance_km = None
-                        changed = True
-                    if user.filter_age_min is not None:
-                        user.filter_age_min = None
-                        changed = True
-                    if user.filter_age_max is not None:
-                        user.filter_age_max = None
-                        changed = True
+                    # Do NOT clear filter preferences — the owner should be able
+                    # to set and test filters just like any regular user.
+                    # bypass_location_filter=True already lets them see everyone
+                    # when no filter is applied.
                     if changed:
                         await db.commit()
                         _log.info(
@@ -344,6 +421,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_recover_stale_attempts()),
         asyncio.create_task(_expire_travel_modes()),
         asyncio.create_task(_enable_bypass_location_for_tester()),
+        asyncio.create_task(_expire_subscriptions()),
     }
     # Keep strong references so GC doesn't discard them before they finish
     for _t in _bg_tasks:
@@ -433,6 +511,13 @@ _APP_KEY_PUBLIC = (
     "/api/v1/subscription/webhook",
 )
 
+# ── Scan-required in-memory cache ─────────────────────────────────────────────
+# Avoids a DB hit on every authenticated request.
+# Entry: user_id → (face_req, id_req, expires_at_monotonic)
+# TTL: 60 seconds — short enough to pick up new flags quickly.
+_SCAN_CACHE_TTL = 60.0
+_scan_cache: Dict[str, Tuple[bool, bool, float]] = {}
+
 
 @app.middleware("http")
 async def app_key_gate(request: Request, call_next):
@@ -513,23 +598,31 @@ async def scan_required_gate(request: Request, call_next):
     except (JWTError, ValueError):
         return await call_next(request)
 
-    # Single lightweight query — only fetch the two flag columns
+    # Check in-memory cache first to avoid a DB hit on every authenticated request
     from sqlalchemy import text as _text2
-    try:
-        async with AsyncSessionLocal() as db:
-            row = (await db.execute(
-                _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
-                {"uid": str(uid)},
-            )).fetchone()
-    except _asyncio.CancelledError:
-        raise  # shutdown — propagate without noise
-    except Exception:
-        return await call_next(request)
+    uid_str = str(uid)
+    now_mono = time.monotonic()
 
-    if row is None:
-        return await call_next(request)
+    cached = _scan_cache.get(uid_str)
+    if cached and now_mono < cached[2]:
+        face_req, id_req = cached[0], cached[1]
+    else:
+        try:
+            async with AsyncSessionLocal() as db:
+                row = (await db.execute(
+                    _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
+                    {"uid": uid_str},
+                )).fetchone()
+        except _asyncio.CancelledError:
+            raise  # shutdown — propagate without noise
+        except Exception:
+            return await call_next(request)
 
-    face_req, id_req = bool(row[0]), bool(row[1])
+        if row is None:
+            return await call_next(request)
+
+        face_req, id_req = bool(row[0]), bool(row[1])
+        _scan_cache[uid_str] = (face_req, id_req, now_mono + _SCAN_CACHE_TTL)
 
     if face_req:
         return JSONResponse(

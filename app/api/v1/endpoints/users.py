@@ -1,7 +1,8 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
@@ -20,6 +21,35 @@ async def _require_admin(current_user: User = Depends(get_current_user)) -> User
             detail="Admin access required.",
         )
     return current_user
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT, summary="Soft-delete the current user's account")
+async def delete_my_account(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Marks the account as deleted (soft delete).
+
+    - All profile data is retained in the database so the phone/social ID
+      can be re-used for a fresh sign-up later.
+    - On re-registration with the same phone/Apple/Facebook ID the row is
+      automatically reset to a blank profile and onboarding is restarted.
+    - All active refresh tokens are revoked immediately.
+    """
+    from app.models.refresh_token import RefreshToken  # local import avoids circular
+
+    now = datetime.now(timezone.utc)
+    current_user.is_deleted  = True
+    current_user.deleted_at  = now
+    current_user.is_active   = False
+
+    # Revoke every refresh token belonging to this user so existing sessions
+    # immediately stop working.
+    await db.execute(
+        delete(RefreshToken).where(RefreshToken.user_id == str(current_user.id))
+    )
+    await db.commit()
 
 
 @router.get("/", response_model=list[UserResponse])

@@ -81,10 +81,12 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "notif_promotions", "notif_dating_tips",
     # Halal profile fields
     "sect_id", "prayer_frequency_id", "marriage_timeline_id",
-    "wali_email", "blur_photos_halal", "halal_mode_enabled", "work_mode_enabled",
+    "wali_email", "wali_verified", "blur_photos_halal", "halal_mode_enabled", "work_mode_enabled",
     # Halal filters
     "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
     "filter_wali_verified_only", "filter_wants_to_work",
+    # Religion filter (basic, free)
+    "filter_religions",
 })
 
 _LIFESTYLE_KEYS: frozenset[str] = frozenset({"drinking", "smoking", "exercise", "diet"})
@@ -137,7 +139,7 @@ async def update_me(
     # Enforce Pro subscription for Pro-gated feature and filter fields.
     # Return explicit 403 so free users (and anyone bypassing the frontend)
     # receive a clear error rather than a silent no-op.
-    if current_user.subscription_tier != "pro":
+    if current_user.subscription_tier not in ("pro", "premium_plus"):
         # Feature fields — hard reject
         pro_feature_attempted = _PRO_ONLY_PROFILE_FIELDS & update_data.keys()
         if pro_feature_attempted:
@@ -370,6 +372,7 @@ async def check_email(
 _FILTER_FIELDS: frozenset[str] = frozenset({
     "filter_age_min", "filter_age_max", "filter_max_distance_km",
     "filter_verified_only", "filter_star_signs", "filter_interests", "filter_languages",
+    "filter_religions",
     "filter_purpose", "filter_looking_for", "filter_education_level",
     "filter_family_plans", "filter_have_kids", "filter_ethnicities",
     "filter_exercise", "filter_drinking", "filter_smoking",
@@ -406,7 +409,7 @@ async def update_filters(
 
     # Reject Pro-only filters for free users — explicit 403 so any client
     # attempting to bypass frontend checks gets a clear error.
-    if current_user.subscription_tier != "pro":
+    if current_user.subscription_tier not in ("pro", "premium_plus"):
         pro_attempted = _PRO_FILTER_FIELDS & data.keys()
         if pro_attempted:
             raise HTTPException(

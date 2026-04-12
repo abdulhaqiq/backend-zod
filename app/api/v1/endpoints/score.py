@@ -1,9 +1,10 @@
 """
 Score endpoints
 ===============
-GET  /score/me                    — return my current score (compute if missing)
-POST /score/me/refresh            — force-recompute my score using latest profile data
-GET  /score/vs/{other_user_id}    — get compatibility % between me and another user
+GET  /score/me                           — return my current score (compute if missing)
+POST /score/me/refresh                   — force-recompute my score using latest profile data
+GET  /score/vs/{other_user_id}           — get compatibility % between me and another user (saves to DB)
+GET  /score/vs/{other_user_id}/cached    — return saved compatibility without charging credits (null if none)
 """
 import uuid
 import logging
@@ -16,11 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
+from app.models.user_compatibility import UserCompatibility
 from app.models.user_score import UserScore
 from app.services.scoring import (
     compute_and_save_score,
     get_or_create_score,
-    compatibility_between,
+    get_or_compute_compatibility,
     CATEGORIES,
 )
 
@@ -105,7 +107,7 @@ async def get_compatibility(
 ):
     """
     Compute pairwise compatibility between the current user and another.
-    Returns a 0-100 percent match, a tier label, and per-category breakdown.
+    Persists the result in user_compatibility table for future free retrieval.
     """
     other = await db.scalar(
         select(User).where(User.id == other_user_id, User.is_active == True)
@@ -116,11 +118,44 @@ async def get_compatibility(
     my_score    = await get_or_create_score(current_user, db)
     their_score = await get_or_create_score(other, db)
 
-    result = compatibility_between(my_score, their_score)
+    result = await get_or_compute_compatibility(current_user, other, db)
     return CompatibilityResponse(
         percent       = result["percent"],
         tier          = result["tier"],
         breakdown     = result["breakdown"],
         my_overall    = my_score.overall or 7.0,
         their_overall = their_score.overall or 7.0,
+    )
+
+
+@router.get("/vs/{other_user_id}/cached", response_model=CompatibilityResponse | None)
+async def get_compatibility_cached(
+    other_user_id: uuid.UUID,
+    current_user:  User       = Depends(get_current_user),
+    db:            AsyncSession = Depends(get_db),
+):
+    """
+    Return the stored compatibility score without computing or charging credits.
+    Returns null (204) if no compatibility has been computed yet for this pair.
+    """
+    uid_a, uid_b = sorted([current_user.id, other_user_id], key=lambda u: str(u))
+    existing: UserCompatibility | None = await db.scalar(
+        select(UserCompatibility).where(
+            UserCompatibility.user_a_id == uid_a,
+            UserCompatibility.user_b_id == uid_b,
+        )
+    )
+    if not existing:
+        return None
+
+    my_score    = await get_or_create_score(current_user, db)
+    other       = await db.scalar(select(User).where(User.id == other_user_id))
+    their_score = await get_or_create_score(other, db) if other else None
+
+    return CompatibilityResponse(
+        percent       = existing.percent,
+        tier          = existing.tier,
+        breakdown     = existing.breakdown or {},
+        my_overall    = my_score.overall or 7.0,
+        their_overall = (their_score.overall if their_score else 7.0) or 7.0,
     )

@@ -108,6 +108,10 @@ class User(Base):
     daily_work_connects_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     daily_work_connects_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Daily revert / undo-dislike (free: 3/day; pro: unlimited) ─────────────
+    daily_revert_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    daily_revert_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # ── AI Credits (shared wallet for all AI features) ────────────────────────
     # Pro: 10/month, Premium+: 25/month, Free: 0. Also purchasable as consumable.
     ai_credits_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -168,6 +172,7 @@ class User(Base):
     filter_star_signs:      Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
     filter_interests:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
     filter_languages:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
+    filter_religions:       Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id] category=religion
     # Pro-only filters
     filter_purpose:         Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [relationship_types.id]
     filter_looking_for:     Mapped[list | None] = mapped_column(JSONB, nullable=True)    # [lookup_options.id]
@@ -252,6 +257,14 @@ class User(Base):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_onboarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Soft-delete: account is hidden but data is retained so the phone number
+    # can be re-used.  On re-registration the row is reset to a blank profile.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Safety / trust ───────────────────────────────────────────────────────
+    trust_score:        Mapped[int]  = mapped_column(Integer, default=10, nullable=False)
+    device_blacklisted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -102,6 +102,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _check_ban_status(user: "User", incoming_device_id: "str | None" = None) -> None:
+    """Raise 403 if the account is banned or the device is blacklisted.
+    Soft-deleted accounts are intentionally NOT rejected here — they will be
+    reset to a fresh profile by the caller before a token is issued."""
+    if user.device_blacklisted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This device has been permanently banned.",
+        )
+    # Only block accounts that are both banned (trust_score <= 0) AND inactive.
+    # Soft-deleted accounts have is_active=False but is_deleted=True, so the
+    # caller resets them first — by the time we reach this check is_deleted is
+    # already False and is_active is True.
+    if user.trust_score is not None and user.trust_score <= 0 and not user.is_active and not user.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been banned.",
+        )
+
+
 async def _issue_token_pair(
     user_id: str,
     db: AsyncSession,
@@ -131,6 +151,18 @@ async def _issue_token_pair(
         result = await db.execute(select(User).where(User.id == user_id))
         user_row = result.scalar_one_or_none()
         if user_row:
+            # Reject if any other account sharing this device_id has been blacklisted
+            blacklisted_result = await db.execute(
+                select(User.id).where(
+                    User.device_id == device.device_id,
+                    User.device_blacklisted.is_(True),
+                ).limit(1)
+            )
+            if blacklisted_result.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This device has been permanently banned.",
+                )
             user_row.device_id = device.device_id
 
     await db.flush()
@@ -146,12 +178,93 @@ async def _get_or_create_user_by_phone(phone: str, db: AsyncSession) -> User:
     result = await db.execute(select(User).where(User.phone == phone))
     user = result.scalar_one_or_none()
     if not user:
-        user = User(phone=phone, is_verified=True)
+        user = User(phone=phone, is_verified=True, filter_max_distance_km=20)
         db.add(user)
         await db.flush()
+    elif user.is_deleted:
+        # Re-registration after soft-delete — reset all profile data so the
+        # user goes through onboarding fresh without a duplicate phone row.
+        _reset_deleted_user(user)
     elif not user.is_verified:
         user.is_verified = True
     return user
+
+
+def _reset_deleted_user(user: "User") -> None:
+    """Wipe all profile/onboarding fields so a soft-deleted user can re-register fresh."""
+    from datetime import datetime, timezone as _tz
+    user.is_deleted          = False
+    user.deleted_at          = None
+    user.is_active           = True
+    user.is_onboarded        = False
+    user.is_verified         = True
+    user.full_name           = None
+    user.date_of_birth       = None
+    user.gender_id           = None
+    user.bio                 = None
+    user.purpose             = None
+    user.height_cm           = None
+    user.interests           = None
+    user.lifestyle           = None
+    user.values_list         = None
+    user.prompts             = None
+    user.photos              = None
+    user.voice_prompts       = None
+    user.causes              = None
+    user.work_experience     = None
+    user.education           = None
+    user.city                = None
+    user.hometown            = None
+    user.address             = None
+    # Halal / work profile
+    user.sect_id             = None
+    user.prayer_frequency_id = None
+    user.marriage_timeline_id = None
+    user.wali_email          = None
+    user.wali_verified       = False
+    user.blur_photos_halal   = False
+    user.halal_mode_enabled  = False
+    user.work_mode_enabled   = False
+    user.work_photos         = None
+    user.work_prompts        = None
+    user.work_matching_goals = None
+    user.work_are_you_hiring = None
+    user.work_headline       = None
+    user.work_persona        = None
+    # Verification
+    user.verification_status = "unverified"
+    user.face_match_score    = None
+    user.face_scan_required  = False
+    user.id_scan_required    = False
+    # Subscription — downgrade to free
+    user.subscription_tier       = "free"
+    user.subscription_expires_at = None
+    user.revenuecat_customer_id  = None
+    # Safety — reset trust score; device_blacklisted intentionally kept
+    # so a banned device can't exploit delete-and-re-register to bypass bans.
+    user.trust_score = 10
+    # Mood
+    user.mood_emoji = None
+    user.mood_text  = None
+    # Filters — clear all saved preferences
+    user.filter_age_min         = None
+    user.filter_age_max         = None
+    user.filter_max_distance_km = 20
+    user.filter_verified_only   = False
+    user.filter_star_signs      = None
+    user.filter_interests       = None
+    user.filter_languages       = None
+    user.filter_religions       = None
+    user.filter_ethnicities     = None
+    user.filter_looking_for     = None
+    user.filter_education_level = None
+    user.filter_family_plans    = None
+    user.filter_have_kids       = None
+    user.filter_sect            = None
+    user.filter_prayer_frequency = None
+    user.filter_marriage_timeline = None
+    user.filter_wali_verified_only = False
+    user.filter_wants_to_work   = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +430,9 @@ async def verify_otp_endpoint(
     # (e.g. snoozed account) doesn't permanently burn the code.
     user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
 
+    # Reject banned accounts / blacklisted devices before doing anything else.
+    _check_ban_status(user, incoming_device_id=payload.device.device_id if payload.device else None)
+
     # Signing in is an intentional action — if the account was snoozed
     # (is_active=False via the snooze toggle), automatically re-activate it.
     # A hard-banned account would need a separate flag; is_active alone is
@@ -381,7 +497,13 @@ async def apple_sign_in(request: Request, payload: AppleAuthRequest, db: AsyncSe
         )
         db.add(user)
         await db.flush()
+    elif user.is_deleted:
+        _reset_deleted_user(user)
+        user.apple_id = apple_id
+        if email:
+            user.email = email
 
+    _check_ban_status(user)
     if not user.is_active:
         user.is_active = True  # Re-activate on sign-in (un-snooze)
     await db.flush()
@@ -423,7 +545,13 @@ async def facebook_sign_in(request: Request, payload: FacebookAuthRequest, db: A
         )
         db.add(user)
         await db.flush()
+    elif user.is_deleted:
+        _reset_deleted_user(user)
+        user.facebook_id = facebook_id
+        if email:
+            user.email = email
 
+    _check_ban_status(user)
     if not user.is_active:
         user.is_active = True  # Re-activate on sign-in (un-snooze)
     await db.flush()

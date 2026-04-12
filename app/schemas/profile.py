@@ -116,6 +116,7 @@ class ProfileUpdateRequest(BaseModel):
     prayer_frequency_id:  int | None = None                # lookup_options (category=prayer_frequency)
     marriage_timeline_id: int | None = None                # lookup_options (category=marriage_timeline)
     wali_email:           str | None = Field(None, max_length=255)
+    wali_verified:        bool | None = None               # can be set by the user themselves
     blur_photos_halal:    bool | None = None
     halal_mode_enabled:   bool | None = None
     work_mode_enabled:    bool | None = None
@@ -131,6 +132,7 @@ class ProfileUpdateRequest(BaseModel):
     filter_star_signs:      list[int] | None = None        # [lookup_options.id] category=star_sign
     filter_interests:       list[int] | None = None        # [lookup_options.id] category=interests
     filter_languages:       list[int] | None = None        # [lookup_options.id] category=language
+    filter_religions:       list[int] | None = None        # [lookup_options.id] category=religion
     # Pro-only (backend ignores if not pro)
     filter_purpose:         list[int] | None = None        # [relationship_types.id]
     filter_looking_for:     list[int] | None = None        # [lookup_options.id]
@@ -163,6 +165,7 @@ class FilterUpdateRequest(BaseModel):
     filter_star_signs:      list[int] | None = None
     filter_interests:       list[int] | None = None
     filter_languages:       list[int] | None = None
+    filter_religions:       list[int] | None = None        # basic, free filter
     # Pro-only (backend silently ignores if user is not pro)
     filter_purpose:         list[int] | None = None
     filter_looking_for:     list[int] | None = None
@@ -265,6 +268,7 @@ class MeResponse(BaseModel):
     filter_star_signs:      list[int] | None
     filter_interests:       list[int] | None
     filter_languages:       list[int] | None
+    filter_religions:       list[int] | None
     filter_purpose:         list[int] | None
     filter_looking_for:     list[int] | None
     filter_education_level: list[int] | None
@@ -321,6 +325,7 @@ class MeResponse(BaseModel):
     linkedin_import_count: int = 0
     linkedin_import_reset_at: datetime | None = None
     super_likes_remaining: int
+    daily_revert_used: int = 0
     is_active: bool
     is_verified: bool
     is_onboarded: bool
