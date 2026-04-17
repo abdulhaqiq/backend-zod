@@ -3,7 +3,9 @@ Authentication endpoints:
   POST /auth/phone/send-otp    — send OTP via SMS or WhatsApp (Twilio)
   POST /auth/phone/verify-otp  — verify OTP, return token pair
   POST /auth/phone/resend-otp  — resend OTP (same rate limits as send)
+  POST /auth/phone/link        — link a verified phone to an existing social account
   POST /auth/apple             — Apple Sign In
+  POST /auth/google            — Google Sign In
   POST /auth/facebook          — Facebook Sign In
   POST /auth/refresh           — refresh access token
   POST /auth/logout            — revoke refresh token
@@ -23,6 +25,7 @@ from app.core.security import (
     verify_otp,
 )
 from app.db.session import get_db
+from app.models.login_event import LoginEvent
 from app.models.otp import OtpCode
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
@@ -30,7 +33,9 @@ from app.schemas.auth import (
     AppleAuthRequest,
     DeviceInfo,
     FacebookAuthRequest,
+    GoogleAuthRequest,
     OtpSentResponse,
+    PhoneLinkRequest,
     PhoneSendOtpRequest,
     PhoneVerifyOtpRequest,
     RefreshRequest,
@@ -38,6 +43,7 @@ from app.schemas.auth import (
 )
 from app.services.apple_auth import verify_apple_token
 from app.services.facebook_auth import verify_facebook_token
+from app.services.google_auth import verify_google_token
 from app.services.twilio_service import send_otp as twilio_send_otp
 
 import random
@@ -102,6 +108,22 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _get_client_ip(request: Request) -> str | None:
+    """
+    Extract the real client IP from the request, preferring proxy headers.
+    Checks X-Forwarded-For, X-Real-IP, CF-Connecting-IP (Cloudflare),
+    then falls back to the direct connection address.
+    """
+    for header in ("x-forwarded-for", "x-real-ip", "cf-connecting-ip"):
+        value = request.headers.get(header)
+        if value:
+            # X-Forwarded-For can be "client, proxy1, proxy2" — take leftmost
+            return value.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
 def _check_ban_status(user: "User", incoming_device_id: "str | None" = None) -> None:
     """Raise 403 if the account is banned or the device is blacklisted.
     Soft-deleted accounts are intentionally NOT rejected here — they will be
@@ -126,6 +148,9 @@ async def _issue_token_pair(
     user_id: str,
     db: AsyncSession,
     device: "DeviceInfo | None" = None,
+    is_new_user: bool = False,
+    auth_method: str = "unknown",
+    request: "Request | None" = None,
 ) -> TokenResponse:
     """Create a new access + refresh token pair and persist the refresh token hash."""
     access_token = create_access_token(subject=user_id)
@@ -135,13 +160,21 @@ async def _issue_token_pair(
     now = _now()
     expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
+    # Server-derived IP (trusted) — always prefer this over client-reported
+    server_ip = _get_client_ip(request) if request else None
+    user_agent = request.headers.get("user-agent") if request else None
+
+    # Use server IP for storage; fall back to client-reported only when
+    # running behind a local dev proxy that strips headers
+    resolved_ip = server_ip or (device.ip_address if device else None)
+
     db.add(RefreshToken(
         user_id=user_id,
         token_hash=token_hash,
         expires_at=expires_at,
-        device_name=device.device_model if device else None,
+        device_name=device.device_name or device.device_model if device else None,
         device_os=device.device_os if device else None,
-        ip_address=device.ip_address if device else None,
+        ip_address=resolved_ip,
         last_used_at=now,
     ))
 
@@ -165,29 +198,51 @@ async def _issue_token_pair(
                 )
             user_row.device_id = device.device_id
 
+    # Write immutable login audit event
+    db.add(LoginEvent(
+        user_id=user_id,
+        auth_method=auth_method,
+        is_new_user=is_new_user,
+        success=True,
+        ip_address=resolved_ip,
+        user_agent=user_agent,
+        device_id=device.device_id if device else None,
+        device_model=device.device_model if device else None,
+        device_os=device.device_os if device else None,
+        device_name=device.device_name if device else None,
+        app_version=device.app_version if device else None,
+        network_type=device.network_type if device else None,
+        carrier=device.carrier if device else None,
+    ))
+
     await db.flush()
 
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        is_new_user=is_new_user,
     )
 
 
-async def _get_or_create_user_by_phone(phone: str, db: AsyncSession) -> User:
+async def _get_or_create_user_by_phone(phone: str, db: AsyncSession) -> tuple["User", bool]:
+    """Returns (user, is_new_user) — is_new_user is True when the row was just created."""
     result = await db.execute(select(User).where(User.phone == phone))
     user = result.scalar_one_or_none()
     if not user:
-        user = User(phone=phone, is_verified=True, filter_max_distance_km=20)
+        user = User(phone=phone, is_verified=False, face_scan_required=True, filter_max_distance_km=20)
         db.add(user)
         await db.flush()
+        return user, True
     elif user.is_deleted:
         # Re-registration after soft-delete — reset all profile data so the
         # user goes through onboarding fresh without a duplicate phone row.
         _reset_deleted_user(user)
-    elif not user.is_verified:
-        user.is_verified = True
-    return user
+        return user, True
+    elif not user.is_verified and not user.face_scan_required:
+        # Existing user who never completed face verification — send them through it now
+        user.face_scan_required = True
+    return user, False
 
 
 def _reset_deleted_user(user: "User") -> None:
@@ -197,7 +252,8 @@ def _reset_deleted_user(user: "User") -> None:
     user.deleted_at          = None
     user.is_active           = True
     user.is_onboarded        = False
-    user.is_verified         = True
+    user.is_verified         = False
+    user.face_scan_required  = True
     user.full_name           = None
     user.date_of_birth       = None
     user.gender_id           = None
@@ -428,7 +484,7 @@ async def verify_otp_endpoint(
 
     # Upsert user — do this BEFORE consuming the OTP so a recoverable error
     # (e.g. snoozed account) doesn't permanently burn the code.
-    user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
+    user, is_new_user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
 
     # Reject banned accounts / blacklisted devices before doing anything else.
     _check_ban_status(user, incoming_device_id=payload.device.device_id if payload.device else None)
@@ -457,8 +513,83 @@ async def verify_otp_endpoint(
             otp.network_type = d.network_type
     await db.commit()
 
-    token_pair = await _issue_token_pair(user_id=str(user.id), db=db, device=payload.device)
+    token_pair = await _issue_token_pair(
+        user_id=str(user.id), db=db, device=payload.device,
+        is_new_user=is_new_user, auth_method="phone_otp", request=request,
+    )
     return token_pair
+
+
+# Import here (not at top) to avoid circular import with app.core.deps
+from app.core.deps import get_current_user as _get_current_user  # noqa: E402
+
+
+@router.post(
+    "/phone/link",
+    summary="Link a verified phone number to the current (social) account",
+)
+@limiter.limit("10/minute")
+async def link_phone_to_account(
+    request: Request,
+    payload: PhoneLinkRequest,
+    current_user: User = Depends(_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    After a social sign-in (Google / Apple) for a new user, the mobile app
+    collects and verifies a phone number then calls this endpoint to attach it
+    to the already-authenticated account.  Unlike /phone/verify-otp this
+    endpoint does NOT create a new user — it only updates the phone on the
+    account that owns the provided Bearer token.
+    """
+    now = _now()
+
+    result = await db.execute(
+        select(OtpCode).where(
+            OtpCode.phone == payload.phone,
+            OtpCode.verified_at.is_(None),
+            OtpCode.expires_at > now,
+        ).order_by(OtpCode.created_at.desc())
+    )
+    otp = result.scalars().first()
+
+    if otp is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active OTP found. Please request a new one.",
+        )
+
+    if not _is_test_phone(payload.phone) and otp.blocked_until and otp.blocked_until > now:
+        remaining = int((otp.blocked_until - now).total_seconds() / 60)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed attempts. Try again in {remaining} minutes.",
+        )
+
+    if not verify_otp(payload.code, otp.code_hash):
+        otp.attempt_count += 1
+        if otp.attempt_count >= settings.OTP_MAX_ATTEMPTS:
+            otp.blocked_until = now + timedelta(minutes=settings.OTP_BLOCK_MINUTES)
+        await db.commit()
+
+        if otp.attempt_count >= settings.OTP_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Too many failed attempts. Phone blocked for {settings.OTP_BLOCK_MINUTES} minutes.",
+            )
+
+        remaining_attempts = settings.OTP_MAX_ATTEMPTS - otp.attempt_count
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid OTP code. {remaining_attempts} attempt(s) remaining.",
+        )
+
+    # OTP is valid — consume it and attach the phone to this account
+    otp.verified_at = now
+    current_user.phone = payload.phone
+    await db.commit()
+
+    return {"message": "Phone linked successfully"}
 
 
 @router.post(
@@ -493,22 +624,30 @@ async def apple_sign_in(request: Request, payload: AppleAuthRequest, db: AsyncSe
             apple_id=apple_id,
             email=email,
             full_name=payload.full_name,
-            is_verified=True,
+            is_verified=False,
+            face_scan_required=True,
         )
         db.add(user)
         await db.flush()
+        is_new_user = True
     elif user.is_deleted:
         _reset_deleted_user(user)
         user.apple_id = apple_id
         if email:
             user.email = email
+        is_new_user = True
+    else:
+        is_new_user = False
 
     _check_ban_status(user)
     if not user.is_active:
         user.is_active = True  # Re-activate on sign-in (un-snooze)
     await db.flush()
 
-    return await _issue_token_pair(user_id=str(user.id), db=db)
+    return await _issue_token_pair(
+        user_id=str(user.id), db=db, device=payload.device,
+        is_new_user=is_new_user, auth_method="apple", request=request,
+    )
 
 
 @router.post(
@@ -541,22 +680,86 @@ async def facebook_sign_in(request: Request, payload: FacebookAuthRequest, db: A
             facebook_id=facebook_id,
             email=email,
             full_name=fb_data.get("name"),
-            is_verified=True,
+            is_verified=False,
+            face_scan_required=True,
         )
         db.add(user)
         await db.flush()
+        is_new_user = True
     elif user.is_deleted:
         _reset_deleted_user(user)
         user.facebook_id = facebook_id
         if email:
             user.email = email
+        is_new_user = True
+    else:
+        is_new_user = False
 
     _check_ban_status(user)
     if not user.is_active:
         user.is_active = True  # Re-activate on sign-in (un-snooze)
     await db.flush()
 
-    return await _issue_token_pair(user_id=str(user.id), db=db)
+    return await _issue_token_pair(
+        user_id=str(user.id), db=db, device=payload.device,
+        is_new_user=is_new_user, auth_method="facebook", request=request,
+    )
+
+
+@router.post(
+    "/google",
+    response_model=TokenResponse,
+    summary="Sign in with Google",
+)
+@limiter.limit("20/minute")
+async def google_sign_in(request: Request, payload: GoogleAuthRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        google_data = await verify_google_token(payload.access_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+
+    google_id = google_data["google_id"]
+    email = google_data.get("email")
+
+    # Look up existing user by google_id first, then by email
+    result = await db.execute(select(User).where(User.google_id == google_id))
+    user = result.scalar_one_or_none()
+
+    if user is None and email:
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        if user:
+            user.google_id = google_id
+
+    if user is None:
+        user = User(
+            google_id=google_id,
+            email=email,
+            full_name=google_data.get("name"),
+            is_verified=False,
+            face_scan_required=True,
+        )
+        db.add(user)
+        await db.flush()
+        is_new_user = True
+    elif user.is_deleted:
+        _reset_deleted_user(user)
+        user.google_id = google_id
+        if email:
+            user.email = email
+        is_new_user = True
+    else:
+        is_new_user = False
+
+    _check_ban_status(user)
+    if not user.is_active:
+        user.is_active = True  # Re-activate on sign-in (un-snooze)
+    await db.flush()
+
+    return await _issue_token_pair(
+        user_id=str(user.id), db=db, device=payload.device,
+        is_new_user=is_new_user, auth_method="google", request=request,
+    )
 
 
 @router.post(
@@ -602,7 +805,10 @@ async def refresh_token(request: Request, payload: RefreshRequest, db: AsyncSess
         ip_address=stored.ip_address,
     ) if (stored.device_name or stored.ip_address) else None
 
-    return await _issue_token_pair(user_id=str(stored.user_id), db=db, device=carried_device)
+    return await _issue_token_pair(
+        user_id=str(stored.user_id), db=db, device=carried_device,
+        auth_method="refresh", request=request,
+    )
 
 
 @router.post(
@@ -718,3 +924,44 @@ async def revoke_all_sessions(
     tokens = result.scalars().all()
     for t in tokens:
         t.revoked_at = now
+
+
+@router.get(
+    "/login-history",
+    summary="Get my login / sign-in history",
+)
+async def get_login_history(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the most recent login events for the authenticated user."""
+    from sqlalchemy import desc as _desc
+    result = await db.execute(
+        select(LoginEvent)
+        .where(LoginEvent.user_id == current_user.id)
+        .order_by(_desc(LoginEvent.created_at))
+        .limit(min(limit, 200))
+    )
+    events = result.scalars().all()
+    return {
+        "events": [
+            {
+                "id": str(e.id),
+                "auth_method": e.auth_method,
+                "is_new_user": e.is_new_user,
+                "ip_address": e.ip_address,
+                "user_agent": e.user_agent,
+                "device_id": e.device_id,
+                "device_model": e.device_model,
+                "device_os": e.device_os,
+                "device_name": e.device_name,
+                "app_version": e.app_version,
+                "network_type": e.network_type,
+                "carrier": e.carrier,
+                "created_at": e.created_at.isoformat(),
+            }
+            for e in events
+        ],
+        "total": len(events),
+    }

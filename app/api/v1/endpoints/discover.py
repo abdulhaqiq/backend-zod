@@ -1564,7 +1564,35 @@ async def get_discover_feed(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    FREE_DAILY_LIKE_LIMIT = 20
+
+    # ── Check daily like limit before fetching profiles ───────────────────────
+    is_free = current_user.subscription_tier == "free"
+    daily_likes_remaining: int | None = None
+    daily_limit_reached = False
+
+    if is_free and mode != "work":
+        now_utc = datetime.now(timezone.utc)
+        dl_reset = current_user.daily_likes_reset_at
+
+        # Auto-reset counter if a new UTC day has begun
+        if dl_reset is None or dl_reset.date() < now_utc.date():
+            await db.execute(
+                text(
+                    "UPDATE users SET daily_likes_used = 0, daily_likes_reset_at = :now "
+                    "WHERE id = CAST(:uid AS uuid)"
+                ).bindparams(now=now_utc, uid=str(current_user.id))
+            )
+            await db.commit()
+            current_user.daily_likes_used = 0
+            current_user.daily_likes_reset_at = now_utc
+
+        used = current_user.daily_likes_used or 0
+        daily_likes_remaining = max(0, FREE_DAILY_LIKE_LIMIT - used)
+        daily_limit_reached = used >= FREE_DAILY_LIKE_LIMIT
+
     profiles = await _fetch_discover_profiles(current_user, db, page, limit, mode=mode, halal=halal)
+
     return {
         "page": page,
         "limit": limit,
@@ -1572,4 +1600,11 @@ async def get_discover_feed(
         "halal": halal,
         "profiles": profiles,
         "has_more": len(profiles) == limit,
+        # ── Daily like status (free users, date mode only) ────────────────────
+        # When daily_limit_reached=True the client should show the upgrade screen
+        # inline in the feed instead of a blank page.
+        "daily_limit_reached":  daily_limit_reached,
+        "daily_likes_remaining": daily_likes_remaining,
+        "daily_likes_limit":    FREE_DAILY_LIKE_LIMIT if is_free else None,
+        "is_pro":               not is_free,
     }

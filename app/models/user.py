@@ -33,6 +33,9 @@ class User(Base):
     apple_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    google_id: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     facebook_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )

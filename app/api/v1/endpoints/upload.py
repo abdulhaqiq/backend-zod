@@ -47,11 +47,75 @@ FACE_MATCH_THRESHOLD = 60.0   # AWS Rekognition CompareFaces similarity threshol
 
 
 
-def _to_jpeg_bytes(img_bytes: bytes) -> bytes:
-    """Convert image to JPEG bytes for Rekognition. Handles WebP/HEIC/PNG → JPEG."""
+_REKOGNITION_MAX_BYTES = 5 * 1024 * 1024   # 5 MB hard limit
+_JPEG_MAX_DIMENSION   = 1920               # resize long-edge before quality reduction
+_STORAGE_DIMENSION    = 1024              # final square crop size stored to DO Spaces
+
+
+def _crop_square_1024(img_bytes: bytes) -> bytes:
+    """
+    Center-crop the image to a square, then resize to 1024×1024.
+    This is applied to every profile photo before it is uploaded to storage.
+
+    Steps:
+      1. Open with HEIC support
+      2. Center-crop to the smaller dimension (portrait → square, landscape → square)
+      3. Resize to 1024×1024 with high-quality Lanczos resampling
+      4. Save as JPEG quality 88
+    """
     from PIL import Image
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except ImportError:
+        pass
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = img.size
+
+    # Center-crop to square
+    side = min(w, h)
+    left   = (w - side) // 2
+    top    = (h - side) // 2
+    img    = img.crop((left, top, left + side, top + side))
+
+    # Resize to 1024×1024
+    img = img.resize((_STORAGE_DIMENSION, _STORAGE_DIMENSION), Image.LANCZOS)
+
     buf = io.BytesIO()
-    Image.open(io.BytesIO(img_bytes)).convert("RGB").save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=88, optimize=True)
+    return buf.getvalue()
+
+
+def _to_jpeg_bytes(img_bytes: bytes) -> bytes:
+    """
+    Convert any format (JPEG/PNG/WebP/HEIC) to a JPEG under Rekognition's 5 MB limit.
+    Resizes long edge to 1920 px, then reduces quality until size is within limits.
+    """
+    from PIL import Image
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except ImportError:
+        pass
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    w, h = img.size
+    if max(w, h) > _JPEG_MAX_DIMENSION:
+        scale = _JPEG_MAX_DIMENSION / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    for quality in (85, 75, 65, 50, 40):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= _REKOGNITION_MAX_BYTES:
+            return buf.getvalue()
+
+    w2, h2 = img.size
+    img = img.resize((w2 // 2, h2 // 2), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=40, optimize=True)
     return buf.getvalue()
 
 
@@ -95,7 +159,7 @@ def _detect_face_fast(img_bytes: bytes):
 
         face       = faces[0]
         confidence = face.get("Confidence", 0.0)
-        if confidence < 85.0:
+        if confidence < 70.0:
             return False, "Face not clearly visible. Please ensure good lighting and look directly at the camera.", None, None, None
 
         quality    = face.get("Quality", {})
@@ -121,52 +185,65 @@ def _detect_face_fast(img_bytes: bytes):
         return False, "Could not process image. Please try again.", None, None, None
 
 
+def _compare_selfie_to_url(selfie_jpeg: bytes, url: str) -> float:
+    """Compare selfie against a single profile photo URL. Returns similarity %."""
+    try:
+        resp = httpx.get(url, timeout=8, follow_redirects=True)
+        if resp.status_code != 200:
+            _log.warning("[FACE MATCH] Could not fetch %s (HTTP %d)", url.split("/")[-1][:24], resp.status_code)
+            return 0.0
+
+        target_jpeg = _to_jpeg_bytes(resp.content)
+        client = _rekognition_client()
+        rek_resp = client.compare_faces(
+            SourceImage={"Bytes": selfie_jpeg},
+            TargetImage={"Bytes": target_jpeg},
+            SimilarityThreshold=0,
+        )
+        matches = rek_resp.get("FaceMatches", [])
+        pct = float(matches[0]["Similarity"]) if matches else 0.0
+        _log.info("[FACE MATCH] Rekognition vs %s → %.1f%%", url.split("/")[-1][:24], pct)
+        return pct
+    except Exception as exc:
+        _log.warning("[FACE MATCH] Error vs %s: %s", url.split("/")[-1][:24], exc)
+        return 0.0
+
+
 def _match_against_photos(
     selfie_img_bytes: bytes,
     photo_urls: list[str],
 ) -> tuple[float, int]:
     """
-    Face matching using AWS Rekognition CompareFaces exclusively.
+    Compare selfie against up to 3 profile photos in parallel using Rekognition.
     Returns (best_similarity_pct, photos_compared).
+    Passing requires best_pct >= FACE_MATCH_THRESHOLD (any one photo is enough).
     """
-    best_pct = 0.0
-    compared = 0
+    if not photo_urls:
+        return 0.0, 0
 
     try:
         selfie_jpeg = _to_jpeg_bytes(selfie_img_bytes)
     except Exception as exc:
-        _log.warning("Could not convert selfie to JPEG: %s", exc)
-        return 0.0, 0
+        _log.warning("Could not convert selfie to JPEG: %s — using raw bytes as fallback", exc)
+        selfie_jpeg = selfie_img_bytes  # already JPEG when passed from _detect_face_fast
 
-    for url in photo_urls:
-        try:
-            resp = httpx.get(url, timeout=8, follow_redirects=True)
-            if resp.status_code != 200:
-                continue
+    urls = photo_urls[:3]  # always cap at 3
 
-            target_jpeg = _to_jpeg_bytes(resp.content)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    scores: list[float] = []
 
-            client = _rekognition_client()
-            rek_resp = client.compare_faces(
-                SourceImage={"Bytes": selfie_jpeg},
-                TargetImage={"Bytes": target_jpeg},
-                SimilarityThreshold=0,
-            )
-            matches = rek_resp.get("FaceMatches", [])
-            if matches:
-                pct = float(matches[0]["Similarity"])
-                _log.info("[FACE MATCH] Rekognition vs %s → %.1f%%", url.split("/")[-1][:24], pct)
-            else:
-                pct = 0.0
-                _log.info("[FACE MATCH] Rekognition vs %s → no match", url.split("/")[-1][:24])
-            compared += 1
-            if pct > best_pct:
-                best_pct = pct
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        futures = {pool.submit(_compare_selfie_to_url, selfie_jpeg, u): u for u in urls}
+        for fut in as_completed(futures):
+            scores.append(fut.result())
 
-        except Exception as exc:
-            _log.warning("Face-match error for %s: %s", url.split("/")[-1][:24], exc)
-
-    return round(best_pct, 1), compared
+    compared  = len(scores)
+    best_pct  = round(max(scores), 1) if scores else 0.0
+    _log.info(
+        "[FACE MATCH] %d photos compared | scores=%s | best=%.1f%%",
+        compared, [round(s, 1) for s in scores], best_pct,
+    )
+    return best_pct, compared
 
 
 # ─── Background verification task ─────────────────────────────────────────────
@@ -248,8 +325,11 @@ async def _run_face_verification(
                 return
 
             _log.info("bg-verify | attempt=%s running face match vs %d photos...", attempt_id, len(photo_urls))
+            # Use the already-converted JPEG bytes from Layer 1 to avoid a second
+            # conversion that may fail if the original file is HEIC/non-standard.
+            selfie_jpeg_for_match = selfie_array if selfie_array else selfie_bytes
             best_pct, compared = await asyncio.to_thread(
-                _match_against_photos, selfie_bytes, photo_urls
+                _match_against_photos, selfie_jpeg_for_match, photo_urls
             )
             attempt.face_match_score = best_pct
             passed = best_pct >= FACE_MATCH_THRESHOLD
@@ -260,12 +340,21 @@ async def _run_face_verification(
                 user.is_verified = True
                 user.verification_status = "verified"
                 user.face_match_score = best_pct
-                # Store selfie so ID verification can use it for face matching
+                # Clear the gate — user can now access the full app
+                user.face_scan_required = False
+                # Bust the in-memory 423 cache so the next request passes immediately
+                try:
+                    from app.main import _scan_cache
+                    _scan_cache.pop(str(user.id), None)
+                except Exception:
+                    pass
+                # Store selfie (cropped 1024×1024) so ID verification can use it for face matching
                 try:
                     from app.core.storage import upload_file as _upload_file
+                    selfie_cropped = await asyncio.to_thread(_crop_square_1024, selfie_bytes)
                     selfie_cdn = await asyncio.to_thread(
                         _upload_file,
-                        selfie_bytes, "image/jpeg",
+                        selfie_cropped, "image/jpeg",
                         folder=f"users/{user.id}/selfies",
                         ext=".jpg",
                     )
@@ -275,10 +364,10 @@ async def _run_face_verification(
             else:
                 attempt.status = "rejected"
                 attempt.rejection_reason = (
-                    f"Face match too low ({best_pct:.0f}%). "
-                    "Make sure your selfie matches the photos on your profile."
+                    "Your selfie doesn't match the photos on your profile. "
+                    "Please take a clear selfie showing your face."
                     if compared > 0
-                    else "Could not compare faces. Ensure your profile photos show your face clearly."
+                    else "Could not compare faces. Make sure your profile photos clearly show your face."
                 )
                 user.verification_status = "rejected"
 
@@ -297,6 +386,11 @@ async def _run_face_verification(
                 "face_match_score": attempt.face_match_score,
                 "rejection_reason": attempt.rejection_reason,
                 "is_live":          attempt.is_live,
+                # FE uses navigate_to to know where to go next without extra logic:
+                #   "feed"   → verification passed, open main app
+                #   "retry"  → show rejection reason + "Try Again" button
+                "navigate_to":      "feed" if attempt.status == "verified" else "retry",
+                "flow":             "onboarding",
             })
 
         except Exception as exc:
@@ -310,9 +404,11 @@ async def _run_face_verification(
             try:
                 from app.api.v1.endpoints.verification_ws import watcher as _watcher
                 await _watcher.notify(user.id, {
-                    "status": "rejected",
+                    "status":           "rejected",
                     "rejection_reason": attempt.rejection_reason,
                     "face_match_score": None,
+                    "navigate_to":      "retry",
+                    "flow":             "onboarding",
                 })
             except Exception:
                 pass
@@ -355,8 +451,68 @@ async def verify_face_endpoint(
         else (request.client.host if request.client else None)
     )
 
-    # ── Snapshot profile photos now (user may change them later) ─────────────
-    photo_urls: list[str] = list(current_user.photos or [])
+    # ── Rate-limit / cooldown check ──────────────────────────────────────────
+    # Schedule (face attempts only):
+    #   attempts 1–5  : free  (no cooldown)
+    #   attempts 6–8  : 15-minute cooldown between each
+    #   attempts 9–11 : 30-minute cooldown between each
+    #   attempts 12–14: 2-hour  cooldown between each
+    #   attempt  15+  : 24-hour cooldown (hard limit)
+    from sqlalchemy import select as _sel, func as _func
+    from datetime import timedelta as _td
+
+    _face_attempts = (await db.execute(
+        _sel(VerificationAttempt)
+        .where(
+            VerificationAttempt.user_id == current_user.id,
+            VerificationAttempt.attempt_type == "face",
+        )
+        .order_by(VerificationAttempt.submitted_at.desc())
+    )).scalars().all()
+
+    _total = len(_face_attempts)
+    _now   = datetime.now(timezone.utc)
+
+    # Determine required cooldown based on total previous attempts
+    if _total < 5:
+        _required_wait = None          # first 5 — no wait
+    elif _total < 8:
+        _required_wait = _td(minutes=15)
+    elif _total < 11:
+        _required_wait = _td(minutes=30)
+    elif _total < 14:
+        _required_wait = _td(hours=2)
+    else:
+        _required_wait = _td(hours=24)
+
+    if _required_wait is not None and _face_attempts:
+        _last_at = _face_attempts[0].submitted_at
+        if _last_at.tzinfo is None:
+            _last_at = _last_at.replace(tzinfo=timezone.utc)
+        _elapsed  = _now - _last_at
+        _remaining = _required_wait - _elapsed
+        if _remaining.total_seconds() > 0:
+            _mins = int(_remaining.total_seconds() // 60) + 1
+            if _mins >= 120:
+                _wait_str = f"{_mins // 60} hour{'s' if _mins // 60 > 1 else ''}"
+            else:
+                _wait_str = f"{_mins} minute{'s' if _mins > 1 else ''}"
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Too many attempts. Please try again in {_wait_str}.",
+                headers={"Retry-After": str(int(_remaining.total_seconds()))},
+            )
+
+    # ── Snapshot first 3 non-empty profile photos for face matching ──────────
+    # Using the first 3 photos ensures the selfie is checked against the most
+    # prominent photos on the profile (all set during onboarding).
+    all_photos: list[str] = [p for p in (current_user.photos or []) if p]
+    photo_urls: list[str] = all_photos[:3]
+    _log.info(
+        "verify-face | user=%s — matching against %d profile photos: %s",
+        current_user.id, len(photo_urls),
+        [u.split("/")[-1][:24] for u in photo_urls],
+    )
 
     # ── Create attempt record ─────────────────────────────────────────────────
     attempt = VerificationAttempt(
@@ -756,8 +912,8 @@ async def _run_id_verification(
                 if not face_match:
                     attempt.status = "rejected"
                     attempt.rejection_reason = (
-                        f"Face on ID doesn't match your selfie ({face_pct:.0f}% match, need 70%). "
-                        "Make sure you are uploading your own ID."
+                        "The face on your ID doesn't match your selfie. "
+                        "Please make sure you are uploading your own valid ID."
                     )
                     attempt.processed_at = datetime.now(timezone.utc)
                     user.verification_status = "rejected"
@@ -1051,14 +1207,17 @@ async def upload_photo_endpoint(
         )
 
     if is_chat:
-        # ── Chat photos: skip face/quality analysis, upload directly ──────────
-        # Chat images can be anything (memes, screenshots, selfies, etc.)
-        # No face detection requirement.
+        # ── Chat photos: NSFW only, no face required ──────────────────────────
         folder = f"users/{current_user.id}/chat"
     else:
-        # ── Profile photos: full analysis pipeline ────────────────────────────
+        # ── Profile photos: parallel face + NSFW pipeline ─────────────────────
+        # anchor = user's first profile photo (photos[0]). If they have none,
+        # this is the first upload — DetectFaces is used instead of CompareFaces.
+        existing_urls: list[str] = list(current_user.photos or [])
+        anchor_url: str | None = existing_urls[0] if existing_urls else None
+
         try:
-            analysis = await asyncio.to_thread(analyze_photo, contents)
+            analysis = await asyncio.to_thread(analyze_photo, contents, anchor_url)
         except Exception as exc:
             _log.error("Photo analysis pipeline crashed: %s", exc, exc_info=True)
             raise HTTPException(
@@ -1067,9 +1226,19 @@ async def upload_photo_endpoint(
             )
 
         if not analysis.passed:
-            print(f"[PHOTO REJECTED] reason={analysis.rejection_reason} | nsfw={analysis.nsfw}({analysis.nsfw_score:.2f}) labels={analysis.nsfw_labels} | face={analysis.has_face} | blurry={analysis.is_blurry}", flush=True)
+            _log.info(
+                "[PHOTO REJECTED] reason=%s | nsfw=%s(%.2f) | face=%s | anchor=%.0f%% | blurry=%s",
+                analysis.rejection_reason, analysis.nsfw, analysis.nsfw_score,
+                analysis.has_face, analysis.anchor_match_pct, analysis.is_blurry,
+            )
         else:
-            print(f"[PHOTO OK] nsfw={analysis.nsfw}({analysis.nsfw_score:.2f}) | face={analysis.has_face}(age={analysis.age_estimate}) | blurry={analysis.is_blurry}", flush=True)
+            _log.info(
+                "[PHOTO OK] nsfw=%s(%.2f) | face=%s(age=%s) | anchor=%s(%.0f%%) | blurry=%s",
+                analysis.nsfw, analysis.nsfw_score,
+                analysis.has_face, analysis.age_estimate,
+                analysis.anchor_checked, analysis.anchor_match_pct,
+                analysis.is_blurry,
+            )
 
         if not analysis.passed:
             raise HTTPException(
@@ -1077,12 +1246,9 @@ async def upload_photo_endpoint(
                 detail=analysis.rejection_reason,
             )
 
-        # ── Gender consistency check ──────────────────────────────────────────
-        # Strict: if profile is Male, only Male-detected photos are accepted.
-        # Threshold lowered to 70% — anything Rekognition calls Female/Male
-        # with reasonable certainty is enforced, no exceptions.
+        # ── Gender consistency check (first photo only — gender available from DetectFaces) ──
         GENDER_CONFIDENCE_MIN = 70.0
-        if current_user.gender_id and analysis.detected_gender:
+        if not anchor_url and current_user.gender_id and analysis.detected_gender:
             try:
                 row = await db.execute(
                     select(LookupOption.label).where(LookupOption.id == current_user.gender_id)
@@ -1090,12 +1256,10 @@ async def upload_photo_endpoint(
                 gender_label: str | None = row.scalar_one_or_none()
                 if gender_label:
                     label_lower = gender_label.lower()
-                    # Match any common male/female label variant
                     is_profile_male   = any(w in label_lower for w in ("male", "man", "boy"))
                     is_profile_female = any(w in label_lower for w in ("female", "woman", "girl"))
-                    detected = analysis.detected_gender   # "Male" or "Female"
+                    detected = analysis.detected_gender
                     conf     = analysis.gender_confidence
-
                     mismatch = (
                         (is_profile_male   and detected == "Female" and conf >= GENDER_CONFIDENCE_MIN) or
                         (is_profile_female and detected == "Male"   and conf >= GENDER_CONFIDENCE_MIN)
@@ -1117,69 +1281,22 @@ async def upload_photo_endpoint(
             except Exception as exc:
                 _log.warning("Gender check failed (skipping): %s", exc)
 
-        existing_urls: list[str] = list(current_user.photos or [])
-
-        # ── Selfie anchor check (verified users) ─────────────────────────────
-        # If the user has a verified selfie on file, every new profile photo
-        # must match it. This prevents adding celebrity/fake photos post-verification.
-        # 60% is appropriate here because the selfie is a controlled, close-up shot.
-        SELFIE_ANCHOR_THRESHOLD = 60.0
-        # Cross-photo consistency (profile photo vs other profile photos) uses a
-        # lower bar because different photos naturally vary in angle/lighting/expression.
-        CROSS_PHOTO_THRESHOLD = 40.0
-
-        if analysis.has_face and current_user.is_verified:
-            try:
-                selfie_row = await db.execute(
-                    select(VerificationAttempt.selfie_url)
-                    .where(VerificationAttempt.user_id == current_user.id)
-                    .where(VerificationAttempt.attempt_type == "face")
-                    .where(VerificationAttempt.status == "verified")
-                    .order_by(VerificationAttempt.submitted_at.desc())
-                    .limit(1)
-                )
-                selfie_url: str | None = selfie_row.scalar_one_or_none()
-                if selfie_url:
-                    selfie_pct, selfie_cmp = await asyncio.to_thread(
-                        _match_against_photos, contents, [selfie_url]
-                    )
-                    _log.info("[SELFIE ANCHOR] new photo vs verified selfie → %.1f%% (cmp=%d)", selfie_pct, selfie_cmp)
-                    if selfie_cmp > 0 and selfie_pct < SELFIE_ANCHOR_THRESHOLD:
-                        raise HTTPException(
-                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail="This photo doesn't match your verified identity. Please upload a photo of yourself.",
-                        )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                _log.warning("Selfie anchor check failed (skipping): %s", exc)
-
-        # ── Face consistency check (against other profile photos) ─────────────
-        if existing_urls and analysis.has_face:
-            try:
-                best_pct, compared = await asyncio.to_thread(
-                    _match_against_photos, contents, existing_urls
-                )
-                print(f"[FACE MATCH] best={best_pct:.1f}% vs {compared} photos | threshold={CROSS_PHOTO_THRESHOLD}%", flush=True)
-
-                if compared > 0 and best_pct < CROSS_PHOTO_THRESHOLD:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail="This photo doesn't appear to be the same person as your other photos. Please upload a photo of yourself.",
-                    )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                _log.warning("Face consistency check failed (skipping): %s", exc)
-
         folder = f"users/{current_user.id}/photos"
+
+    # ── Crop to 1024×1024 square before storage (profile photos only) ─────────
+    # Chat photos are stored as-is; profile photos are always square-cropped.
+    if not is_chat:
+        try:
+            contents = await asyncio.to_thread(_crop_square_1024, contents)
+        except Exception as exc:
+            _log.warning("Square crop failed (using original): %s", exc)
 
     # ── Upload to DO Spaces ───────────────────────────────────────────────────
     try:
         cdn_url = await asyncio.to_thread(
             upload_photo,
             contents,
-            file.content_type or "image/jpeg",
+            "image/jpeg",   # always JPEG after crop
             folder=folder,
         )
     except RuntimeError as exc:

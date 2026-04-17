@@ -1,56 +1,47 @@
 """
-Photo analysis pipeline — powered entirely by AWS Rekognition.
+Photo analysis pipeline — AWS Rekognition only.
 
-  1. Face + Quality check  (Rekognition DetectFaces)            — sharpness, brightness, face required, 18+
-  2. Watermark check       (Rekognition DetectText)             — stock/copyright keywords
-  3. NSFW check            (Rekognition DetectModerationLabels) — explicit / adult content
+Two-call parallel pipeline:
+  ┌─────────────────────────────────────────────────────────┐
+  │ First photo   → DetectFaces(ALL) ║ DetectModerationLabels│
+  │ Next photos   → CompareFaces     ║ DetectModerationLabels│
+  └─────────────────────────────────────────────────────────┘
 
-All three checks use a single boto3 client. No NumPy, no Pillow image analysis,
-no external ML libraries (DeepFace, nudenet, easyocr, imagehash) required.
-Pillow is used only as a thin format converter (WebP/HEIC → JPEG) before sending
-bytes to Rekognition — not for any analysis.
+Both calls run in parallel via ThreadPoolExecutor — no sequential waiting.
+CompareFaces against the user's first/anchor photo replaces DetectFaces for
+all subsequent uploads, giving face-match + existence check in one shot.
 """
 
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor, wait as _wait, FIRST_EXCEPTION
 from dataclasses import dataclass, field
 from typing import Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
-# ── Thresholds (Rekognition quality scores are 0–100) ─────────────────────────
+# ── Thresholds ────────────────────────────────────────────────────────────────
 
-SHARPNESS_MIN   = 10.0  # Rekognition Quality.Sharpness below this → blurry (10 = only genuinely unusable photos)
-BRIGHTNESS_MIN  =  5.0  # Rekognition Quality.Brightness below this → too dark
-BRIGHTNESS_MAX  = 98.0  # Rekognition Quality.Brightness above this → overexposed
-MIN_AGE_ALLOWED = 18    # Rekognition age estimate below this → rejected
-FACE_CONFIDENCE = 80.0  # Rekognition face confidence minimum
+SHARPNESS_MIN         = 10.0   # Quality.Sharpness below → blurry
+BRIGHTNESS_MIN        =  5.0   # Quality.Brightness below → too dark
+BRIGHTNESS_MAX        = 98.0   # Quality.Brightness above → overexposed
+MIN_AGE_ALLOWED       = 18
+FACE_CONFIDENCE       = 70.0   # Minimum DetectFaces confidence
+ANCHOR_MATCH_MIN      = 40.0   # CompareFaces similarity % — same person required
 
 NSFW_REJECT_LABELS = {
-    "Explicit Nudity",
-    "Nudity",
-    "Graphic Male Nudity",
-    "Graphic Female Nudity",
-    "Nude Male",
-    "Nude Female",
-    "Explicit Sexual Activity",
-    "Graphic Sexual Activity",
-    "Partial Nudity",
-    "Exposed Male Genitalia",
-    "Exposed Female Genitalia",
-    "Exposed Anus",
-    "Exposed Buttocks Or Anus",
-}
-
-WATERMARK_KEYWORDS = {
-    "shutterstock", "getty", "istock", "dreamstime", "alamy",
-    "depositphotos", "123rf", "adobe stock", "©", "copyright", "watermark",
+    "Explicit Nudity", "Nudity", "Graphic Male Nudity", "Graphic Female Nudity",
+    "Nude Male", "Nude Female", "Explicit Sexual Activity", "Graphic Sexual Activity",
+    "Partial Nudity", "Exposed Male Genitalia", "Exposed Female Genitalia",
+    "Exposed Anus", "Exposed Buttocks Or Anus",
 }
 
 
 # ── Rekognition client ────────────────────────────────────────────────────────
 
-def _rekognition_client():
+def _client():
     import boto3
     from botocore.config import Config
     from app.core.config import settings
@@ -59,23 +50,50 @@ def _rekognition_client():
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY or None,
         region_name=getattr(settings, "AWS_REGION", None) or "us-east-1",
-        config=Config(
-            connect_timeout=8,
-            read_timeout=15,
-            retries={"max_attempts": 1},
-        ),
+        config=Config(connect_timeout=8, read_timeout=15, retries={"max_attempts": 1}),
     )
+
+
+# ── JPEG conversion ───────────────────────────────────────────────────────────
+
+_REKOGNITION_MAX_BYTES = 5 * 1024 * 1024   # 5 MB hard limit
+_JPEG_MAX_DIMENSION   = 1920               # resize long-edge to this before quality reduction
 
 
 def _to_jpeg(img_bytes: bytes) -> bytes:
     """
-    Convert image bytes to JPEG for Rekognition.
-    Rekognition natively supports JPEG and PNG — conversion only needed for WebP/HEIC.
-    Uses Pillow only as a format adapter, not for analysis.
+    Convert any supported format (JPEG/PNG/WebP/HEIC) to JPEG for Rekognition.
+    Ensures output is under Rekognition's 5 MB limit by:
+      1. Resizing the long edge to 1920 px (enough detail, drastically reduces file size)
+      2. Iteratively lowering quality (85 → 75 → 65 → 50) until under 5 MB
     """
     from PIL import Image
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except ImportError:
+        pass
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    # Resize long edge to 1920 px while keeping aspect ratio
+    w, h = img.size
+    if max(w, h) > _JPEG_MAX_DIMENSION:
+        scale = _JPEG_MAX_DIMENSION / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # Try progressively lower quality until under 5 MB
+    for quality in (85, 75, 65, 50, 40):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= _REKOGNITION_MAX_BYTES:
+            return buf.getvalue()
+
+    # Last resort: halve dimensions again and save at quality 40
+    w2, h2 = img.size
+    img = img.resize((w2 // 2, h2 // 2), Image.LANCZOS)
     buf = io.BytesIO()
-    Image.open(io.BytesIO(img_bytes)).convert("RGB").save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=40, optimize=True)
     return buf.getvalue()
 
 
@@ -86,152 +104,189 @@ class PhotoAnalysis:
     passed: bool
     rejection_reason: Optional[str]
 
-    # Layer 1 — quality + face (single Rekognition DetectFaces call)
+    # Quality
     is_blurry: bool
-    sharpness: float         # Rekognition Quality.Sharpness  (0–100)
+    sharpness: float
     brightness_ok: bool
-    brightness: float        # Rekognition Quality.Brightness (0–100)
-    quality_score: float     # composite (for logging)
+    brightness: float
+    quality_score: float
 
-    # Layer 2 — watermark
-    has_watermark: bool
-    watermark_text: str
-
-    # Layer 3 — NSFW
+    # NSFW
     nsfw: bool
     nsfw_score: float
     nsfw_labels: list = field(default_factory=list)
 
-    # Face details (from layer 1)
+    # Face
     has_face: bool = False
     face_count: int = 0
+    multiple_faces: bool = False
     age_estimate: Optional[int] = None
     under_18_risk: bool = False
-    detected_gender: Optional[str] = None      # "Male" | "Female" | None
-    gender_confidence: float = 0.0             # Rekognition confidence (0–100)
+    detected_gender: Optional[str] = None
+    gender_confidence: float = 0.0
+
+    # Anchor match (only for subsequent photos)
+    anchor_match_pct: float = 0.0
+    anchor_checked: bool = False
+
+    # Watermark field kept for API compatibility but always False now
+    has_watermark: bool = False
+    watermark_text: str = ""
 
 
-# ── Layer 1+4 combined: Face + Quality (Rekognition DetectFaces) ──────────────
+# ── Call 1a: DetectFaces (first photo) ───────────────────────────────────────
 
-def _check_face_and_quality(jpeg_bytes: bytes):
+def _detect_faces(jpeg_bytes: bytes):
     """
-    Single Rekognition DetectFaces call with Attributes=ALL returns:
-      - Face confidence
-      - AgeRange (Low / High)
-      - Quality.Sharpness  (0–100)  ← replaces NumPy blur detection
-      - Quality.Brightness (0–100)  ← replaces Pillow ImageStat
-
+    Used for the very first photo — no anchor to compare against yet.
     Returns (has_face, face_count, age_estimate, under_18_risk,
              is_blurry, sharpness, brightness_ok, brightness, quality_score,
              detected_gender, gender_confidence)
     """
     try:
-        client = _rekognition_client()
-        resp   = client.detect_faces(Image={"Bytes": jpeg_bytes}, Attributes=["ALL"])
-        faces  = [f for f in resp.get("FaceDetails", []) if f.get("Confidence", 0) >= FACE_CONFIDENCE]
+        resp  = _client().detect_faces(Image={"Bytes": jpeg_bytes}, Attributes=["ALL"])
+        faces = [f for f in resp.get("FaceDetails", []) if f.get("Confidence", 0) >= FACE_CONFIDENCE]
 
         if not faces:
-            logger.info("Face check: no confident face detected")
+            # Fallback: DetectLabels to allow standing / full-body shots
+            try:
+                lresp = _client().detect_labels(
+                    Image={"Bytes": jpeg_bytes}, MaxLabels=10, MinConfidence=80.0
+                )
+                if any(
+                    l["Name"] in ("Person", "Human", "People") and l["Confidence"] >= 80.0
+                    for l in lresp.get("Labels", [])
+                ):
+                    logger.info("DetectFaces: no close face — person detected (standing/full-body)")
+                    return True, 1, None, False, False, 60.0, True, 50.0, 0.6, None, 0.0
+            except Exception as e:
+                logger.warning("Person label fallback failed: %s", e)
+
+            logger.info("DetectFaces: no face detected")
             return False, 0, None, False, False, 0.0, True, 50.0, 0.0, None, 0.0
 
-        face       = faces[0]
-        quality    = face.get("Quality", {})
-        sharpness  = float(quality.get("Sharpness",  50.0))
+        face      = faces[0]
+        quality   = face.get("Quality", {})
+        sharpness = float(quality.get("Sharpness", 50.0))
         brightness = float(quality.get("Brightness", 50.0))
 
-        is_blurry     = sharpness  < SHARPNESS_MIN
+        is_blurry     = sharpness < SHARPNESS_MIN
         brightness_ok = BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX
         quality_score = round((sharpness / 100.0) * 0.7 + (1.0 if brightness_ok else 0.3) * 0.3, 3)
 
-        age_range  = face.get("AgeRange", {})
-        ages = [
-            (f["AgeRange"]["Low"] + f["AgeRange"]["High"]) // 2
-            for f in faces if "AgeRange" in f
-        ]
-        face_count = len(faces)
+        ages       = [(f["AgeRange"]["Low"] + f["AgeRange"]["High"]) // 2 for f in faces if "AgeRange" in f]
         avg_age    = int(sum(ages) / len(ages)) if ages else None
         min_age    = min(ages) if ages else None
         under_18   = min_age is not None and min_age < MIN_AGE_ALLOWED
 
-        gender_data  = face.get("Gender", {})
-        det_gender   = gender_data.get("Value")        # "Male" | "Female"
-        gender_conf  = float(gender_data.get("Confidence", 0.0))
+        gender_data = face.get("Gender", {})
+        det_gender  = gender_data.get("Value")
+        gender_conf = float(gender_data.get("Confidence", 0.0))
 
         logger.info(
-            "Face+Quality [Rekognition] | faces=%d sharpness=%.1f brightness=%.1f ages=%s under18=%s gender=%s(%.0f%%)",
-            face_count, sharpness, brightness, ages, under_18, det_gender, gender_conf,
+            "DetectFaces | faces=%d sharpness=%.1f brightness=%.1f ages=%s under18=%s gender=%s(%.0f%%)",
+            len(faces), sharpness, brightness, ages, under_18, det_gender, gender_conf,
         )
-        return True, face_count, avg_age, under_18, is_blurry, sharpness, brightness_ok, brightness, quality_score, det_gender, gender_conf
+        return True, len(faces), avg_age, under_18, is_blurry, sharpness, brightness_ok, brightness, quality_score, det_gender, gender_conf
 
     except Exception as exc:
-        logger.warning("Face+Quality check failed: %s", exc)
+        logger.warning("DetectFaces failed: %s", exc)
         return False, 0, None, False, False, 0.0, True, 50.0, 0.0, None, 0.0
 
 
-# ── Layer 2: Watermark (Rekognition DetectText) ───────────────────────────────
+# ── Call 1b: CompareFaces against anchor (subsequent photos) ─────────────────
 
-def _check_watermark(jpeg_bytes: bytes):
+def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
+    """
+    Used for every photo after the first.
+    Downloads the anchor (first profile photo) and calls CompareFaces.
+    Returns (has_face, similarity_pct, is_blurry, sharpness, brightness_ok, brightness, quality_score)
+    """
     try:
-        client   = _rekognition_client()
-        resp     = client.detect_text(Image={"Bytes": jpeg_bytes})
-        words    = [
-            d["DetectedText"]
-            for d in resp.get("TextDetections", [])
-            if d.get("Type") == "WORD" and d.get("Confidence", 0) >= 60
-        ]
-        combined = " ".join(words).lower()
-        for kw in WATERMARK_KEYWORDS:
-            if kw in combined:
-                logger.info("Watermark detected: keyword=%r", kw)
-                return True, combined[:120]
-        return False, ""
+        resp = httpx.get(anchor_url, timeout=8, follow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning("CompareFaces: could not fetch anchor (%d)", resp.status_code)
+            return False, 0.0, False, 0.0, True, 50.0, 0.0
+
+        anchor_jpeg = _to_jpeg(resp.content)
+
+        rek = _client().compare_faces(
+            SourceImage={"Bytes": anchor_jpeg},
+            TargetImage={"Bytes": new_jpeg},
+            SimilarityThreshold=0,
+        )
+
+        matches   = rek.get("FaceMatches", [])
+        unmatched = rek.get("UnmatchedFaces", [])
+
+        if not matches:
+            if unmatched:
+                total_faces = len(unmatched)
+                logger.info("CompareFaces: face found but doesn't match anchor (0%%) faces=%d", total_faces)
+            else:
+                logger.info("CompareFaces: no face found in new photo")
+            # Return multiple_faces flag as last element
+            return bool(unmatched), 0.0, False, 50.0, True, 50.0, 0.5, len(unmatched) > 1
+
+        best      = max(matches, key=lambda m: m["Similarity"])
+        sim_pct   = float(best["Similarity"])
+        face_det  = best.get("Face", {})
+        quality   = face_det.get("Quality", {})
+        sharpness = float(quality.get("Sharpness", 50.0))
+        brightness = float(quality.get("Brightness", 50.0))
+
+        is_blurry     = sharpness < SHARPNESS_MIN
+        brightness_ok = BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX
+        quality_score = round((sharpness / 100.0) * 0.7 + (1.0 if brightness_ok else 0.3) * 0.3, 3)
+
+        # Multiple people = matched face + any unmatched faces in the same photo
+        total_faces    = len(matches) + len(unmatched)
+        multiple_faces = total_faces > 1
+
+        logger.info(
+            "CompareFaces | similarity=%.1f%% sharpness=%.1f brightness=%.1f faces=%d",
+            sim_pct, sharpness, brightness, total_faces,
+        )
+        return True, sim_pct, is_blurry, sharpness, brightness_ok, brightness, quality_score, multiple_faces
+
     except Exception as exc:
-        logger.warning("Watermark check failed: %s", exc)
-        return False, ""
+        logger.warning("CompareFaces failed: %s", exc)
+        return False, 0.0, False, 0.0, True, 50.0, 0.0
 
 
-# ── Layer 3: NSFW (Rekognition DetectModerationLabels) ───────────────────────
+# ── Call 2: DetectModerationLabels (always, runs in parallel) ────────────────
 
 def _check_nsfw(jpeg_bytes: bytes):
     try:
-        client = _rekognition_client()
-        resp   = client.detect_moderation_labels(Image={"Bytes": jpeg_bytes}, MinConfidence=50.0)
+        resp  = _client().detect_moderation_labels(Image={"Bytes": jpeg_bytes}, MinConfidence=50.0)
         labels = resp.get("ModerationLabels", [])
         hits   = [l for l in labels if l["Name"] in NSFW_REJECT_LABELS]
 
         if hits:
             top_score   = max(l["Confidence"] for l in hits)
             label_names = [l["Name"] for l in hits]
-            logger.info("NSFW detected: labels=%s", label_names)
+            logger.info("NSFW detected: %s", label_names)
             return True, round(top_score / 100.0, 4), label_names
 
         all_scores = [l["Confidence"] for l in labels]
-        max_score  = round(max(all_scores) / 100.0, 4) if all_scores else 0.0
-        return False, max_score, []
+        return False, round(max(all_scores) / 100.0, 4) if all_scores else 0.0, []
 
     except Exception as exc:
         logger.warning("NSFW check failed: %s", exc)
         return False, 0.0, []
 
 
-# ── Quality score (for photo reordering) ─────────────────────────────────────
+# ── Quality score helper (used for photo reordering) ─────────────────────────
 
 def get_photo_quality_score(img_bytes: bytes) -> float:
-    """
-    Return a 0.0–1.0 quality score for a photo using Rekognition's built-in
-    Quality.Sharpness and Quality.Brightness — no NumPy/Pillow math needed.
-    Used to reorder profile photos best-first.
-    Returns 0.0 if Rekognition finds no face or the call fails.
-    """
     try:
         jpeg_bytes = _to_jpeg(img_bytes)
-        client = _rekognition_client()
-        resp  = client.detect_faces(Image={"Bytes": jpeg_bytes}, Attributes=["ALL"])
+        resp  = _client().detect_faces(Image={"Bytes": jpeg_bytes}, Attributes=["ALL"])
         faces = [f for f in resp.get("FaceDetails", []) if f.get("Confidence", 0) >= FACE_CONFIDENCE]
         if not faces:
             return 0.0
-        quality   = faces[0].get("Quality", {})
-        sharpness = float(quality.get("Sharpness",  0.0))
+        quality    = faces[0].get("Quality", {})
+        sharpness  = float(quality.get("Sharpness", 0.0))
         brightness = float(quality.get("Brightness", 50.0))
         brightness_ok = BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX
         return round((sharpness / 100.0) * 0.7 + (1.0 if brightness_ok else 0.3) * 0.3, 3)
@@ -242,16 +297,21 @@ def get_photo_quality_score(img_bytes: bytes) -> float:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def analyze_photo(img_bytes: bytes) -> PhotoAnalysis:
+def analyze_photo(img_bytes: bytes, anchor_url: Optional[str] = None) -> PhotoAnalysis:
     """
-    Run all analysis layers via AWS Rekognition only.
+    Run face + NSFW analysis in parallel.
+
+    anchor_url — URL of the user's first/anchor profile photo.
+      • None  → first photo: DetectFaces  ║ DetectModerationLabels (parallel)
+      • str   → next photos: CompareFaces ║ DetectModerationLabels (parallel)
+
     Hard rejections:
-      ✗  Blurry / low-sharpness  (Rekognition Quality.Sharpness < 20)
-      ✗  Too dark / overexposed  (Rekognition Quality.Brightness out of range)
-      ✗  Watermark / stock text  (Rekognition DetectText)
-      ✗  Explicit / adult content (Rekognition ModerationLabels)
-      ✗  No human face           (Rekognition DetectFaces confidence < 85%)
-      ✗  Face appears under 18   (Rekognition AgeRange)
+      ✗ No face / person detected
+      ✗ Blurry (sharpness < 10)
+      ✗ Too dark / overexposed
+      ✗ Explicit/adult NSFW content
+      ✗ Appears under 18 (first-photo only)
+      ✗ Face doesn't match anchor (subsequent photos, similarity < 40%)
     """
     try:
         jpeg_bytes = _to_jpeg(img_bytes)
@@ -261,47 +321,79 @@ def analyze_photo(img_bytes: bytes) -> PhotoAnalysis:
             passed=False,
             rejection_reason="Could not read image. Please try a different photo.",
             is_blurry=False, sharpness=0.0, brightness_ok=True, brightness=50.0, quality_score=0.0,
-            has_watermark=False, watermark_text="", nsfw=False, nsfw_score=0.0,
-            has_face=False, face_count=0, age_estimate=None, under_18_risk=False,
+            nsfw=False, nsfw_score=0.0,
+            has_face=False, face_count=0, multiple_faces=False, age_estimate=None, under_18_risk=False,
         )
 
-    (has_face, face_count, age_estimate, under_18_risk,
-     is_blurry, sharpness, brightness_ok, brightness, quality_score,
-     detected_gender, gender_confidence) = _check_face_and_quality(jpeg_bytes)
+    # ── Run both checks in parallel ───────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        nsfw_future = pool.submit(_check_nsfw, jpeg_bytes)
 
-    has_watermark, watermark_text = _check_watermark(jpeg_bytes)
-    nsfw, nsfw_score, nsfw_labels = _check_nsfw(jpeg_bytes)
+        if anchor_url:
+            face_future = pool.submit(_compare_with_anchor, jpeg_bytes, anchor_url)
+        else:
+            face_future = pool.submit(_detect_faces, jpeg_bytes)
 
+    nsfw, nsfw_score, nsfw_labels = nsfw_future.result()
+
+    # ── Unpack face results ───────────────────────────────────────────────────
+    anchor_match_pct = 0.0
+    anchor_checked   = False
+    detected_gender  = None
+    gender_confidence = 0.0
+    age_estimate     = None
+    under_18_risk    = False
+    face_count       = 0
+    multiple_faces   = False
+
+    if anchor_url:
+        anchor_checked = True
+        (has_face, anchor_match_pct,
+         is_blurry, sharpness, brightness_ok, brightness, quality_score,
+         multiple_faces) = face_future.result()
+    else:
+        (has_face, face_count, age_estimate, under_18_risk,
+         is_blurry, sharpness, brightness_ok, brightness, quality_score,
+         detected_gender, gender_confidence) = face_future.result()
+        multiple_faces = face_count > 1
+
+    # ── Apply rejections in priority order ────────────────────────────────────
     rejection_reason: Optional[str] = None
 
     if not has_face:
         rejection_reason = "No face detected. Please upload a clear photo showing your face."
+    elif multiple_faces:
+        rejection_reason = "Multiple people detected. Please upload a solo photo of yourself."
     elif is_blurry:
-        rejection_reason = (
-            f"Photo is too blurry (sharpness: {sharpness:.0f}/100). "
-            "Please upload a sharper, clearer photo."
-        )
+        rejection_reason = "Photo is too blurry. Please upload a sharper, clearer photo."
     elif not brightness_ok:
-        if brightness < BRIGHTNESS_MIN:
-            rejection_reason = "Photo is too dark. Please find better lighting."
-        else:
-            rejection_reason = "Photo is overexposed. Avoid direct bright light."
-    elif has_watermark:
         rejection_reason = (
-            "Photo appears to contain a stock photo watermark. "
-            "Please upload an original photo."
+            "Photo is too dark. Please find better lighting."
+            if brightness < BRIGHTNESS_MIN
+            else "Photo is overexposed. Please avoid direct bright light."
         )
     elif nsfw:
         rejection_reason = "Photo contains explicit or adult content and cannot be uploaded."
     elif under_18_risk:
+        rejection_reason = "Photo appears to show someone under 18. Upload rejected."
+    elif anchor_checked and anchor_match_pct < ANCHOR_MATCH_MIN:
         rejection_reason = (
-            f"Photo appears to show someone under 18 "
-            f"(estimated age: {age_estimate}). Upload rejected."
+            "This photo doesn't appear to be the same person as your other photos. "
+            "Please upload a photo of yourself."
         )
 
     passed = rejection_reason is None
 
-    result = PhotoAnalysis(
+    logger.info(
+        "Photo analysis | passed=%s face=%s anchor=%s(%.0f%%) sharpness=%.0f brightness=%.0f nsfw=%s(%.2f)%s",
+        passed, has_face,
+        anchor_checked, anchor_match_pct,
+        sharpness, brightness,
+        nsfw, nsfw_score,
+        f" | REJECTED: {rejection_reason}" if not passed else "",
+    )
+
+    return PhotoAnalysis(
         passed=passed,
         rejection_reason=rejection_reason,
         is_blurry=is_blurry,
@@ -309,25 +401,18 @@ def analyze_photo(img_bytes: bytes) -> PhotoAnalysis:
         brightness_ok=brightness_ok,
         brightness=brightness,
         quality_score=quality_score,
-        has_watermark=has_watermark,
-        watermark_text=watermark_text,
+        has_watermark=False,
+        watermark_text="",
         nsfw=nsfw,
         nsfw_score=nsfw_score,
         nsfw_labels=nsfw_labels,
         has_face=has_face,
         face_count=face_count,
+        multiple_faces=multiple_faces,
         age_estimate=age_estimate,
         under_18_risk=under_18_risk,
         detected_gender=detected_gender,
         gender_confidence=gender_confidence,
+        anchor_match_pct=anchor_match_pct,
+        anchor_checked=anchor_checked,
     )
-
-    logger.info(
-        "Photo analysis | passed=%s face=%s(count=%s age=%s) sharpness=%.0f brightness=%.0f "
-        "watermark=%s nsfw=%s(%.2f)%s",
-        passed, has_face, face_count, age_estimate, sharpness, brightness,
-        has_watermark, nsfw, nsfw_score,
-        f" | REJECTED: {rejection_reason}" if not passed else "",
-    )
-
-    return result

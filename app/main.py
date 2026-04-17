@@ -45,13 +45,16 @@ async def lifespan(app: FastAPI):
     # Create all tables on startup (no-op for existing tables).
     # Wrapped in try/except so a transient DB timeout doesn't prevent startup
     # when tables already exist (e.g. connecting to a remote production DB).
+    import asyncio as _asyncio_startup
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+        async def _create_tables():
+            async with engine.begin() as conn:
+                await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+        await _asyncio_startup.wait_for(_create_tables(), timeout=10.0)
     except Exception as _create_exc:
         import logging as _clog
         _clog.getLogger(__name__).warning(
-            "create_all skipped (non-critical — tables likely already exist): %s",
+            "create_all skipped (non-critical — tables likely already exist or DB unreachable): %s",
             _create_exc.__class__.__name__,
         )
 
@@ -226,13 +229,30 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS filter_religions JSONB",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+        # ── University email verification columns ──────────────────────────────
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS university VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_email VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_email_verified BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_otp_hash VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_otp_expires_at TIMESTAMPTZ",
     ]
-    for _sql in _MIGRATIONS:
-        try:
-            async with engine.begin() as _conn:
-                await _conn.execute(_text(_sql))
-        except Exception as _migration_exc:
-            _mig_log.warning("Migration skipped (%s): %s", _migration_exc.__class__.__name__, _sql)
+    import asyncio as _asyncio
+
+    async def _run_migrations() -> None:
+        for _sql in _MIGRATIONS:
+            try:
+                async with engine.begin() as _conn:
+                    await _conn.execute(_text(_sql))
+            except Exception as _migration_exc:
+                _mig_log.warning("Migration skipped (%s): %s", _migration_exc.__class__.__name__, _sql)
+
+    try:
+        await _asyncio.wait_for(_run_migrations(), timeout=15.0)
+    except _asyncio.TimeoutError:
+        _mig_log.warning(
+            "Startup migrations timed out after 15s (DB unreachable?). "
+            "Server will start anyway — migrations will run on next healthy restart."
+        )
 
     import asyncio
     import logging
@@ -606,11 +626,12 @@ async def scan_required_gate(request: Request, call_next):
     cached = _scan_cache.get(uid_str)
     if cached and now_mono < cached[2]:
         face_req, id_req = cached[0], cached[1]
+        _cached_is_onboarded = cached[3] if len(cached) > 3 else True
     else:
         try:
             async with AsyncSessionLocal() as db:
                 row = (await db.execute(
-                    _text2("SELECT face_scan_required, id_scan_required FROM users WHERE id = :uid"),
+                    _text2("SELECT face_scan_required, id_scan_required, is_onboarded FROM users WHERE id = :uid"),
                     {"uid": uid_str},
                 )).fetchone()
         except _asyncio.CancelledError:
@@ -622,14 +643,27 @@ async def scan_required_gate(request: Request, call_next):
             return await call_next(request)
 
         face_req, id_req = bool(row[0]), bool(row[1])
-        _scan_cache[uid_str] = (face_req, id_req, now_mono + _SCAN_CACHE_TTL)
+        # Store is_onboarded (index 2) in cache to avoid a second DB hit in the 423 block
+        _scan_cache[uid_str] = (face_req, id_req, now_mono + _SCAN_CACHE_TTL, bool(row[2]))
+        _cached_is_onboarded = bool(row[2])
 
     if face_req:
+        # Determine whether this is a normal onboarding step or a compliance re-check.
+        # FE uses `flow` to decide which screen to show:
+        #   "onboarding"  → friendly camera UI: "Let's verify it's you"
+        #   "compliance"  → re-verification prompt
+        _flow = "compliance" if _cached_is_onboarded else "onboarding"
+
         return JSONResponse(
             status_code=423,
             content={
-                "detail": "Face verification required before accessing this feature.",
+                "detail": (
+                    "Almost there! Please verify your face to complete setup."
+                    if _flow == "onboarding"
+                    else "Please complete face verification to continue."
+                ),
                 "code": "face_scan_required",
+                "flow": _flow,   # "onboarding" | "compliance"
             },
         )
     if id_req:
@@ -638,6 +672,7 @@ async def scan_required_gate(request: Request, call_next):
             content={
                 "detail": "ID verification required before accessing this feature.",
                 "code": "id_scan_required",
+                "flow": "compliance",
             },
         )
 

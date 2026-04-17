@@ -13,6 +13,7 @@ from app.db.base import Base
 import app.models.user  # noqa: F401
 import app.models.otp  # noqa: F401
 import app.models.refresh_token  # noqa: F401
+import app.models.login_event  # noqa: F401
 import app.models.lookup  # noqa: F401
 import app.models.verification  # noqa: F401
 import app.models.card  # noqa: F401

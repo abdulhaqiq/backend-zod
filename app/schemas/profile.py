@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -157,10 +157,11 @@ class FilterUpdateRequest(BaseModel):
     """
     Sent by the filter sheet when the user taps "Apply Filters".
     Only discover filter preferences — nothing else.
+    distance: null is treated as 80 km (no "Any"/unlimited — 80 is the hard cap).
     """
     filter_age_min:         int | None = Field(None, ge=18, le=80)
     filter_age_max:         int | None = Field(None, ge=18, le=80)
-    filter_max_distance_km: int | None = Field(None, ge=1, le=80)
+    filter_max_distance_km: int | None = Field(None, ge=1, le=80)  # null → 80 (no "Any")
     filter_verified_only:   bool | None = None
     filter_star_signs:      list[int] | None = None
     filter_interests:       list[int] | None = None
@@ -193,6 +194,7 @@ class MeResponse(BaseModel):
     phone: str | None
     email: str | None
     apple_id: str | None
+    google_id: str | None
     full_name: str | None
     date_of_birth: date | None
     gender_id: int | None
@@ -261,9 +263,11 @@ class MeResponse(BaseModel):
     work_job_search_status_id: int | None
 
     # ── Discover filter preferences ───────────────────────────────────────────
-    filter_age_min:         int | None
-    filter_age_max:         int | None
-    filter_max_distance_km: int | None
+    # Defaults returned to FE when user hasn't explicitly set them yet:
+    #   age: 18–63, distance: 20 km (hard cap 80, no "Any")
+    filter_age_min:         int | None = 18
+    filter_age_max:         int | None = 63
+    filter_max_distance_km: int | None = 20
     filter_verified_only:   bool
     filter_star_signs:      list[int] | None
     filter_interests:       list[int] | None
@@ -332,4 +336,78 @@ class MeResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # ── Onboarding progress ───────────────────────────────────────────────────
+    # Computed: which required steps are still incomplete.
+    # FE uses this to know which screen to show next and to gate the "Continue" button.
+    onboarding_missing: list[str] = []
+
+    # ── Face verification gate ────────────────────────────────────────────────
+    # needs_face_verification: true  → FE must show face scan camera screen NOW.
+    # verification_flow:
+    #   "onboarding"  → friendly first-time UI  "Let's verify it's you 🙂"
+    #   "compliance"  → re-verification prompt  "Please re-verify your identity"
+    #   null          → no verification needed right now
+    needs_face_verification: bool = False
+    verification_flow: str | None = None
+
+    # True when a valid FCM (non-Expo) push token is stored
+    has_push_token: bool = False
+
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _apply_filter_defaults(self):
+        """
+        1. Fill filter field defaults (distance 20 km, age 18–63).
+        2. Compute onboarding_missing — list of step keys the user hasn't completed yet.
+           FE uses this to gate the "Continue" button and navigate to the right screen.
+
+        Onboarding required steps (in order):
+          name        → full_name
+          dob         → date_of_birth
+          gender      → gender_id
+          religion    → religion_id   ← must come early
+          photos      → photos (min 4)
+          (face verification is enforced server-side via face_scan_required flag)
+
+        distance: null → 20 km (max cap 80, no 'Any' concept)
+        age_min:  null → 18
+        age_max:  null → 63
+        """
+        # ── Filter defaults ───────────────────────────────────────────────────
+        if self.filter_max_distance_km is None:
+            self.filter_max_distance_km = 20
+        else:
+            self.filter_max_distance_km = min(self.filter_max_distance_km, 80)
+        if self.filter_age_min is None:
+            self.filter_age_min = 18
+        if self.filter_age_max is None:
+            self.filter_age_max = 63
+
+        # ── Onboarding missing steps ──────────────────────────────────────────
+        if not self.is_onboarded:
+            missing = []
+            if not self.full_name:
+                missing.append("name")
+            if not self.date_of_birth:
+                missing.append("dob")
+            if not self.gender_id:
+                missing.append("gender")
+            if not self.religion_id:
+                missing.append("religion")
+            photo_count = len([p for p in (self.photos or []) if p])
+            if photo_count < 4:
+                missing.append("photos")   # needs 4 photos minimum
+            self.onboarding_missing = missing
+
+        # ── Face verification gate ────────────────────────────────────────────
+        # face_scan_required=True means the server will 423 any other endpoint.
+        # Expose this cleanly so the FE can route to the camera screen immediately
+        # on app launch / after onboarding — no need to wait for a 423 error.
+        if getattr(self, "face_scan_required", False):
+            self.needs_face_verification = True
+            self.verification_flow = (
+                "onboarding" if not self.is_onboarded else "compliance"
+            )
+
+        return self

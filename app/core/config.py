@@ -95,9 +95,10 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"
 
-    # Expo Push Notifications (optional — improves rate limits in production)
-    # Generate at: https://expo.dev/accounts/<username>/settings/access-tokens
-    EXPO_ACCESS_TOKEN: str = ""
+    # Firebase Cloud Messaging (push notifications)
+    # Path to the service-account JSON downloaded from:
+    # Firebase Console → Project Settings → Service Accounts → Generate new private key
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = ""
 
     # DigitalOcean Spaces
     DO_SPACES_KEY: str = ""

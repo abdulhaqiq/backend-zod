@@ -457,6 +457,20 @@ async def verify_purchase(
     rc_data = await _rc_get_customer(body.revenuecat_customer_id)
     is_active, new_tier, expires_at = _extract_entitlement(rc_data)
 
+    # If another user already owns this RC customer ID (e.g. an old anonymous ID
+    # from a previous account on the same device), clear it from them first so
+    # the unique constraint does not raise a 500 on commit.
+    other_owner_result = await db.execute(
+        select(User).where(
+            User.revenuecat_customer_id == body.revenuecat_customer_id,
+            User.id != current_user.id,
+        )
+    )
+    other_owner = other_owner_result.scalar_one_or_none()
+    if other_owner:
+        other_owner.revenuecat_customer_id = None
+        await db.flush()
+
     current_user.revenuecat_customer_id = body.revenuecat_customer_id
     old_tier = current_user.subscription_tier
     current_user.subscription_tier = new_tier
@@ -741,6 +755,18 @@ async def topup_ai_credits(
     non_subs: dict = subscriber.get("non_subscriptions", {})
     if body.pack_id not in non_subs:
         raise HTTPException(402, "RevenueCat: purchase not found for this product.")
+
+    # Clear the RC customer ID from any other user who already holds it
+    other_rc_result = await db.execute(
+        select(User).where(
+            User.revenuecat_customer_id == body.revenuecat_customer_id,
+            User.id != current_user.id,
+        )
+    )
+    other_rc_owner = other_rc_result.scalar_one_or_none()
+    if other_rc_owner:
+        other_rc_owner.revenuecat_customer_id = None
+        await db.flush()
 
     current_user.revenuecat_customer_id = body.revenuecat_customer_id
     current_user.ai_credits_balance += credits_to_add

@@ -109,9 +109,17 @@ _PRO_ONLY_PROFILE_FIELDS: frozenset[str] = frozenset({
 })
 
 
+def _build_me(user: User) -> MeResponse:
+    """Build a MeResponse, injecting computed fields that can't live in the schema."""
+    r = MeResponse.model_validate(user)
+    raw = user.push_token or ""
+    r.has_push_token = bool(raw) and not raw.startswith("ExponentPushToken")
+    return r
+
+
 @router.get("/me", response_model=MeResponse, summary="Get current user profile")
 async def get_me(current_user: User = Depends(get_current_user)) -> MeResponse:
-    return MeResponse.model_validate(current_user)
+    return _build_me(current_user)
 
 
 @router.patch("/me", response_model=MeResponse, summary="Update profile (onboarding or edit)")
@@ -217,10 +225,10 @@ async def update_me(
         if field == "photos" and value is not None:
             filled = [u for u in value if u]
             existing_count = len(current_user.photos or [])
-            if current_user.is_onboarded and len(filled) < 2 and len(filled) < existing_count:
+            if current_user.is_onboarded and len(filled) < 4 and len(filled) < existing_count:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Your profile must have at least 2 photos.",
+                    detail="Your profile must have at least 4 photos.",
                 )
 
         # Email uniqueness check — skip if same as current
@@ -234,6 +242,33 @@ async def update_me(
                     detail="This email address is already in use.",
                 )
         setattr(current_user, field, value)
+
+        # When onboarding completes, validate required fields then gate on face verification.
+        if field == "is_onboarded" and value is True:
+            # ── Minimum 4 photos required ─────────────────────────────────────
+            # Count photos from the update payload (if being set now) or existing
+            photos_after = update_data.get("photos", current_user.photos) or []
+            filled_photos = [p for p in photos_after if p]
+            if len(filled_photos) < 4:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="You need at least 4 photos to complete your profile.",
+                )
+
+            # ── Religion required ─────────────────────────────────────────────
+            religion_after = update_data.get("religion_id", current_user.religion_id)
+            if not religion_after:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Please select your religion to complete your profile.",
+                )
+
+            # ── Immediately require face verification ─────────────────────────
+            # The 423 gate in main.py blocks all other API calls until the user
+            # passes face scan. face_scan_required is cleared on verification success.
+            if current_user.verification_status != "verified":
+                current_user.face_scan_required = True
+
         # When the user manually turns off travel mode, restore their real GPS location
         if field == "travel_mode_enabled" and value is False:
             current_user.travel_expires_at = None
@@ -261,7 +296,7 @@ async def update_me(
     await db.refresh(current_user)
     # Recompute compatibility score in background after every profile update
     background_tasks.add_task(_recompute_score_bg, current_user.id)
-    return MeResponse.model_validate(current_user)
+    return _build_me(current_user)
 
 
 async def _recompute_score_bg(user_id):
@@ -291,7 +326,7 @@ async def select_best_photo(
 
     if len(photos) < 2:
         # Nothing to reorder — return as-is
-        return MeResponse.model_validate(current_user)
+        return _build_me(current_user)
 
     async def _score_photo(client: httpx.AsyncClient, url: str) -> tuple[str, float]:
         try:
@@ -325,24 +360,93 @@ async def select_best_photo(
         [(url.split("/")[-1][:20], round(s, 3)) for url, s in scored],
     )
 
-    return MeResponse.model_validate(current_user)
+    return _build_me(current_user)
 
 
-@router.post("/me/push-token", summary="Register or update push notification token")
+@router.get("/me/push-token", summary="Get current push token registration status")
+async def get_push_token_status(
+    current_user: User = Depends(get_current_user),
+):
+    """Returns whether the user has a valid FCM token registered."""
+    raw = current_user.push_token or ""
+    is_fcm = bool(raw) and not raw.startswith("ExponentPushToken")
+    return {
+        "has_push_token": is_fcm,
+        "token_type": "fcm" if is_fcm else ("expo" if raw else None),
+    }
+
+
+@router.post("/me/push-token", summary="Register or update FCM push notification token")
 async def register_push_token(
     body: dict,
     current_user: User = Depends(get_current_user),
     db: AsyncSession    = Depends(get_db),
 ):
-    """Store the device push token (Expo or FCM) for this user."""
+    """Store the device FCM token for push notifications.
+
+    Replaces any previously stored token (including old Expo tokens).
+    The token is stored in the push_token column and used by the backend
+    to send FCM messages to this user's device.
+    """
     token = str(body.get("token", "")).strip()
     if not token:
         raise HTTPException(status_code=422, detail="token is required")
 
+    is_expo_token = token.startswith("ExponentPushToken")
+    token_type    = "expo_legacy" if is_expo_token else "fcm"
+
     current_user.push_token = token
     await db.commit()
-    _log.info("push-token | user=%s token=%s…", current_user.id, token[:24])
-    return {"ok": True}
+    _log.info(
+        "push-token | user=%s type=%s token=%s…",
+        current_user.id, token_type, token[:28],
+    )
+    return {"ok": True, "token_type": token_type}
+
+
+# ── Notification channels ─────────────────────────────────────────────────────
+
+# Channel definitions are served from here so the mobile app never needs a
+# code update to get new channels — just bump the list below.
+_NOTIFICATION_CHANNELS = [
+    {
+        "id": "activity",
+        "name": "Activity",
+        "description": "Matches, messages, likes and other activity",
+        "importance": "high",
+        "sound": True,
+        "vibration": True,
+        "badge": True,
+    },
+    {
+        "id": "incoming_call",
+        "name": "Incoming Calls",
+        "description": "Incoming voice and video call alerts",
+        "importance": "max",
+        "sound": True,
+        "vibration": True,
+        "badge": False,
+    },
+    {
+        "id": "marketing",
+        "name": "Promotions & Updates",
+        "description": "Feature updates, dating tips and promotions",
+        "importance": "default",
+        "sound": False,
+        "vibration": False,
+        "badge": False,
+    },
+]
+
+
+@router.get("/notification-channels", summary="Push notification channel definitions for client-side registration")
+async def get_notification_channels():
+    """
+    Returns the list of Android notification channels the app should register.
+    The client checks each channel's existence before creating it (idempotent).
+    No auth required — called on first app launch before sign-in.
+    """
+    return {"channels": _NOTIFICATION_CHANNELS}
 
 
 # ── Public email availability check ──────────────────────────────────────────
@@ -405,7 +509,7 @@ async def update_filters(
 
     if not data:
         # Nothing sent — just return the current profile unchanged
-        return MeResponse.model_validate(current_user)
+        return _build_me(current_user)
 
     # Reject Pro-only filters for free users — explicit 403 so any client
     # attempting to bypass frontend checks gets a clear error.
@@ -422,11 +526,18 @@ async def update_filters(
 
     for field, value in data.items():
         if field in _FILTER_FIELDS:
+            # Distance: cap at 80 km — null (previously "Any") becomes 80.
+            # This removes the unlimited/"Any" concept; 80 km is the hard max.
+            if field == "filter_max_distance_km":
+                if value is None:
+                    value = 80
+                else:
+                    value = min(int(value), 80)
             setattr(current_user, field, value)
 
     await db.commit()
     await db.refresh(current_user)
-    return MeResponse.model_validate(current_user)
+    return _build_me(current_user)
 
 
 @router.patch("/me/snooze", summary="Toggle snooze mode — hides profile from discovery")
