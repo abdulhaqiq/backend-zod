@@ -29,6 +29,10 @@ from app.models.login_event import LoginEvent
 from app.models.otp import OtpCode
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
+
+# Maximum number of concurrent active sessions per user.
+# Any older sessions beyond this cap are revoked automatically on new login/refresh.
+MAX_SESSIONS = 2
 from app.schemas.auth import (
     AppleAuthRequest,
     DeviceInfo,
@@ -216,6 +220,19 @@ async def _issue_token_pair(
     ))
 
     await db.flush()
+
+    # Enforce MAX_SESSIONS: keep only the N most-recent active tokens; revoke the rest.
+    # This runs after flush so the new token is already visible in the query.
+    _active_q = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+            RefreshToken.expires_at > now,
+        ).order_by(RefreshToken.created_at.desc())
+    )
+    _active_tokens = _active_q.scalars().all()
+    for _old_token in _active_tokens[MAX_SESSIONS:]:
+        _old_token.revoked_at = now
 
     return TokenResponse(
         access_token=access_token,
@@ -836,8 +853,6 @@ async def logout(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 from app.core.deps import get_current_user  # noqa: E402 – imported here to avoid circular
-
-MAX_SESSIONS = 2
 
 
 @router.get(

@@ -12,6 +12,7 @@ REST:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -169,16 +170,45 @@ async def websocket_notify(
     # Broadcast "online" to all matched partners immediately
     await _broadcast_presence(uid_me, online=True)
 
+    # Seconds of silence before the server sends a keep-alive ping.
+    # Must be shorter than any proxy/NAT timeout (typically 30-60 s).
+    _NOTIFY_PING_INTERVAL = 25
+    # Seconds to wait for the client to respond with a pong before giving up.
+    _NOTIFY_PONG_TIMEOUT  = 10
+
     try:
         while True:
-            raw = await websocket.receive_text()
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=_NOTIFY_PING_INTERVAL,
+                )
+            except asyncio.TimeoutError:
+                # No message from client for 25 s — send a server-initiated ping
+                # so routers/NATs see traffic and don't silently kill the connection.
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                    # Give the client up to 10 s to reply before declaring it dead.
+                    raw = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=_NOTIFY_PONG_TIMEOUT,
+                    )
+                    # If the client replied with anything (pong or a real message),
+                    # continue processing it below — fall through to the try block.
+                except asyncio.TimeoutError:
+                    _log.debug("ws:notify | user=%s ping timeout, closing", uid_me[:8])
+                    break
+                except (WebSocketDisconnect, OSError):
+                    break
             try:
                 data = json.loads(raw)
                 msg_type = data.get("type", "")
 
-                # ── Ping ──────────────────────────────────────────────────────
+                # ── Ping / pong (both directions) ──────────────────────────────
                 if msg_type == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
+                elif msg_type == "pong":
+                    pass  # response to our server-initiated ping — nothing to do
 
                 # ── Presence query ────────────────────────────────────────────
                 elif msg_type == "presence_query":
@@ -842,12 +872,11 @@ async def websocket_chat(
                 continue
 
             # ── Content restriction (text / answer messages only) ─────────────
+            # Restricted content is auto-censored to *** rather than rejected,
+            # so the message still goes through but scrubbed of violations.
             if msg_type in ("text", "answer", "card"):
-                from app.utils.content_filter import check_content
-                violation = check_content(content)
-                if violation:
-                    await websocket.send_text(json.dumps({"type": "restricted", "detail": violation}))
-                    continue
+                from app.utils.content_filter import sanitize_content
+                content = sanitize_content(content)
 
             async with AsyncSessionLocal() as db:
                 msg = Message(
@@ -885,45 +914,49 @@ async def websocket_chat(
             # Push notification if the recipient is offline
             if not delivered:
                 sender_name = current_user.full_name or "Someone"
-                # Friendly preview — don't expose raw URLs in notifications
                 if msg_type == "image":
-                    preview = "📷 Sent a photo"
+                    preview = "Sent a photo"
                 elif msg_type == "voice":
-                    preview = "🎙️ Sent a voice message"
+                    preview = "Sent a voice message"
                 elif msg_type == "card":
-                    preview = "🃏 Sent a card"
+                    preview = "Sent a card"
                 elif msg_type in ("game_wyr", "wyr"):
-                    preview = "🤷 Sent a Would You Rather"
+                    preview = "Sent a Would You Rather"
                 elif msg_type in ("game_nhi", "nhi"):
-                    preview = "🍹 Sent Never Have I Ever"
+                    preview = "Sent a Never Have I Ever"
                 elif msg_type in ("game_hot", "hot_takes"):
-                    preview = "🔥 Sent a Hot Take"
+                    preview = "Sent a Hot Take"
                 elif msg_type in ("game_quiz",):
-                    preview = "💘 Sent a Compatibility Quiz"
+                    preview = "Sent a Compatibility Quiz"
                 elif msg_type in ("game_date",):
-                    preview = "🗓️ Sent Build a Date"
+                    preview = "Sent a Build a Date"
                 elif msg_type in ("game_emoji",):
-                    preview = "😂 Sent an Emoji Story"
+                    preview = "Sent an Emoji Story"
                 elif msg_type in ("question_cards",):
-                    preview = "🎮 Sent a game card"
+                    preview = "Sent a game card"
                 elif msg_type == "tod_invite":
-                    preview = "🎲 Wants to play Truth or Dare"
+                    preview = "Sent a Truth or Dare"
                 elif msg_type == "tod_answer":
-                    preview = "🎲 Answered your Truth or Dare"
+                    preview = "Answered your Truth or Dare"
+                elif msg_type == "tod_choice":
+                    preview = "Chose in Truth or Dare"
                 elif msg_type == "call":
-                    preview = "📞 Missed call"
+                    preview = "Missed call"
                 else:
-                    preview = content[:80]
+                    preview = "New message"
+                sender_photo = (current_user.photos or [None])[0] or ""
                 await notify_user(
                     fresh_other, "chat",
-                    title=f"💬 {sender_name}",
+                    title=sender_name,
                     body=preview,
                     data={
                         "type":           "chat",
                         "room_id":        room_id,
                         "sender_id":      uid_me,
                         "sender_name":    sender_name,
+                        "sender_image":   sender_photo,
                         "other_user_id":  uid_me,
+                        "mutable_content": True,
                     },
                 )
 
@@ -952,14 +985,19 @@ async def get_conversations(
 
     uid = str(current_user.id)
 
-    # Get all matches for this user
+    # Get all non-expired matches for this user.
+    # A match is kept alive once either party sends a message (expires_at pushed to NULL sentinel).
+    # Expired matches (expires_at < NOW()) are hidden from conversations.
     matches_rows = await db.execute(
         text("""
             SELECT
                 CASE WHEN user1_id = CAST(:uid AS uuid) THEN user2_id ELSE user1_id END AS partner_id,
-                matched_at
+                matched_at,
+                is_super,
+                expires_at
             FROM matches
-            WHERE user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid)
+            WHERE (user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid))
+              AND expires_at > NOW()
             ORDER BY matched_at DESC
         """).bindparams(uid=uid)
     )
@@ -969,6 +1007,11 @@ async def get_conversations(
         return {"conversations": [], "total": 0}
 
     partner_ids = [str(r[0]) for r in match_rows]
+    # Keyed match metadata: partner_id → {matched_at, is_super, expires_at}
+    match_meta: dict[str, dict] = {
+        str(r[0]): {"matched_at": r[1], "is_super": r[2], "expires_at": r[3]}
+        for r in match_rows
+    }
 
     # Fetch partner profiles
     partners_result = await db.execute(
@@ -983,6 +1026,7 @@ async def get_conversations(
             continue
 
         room_id = Message.make_room_id(current_user.id, partner.id)
+        meta    = match_meta.get(partner_id, {})
 
         # Latest message in this room
         latest_result = await db.execute(
@@ -1004,6 +1048,8 @@ async def get_conversations(
         )
         unread_count = len(unread_result.scalars().all())
 
+        expires_at = meta.get("expires_at")
+
         conversations.append({
             "partner_id":     str(partner.id),
             "partner_name":   partner.full_name or "Unknown",
@@ -1012,6 +1058,8 @@ async def get_conversations(
             "last_message":   _msg_to_dict(latest_msg) if latest_msg else None,
             "unread_count":   unread_count,
             "is_online":      notify_manager.is_online(str(partner.id)),
+            "is_super_match": bool(meta.get("is_super")),
+            "expires_at":     expires_at.isoformat() if expires_at else None,
         })
 
     return {"conversations": conversations, "total": len(conversations)}
@@ -1155,6 +1203,20 @@ async def send_message(
         created_at=datetime.now(timezone.utc),
     )
     db.add(msg)
+
+    # First message ever in this match → extend expiry far into the future so
+    # the conversation is never auto-deleted once both parties have engaged.
+    u1, u2 = sorted([str(current_user.id), other_user_id])
+    await db.execute(
+        text("""
+            UPDATE matches
+            SET expires_at = NOW() + INTERVAL '3650 days'
+            WHERE user1_id = CAST(:u1 AS uuid)
+              AND user2_id = CAST(:u2 AS uuid)
+              AND expires_at < NOW() + INTERVAL '3649 days'
+        """).bindparams(u1=u1, u2=u2)
+    )
+
     await db.commit()
     await db.refresh(msg)
 
@@ -1173,17 +1235,20 @@ async def send_message(
         await notify_manager.send_to(str(other_uuid), notify_payload)
 
     if not delivered:
-        sender_name = current_user.full_name or "Someone"
+        sender_name  = current_user.full_name or "Someone"
+        sender_photo = (current_user.photos or [None])[0] or ""
         await notify_user(
             other_user, "chat",
             title=f"💬 {sender_name}",
-            body=content[:80],
+            body="💬 New message",
             data={
-                "type":          "chat",
-                "room_id":       room_id,
-                "sender_id":     str(current_user.id),
-                "sender_name":   sender_name,
-                "other_user_id": str(current_user.id),
+                "type":            "chat",
+                "room_id":         room_id,
+                "sender_id":       str(current_user.id),
+                "sender_name":     sender_name,
+                "sender_image":    sender_photo,
+                "other_user_id":   str(current_user.id),
+                "mutable_content": True,
             },
         )
 
@@ -1331,10 +1396,8 @@ async def edit_message(
     if not new_content:
         raise HTTPException(status_code=422, detail="content cannot be empty")
 
-    from app.utils.content_filter import check_content
-    violation = check_content(new_content)
-    if violation:
-        raise HTTPException(status_code=422, detail=violation)
+    from app.utils.content_filter import sanitize_content
+    new_content = sanitize_content(new_content)
 
     msg.content   = new_content
     msg.edited_at = datetime.now(timezone.utc)

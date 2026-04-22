@@ -130,16 +130,18 @@ async def _expire_if_needed(user: User, db: AsyncSession) -> str:
     return tier
 
 
-def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
-    """Return (is_active, tier, expires_at) from RevenueCat subscriber payload.
+def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None, str | None]:
+    """Return (is_active, tier, expires_at, product_id) from RevenueCat subscriber payload.
 
     Checks both 'premium' and 'pro' entitlements; premium takes precedence.
     tier is one of: 'premium_plus' | 'pro' | 'free'
     expires_at is always a naive UTC datetime (no tzinfo) to match the DB column
     type TIMESTAMP WITHOUT TIME ZONE.
+    product_id is the Apple product identifier from the active subscription.
     """
     subscriber = rc_data.get("subscriber", {})
     entitlements = subscriber.get("entitlements", {})
+    subscriptions = subscriber.get("subscriptions", {})
     now = datetime.now(timezone.utc)
 
     for rc_key, tier in [("premium", "premium_plus"), ("Premium", "premium_plus"),
@@ -148,14 +150,22 @@ def _extract_entitlement(rc_data: dict) -> tuple[bool, str, datetime | None]:
         if not ent:
             continue
         expires_str = ent.get("expires_date")
+        # Extract the product_id from the entitlement's product reference
+        product_identifier = ent.get("product_identifier")
+        # Also check subscriptions dict for the current period's product
+        if product_identifier and product_identifier in subscriptions:
+            sub_info = subscriptions[product_identifier]
+            product_id = sub_info.get("product_plan_identifier") or product_identifier
+        else:
+            product_id = product_identifier
         if not expires_str:
-            return True, tier, None  # lifetime
+            return True, tier, None, product_id  # lifetime
         expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
         if expires_at > now:
             # Strip timezone — DB column is TIMESTAMP WITHOUT TIME ZONE
-            return True, tier, expires_at.replace(tzinfo=None)
+            return True, tier, expires_at.replace(tzinfo=None), product_id
 
-    return False, "free", None
+    return False, "free", None, None
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -455,7 +465,7 @@ async def verify_purchase(
         raise HTTPException(501, "RevenueCat not configured — set REVENUECAT_SECRET_KEY")
 
     rc_data = await _rc_get_customer(body.revenuecat_customer_id)
-    is_active, new_tier, expires_at = _extract_entitlement(rc_data)
+    is_active, new_tier, expires_at, apple_product_id = _extract_entitlement(rc_data)
 
     # If another user already owns this RC customer ID (e.g. an old anonymous ID
     # from a previous account on the same device), clear it from them first so
@@ -489,6 +499,7 @@ async def verify_purchase(
         event_type="INITIAL_PURCHASE" if upgrading else "VERIFY",
         tier=new_tier,
         rc_customer_id=body.revenuecat_customer_id,
+        apple_product_id=apple_product_id,
         starts_at=datetime.now(timezone.utc),
         expires_at=expires_at,
     )

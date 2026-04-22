@@ -10,6 +10,7 @@ POST /discover/swipe   body: {swiped_id, direction, mode}
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import date, datetime, timezone, timedelta
@@ -480,6 +481,23 @@ async def _fetch_discover_profiles(
         if swiped_ids:
             stmt = stmt.where(User.id.not_in(swiped_ids))
 
+        # Also exclude profiles that liked this user but were rejected (left-swiped
+        # via the Liked You page) — these write to swipes but may not have a prior
+        # swipe record themselves, so check the liked_id side too.
+        disliked_likers_result = await db.execute(
+            text("""
+                SELECT l.liker_id
+                FROM likes l
+                JOIN swipes s ON s.swiped_id = l.liker_id
+                             AND s.swiper_id = CAST(:uid AS uuid)
+                             AND s.direction = 'left'
+                WHERE l.liked_id = CAST(:uid AS uuid)
+            """).bindparams(uid=str(me.id))
+        )
+        disliked_liker_ids = [row[0] for row in disliked_likers_result.fetchall()]
+        if disliked_liker_ids:
+            stmt = stmt.where(User.id.not_in(disliked_liker_ids))
+
         matched_result = await db.execute(
             text("""
                 SELECT CASE
@@ -531,27 +549,31 @@ async def _fetch_discover_profiles(
     _origin_lat, _origin_lon = _resolve_origin_coords(me)
 
     # ── Distance filter pushed into SQL (Haversine bounding-box + exact check) ─
-    # When we have an origin and a max_km cap is set, filter in SQL so we don't
-    # fetch thousands of far-away rows only to drop them in Python.
-    # null filter_max_distance_km defaults to 20 km (matches the client slider default).
-    # bypass_location_filter=True (admin override) skips ALL distance filtering
-    # so the user sees profiles from any location worldwide.
-    _effective_max_km = float(me.filter_max_distance_km) if me.filter_max_distance_km is not None else 20.0
+    # Only applied when the user has EXPLICITLY set a max distance (non-null
+    # filter_max_distance_km). A null value means "Any distance" — show everyone.
+    # When applied, profiles without lat/lon are always included (no location on
+    # record → we can't calculate distance, so we don't exclude them).
+    # bypass_location_filter=True (admin override) skips ALL distance filtering.
+    _user_set_distance = me.filter_max_distance_km is not None
+    _effective_max_km = float(me.filter_max_distance_km) if _user_set_distance else None
     if (
         not _bypass_distance
+        and _user_set_distance
+        and _effective_max_km is not None
         and _origin_lat is not None
         and _origin_lon is not None
     ):
         _max_km = _effective_max_km
         stmt = stmt.where(
             text(
-                # Haversine entirely in SQL — no PostGIS required.
-                "latitude  IS NOT NULL AND longitude IS NOT NULL AND "
+                # Profiles without location are always included (distance unknown).
+                # Profiles WITH location must be within max_km.
+                "(latitude IS NULL OR longitude IS NULL OR "
                 "2 * 6371 * ASIN(SQRT("
                 "  POWER(SIN(RADIANS(latitude  - :lat) / 2), 2) + "
                 "  COS(RADIANS(:lat)) * COS(RADIANS(latitude)) * "
                 "  POWER(SIN(RADIANS(longitude - :lon) / 2), 2)"
-                ")) <= :max_km"
+                ")) <= :max_km)"
             ).bindparams(lat=_origin_lat, lon=_origin_lon, max_km=_max_km)
         )
 
@@ -565,6 +587,7 @@ async def _fetch_discover_profiles(
         wf = me.work_filter_settings  # dict
 
         # Distance (overrides the global filter_max_distance_km for work mode)
+        # Only applied when explicitly set; profiles without lat/lon are always included.
         wf_distance = wf.get("distance_km")
         if (
             wf_distance is not None
@@ -575,12 +598,12 @@ async def _fetch_discover_profiles(
             wf_max_km = float(wf_distance)
             stmt = stmt.where(
                 text(
-                    "latitude IS NOT NULL AND longitude IS NOT NULL AND "
+                    "(latitude IS NULL OR longitude IS NULL OR "
                     "2 * 6371 * ASIN(SQRT("
                     "  POWER(SIN(RADIANS(latitude  - :wlat) / 2), 2) + "
                     "  COS(RADIANS(:wlat)) * COS(RADIANS(latitude)) * "
                     "  POWER(SIN(RADIANS(longitude - :wlon) / 2), 2)"
-                    ")) <= :wmaxkm"
+                    ")) <= :wmaxkm)"
                 ).bindparams(wlat=_origin_lat, wlon=_origin_lon, wmaxkm=wf_max_km)
             )
 
@@ -1088,6 +1111,9 @@ async def record_swipe(
             """).bindparams(swiper=str(current_user.id), swiped=body.swiped_id)
         )
 
+        # Check swipes table first; also fall back to the likes table so that
+        # profiles seeded/liked directly (without a swipe record) still trigger
+        # a match when the current user swipes right on them.
         result = await db.execute(
             text("""
                 SELECT 1 FROM swipes
@@ -1095,6 +1121,10 @@ async def record_swipe(
                   AND swiped_id = CAST(:swiper AS uuid)
                   AND direction IN ('right', 'super')
                   AND mode = :mode
+                UNION ALL
+                SELECT 1 FROM likes
+                WHERE liker_id = CAST(:swiped AS uuid)
+                  AND liked_id = CAST(:swiper AS uuid)
                 LIMIT 1
             """).bindparams(
                 swiped=body.swiped_id,
@@ -1106,13 +1136,22 @@ async def record_swipe(
 
         if is_match:
             # Persist match (stable ordering: smaller UUID first)
+            # Super-like matches get a 48h window; regular matches get 24h.
             u1, u2 = sorted([str(current_user.id), body.swiped_id])
+            expiry_hours = 48 if is_super else 24
             await db.execute(
                 text("""
-                    INSERT INTO matches (user1_id, user2_id)
-                    VALUES (CAST(:u1 AS uuid), CAST(:u2 AS uuid))
-                    ON CONFLICT DO NOTHING
-                """).bindparams(u1=u1, u2=u2)
+                    INSERT INTO matches (user1_id, user2_id, is_super, expires_at)
+                    VALUES (
+                        CAST(:u1 AS uuid),
+                        CAST(:u2 AS uuid),
+                        :is_super,
+                        NOW() + CAST(:expiry_hours || ' hours' AS INTERVAL)
+                    )
+                    ON CONFLICT (user1_id, user2_id) DO UPDATE
+                        SET is_super    = EXCLUDED.is_super,
+                            expires_at  = GREATEST(matches.expires_at, EXCLUDED.expires_at)
+                """).bindparams(u1=u1, u2=u2, is_super=is_super, expiry_hours=expiry_hours)
             )
 
     await db.commit()
@@ -1129,12 +1168,13 @@ async def record_swipe(
             swiped_user = swiped_result.scalar_one_or_none()
 
             # ── WebSocket: real-time match event to both users ────────────────
-            match_payload = {"type": "match", "profile": liker_profile}
+            # is_super tells the receiving client to render a golden ring
+            match_payload = {"type": "match", "profile": liker_profile, "is_super": is_super}
             await nm.send_to(body.swiped_id, match_payload)
             if swiped_user:
                 await nm.send_to(
                     str(current_user.id),
-                    {"type": "match", "profile": _build_profile(swiped_user, None)},
+                    {"type": "match", "profile": _build_profile(swiped_user, None), "is_super": is_super},
                 )
 
             # ── Push notification: for users not on the WS (background/killed) ─
@@ -1248,9 +1288,13 @@ async def get_match_profile(
 
     # Compatibility — cached in user_compatibility table, only recomputed when
     # either user's profile has changed (detected by profile_hash comparison).
+    # 10-second timeout guards against OpenAI API hangs (falls back gracefully).
     compat: dict | None = None
     try:
-        compat = await get_or_compute_compatibility(current_user, target, db)
+        compat = await asyncio.wait_for(
+            get_or_compute_compatibility(current_user, target, db),
+            timeout=10.0,
+        )
     except Exception:
         _log.warning("Could not compute compatibility for %s ↔ %s", current_user.id, uid)
 

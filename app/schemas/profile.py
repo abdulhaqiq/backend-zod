@@ -116,6 +116,9 @@ class ProfileUpdateRequest(BaseModel):
     prayer_frequency_id:  int | None = None                # lookup_options (category=prayer_frequency)
     marriage_timeline_id: int | None = None                # lookup_options (category=marriage_timeline)
     wali_email:           str | None = Field(None, max_length=255)
+    wali_name:            str | None = Field(None, max_length=128)
+    wali_age:             int | None = Field(None, ge=18, le=120)
+    wali_relation:        str | None = Field(None, max_length=64)
     wali_verified:        bool | None = None               # can be set by the user themselves
     blur_photos_halal:    bool | None = None
     halal_mode_enabled:   bool | None = None
@@ -226,6 +229,9 @@ class MeResponse(BaseModel):
     prayer_frequency_id:  int | None
     marriage_timeline_id: int | None
     wali_email:           str | None
+    wali_name:            str | None
+    wali_age:             int | None
+    wali_relation:        str | None
     wali_verified:        bool
     blur_photos_halal:    bool
     halal_mode_enabled:   bool

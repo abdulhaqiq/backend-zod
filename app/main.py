@@ -45,21 +45,14 @@ async def lifespan(app: FastAPI):
     # Create all tables on startup (no-op for existing tables).
     # Wrapped in try/except so a transient DB timeout doesn't prevent startup
     # when tables already exist (e.g. connecting to a remote production DB).
-    import asyncio as _asyncio_startup
-    try:
-        async def _create_tables():
-            async with engine.begin() as conn:
-                await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
-        await _asyncio_startup.wait_for(_create_tables(), timeout=10.0)
-    except Exception as _create_exc:
-        import logging as _clog
-        _clog.getLogger(__name__).warning(
-            "create_all skipped (non-critical — tables likely already exist or DB unreachable): %s",
-            _create_exc.__class__.__name__,
-        )
+    # create_all is intentionally skipped — all schema changes are handled
+    # by the incremental _MIGRATIONS list below which use IF NOT EXISTS clauses.
+    # Running create_all on every startup against a remote SSL DB is slow (10-15s)
+    # and blocks the server from accepting connections during that window.
 
-    # Incremental column migrations — each runs in its own short transaction so the
-    # AccessExclusiveLock is released immediately and can't deadlock with live queries.
+    # Incremental column migrations — all run in a single connection to avoid the
+    # SSL handshake overhead of opening a new connection per statement (which caused
+    # 8-15s startup timeouts). Each statement uses IF NOT EXISTS so it's idempotent.
     from sqlalchemy import text as _text
     import logging as _mlog
     _mig_log = _mlog.getLogger(__name__)
@@ -235,24 +228,41 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_email_verified BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_otp_hash VARCHAR(255)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS university_otp_expires_at TIMESTAMPTZ",
+        # Wali information fields
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_name VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_age INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_relation VARCHAR(128)",
+        # is_banned — separates admin bans from snooze (is_active=False)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     import asyncio as _asyncio
 
-    async def _run_migrations() -> None:
-        for _sql in _MIGRATIONS:
-            try:
-                async with engine.begin() as _conn:
-                    await _conn.execute(_text(_sql))
-            except Exception as _migration_exc:
-                _mig_log.warning("Migration skipped (%s): %s", _migration_exc.__class__.__name__, _sql)
-
-    try:
-        await _asyncio.wait_for(_run_migrations(), timeout=15.0)
-    except _asyncio.TimeoutError:
-        _mig_log.warning(
-            "Startup migrations timed out after 15s (DB unreachable?). "
-            "Server will start anyway — migrations will run on next healthy restart."
-        )
+    async def _run_migrations_bg() -> None:
+        """
+        Run schema migrations in the background after the server starts accepting
+        requests. Uses a single DB connection for all statements (avoids the
+        SSL handshake overhead that caused 8-15s startup delays when opening one
+        connection per statement). All statements are IF NOT EXISTS so they are
+        safe to run repeatedly.
+        """
+        await _asyncio.sleep(0)  # yield so lifespan finishes first
+        try:
+            async with engine.connect() as _conn:
+                for _sql in _MIGRATIONS:
+                    try:
+                        await _conn.execute(_text(_sql))
+                    except Exception as _migration_exc:
+                        _mig_log.warning(
+                            "Migration skipped (%s): %.120s",
+                            _migration_exc.__class__.__name__, _sql,
+                        )
+                await _conn.commit()
+            _mig_log.info("Background migrations complete.")
+        except Exception as _conn_exc:
+            _mig_log.warning(
+                "Background migrations failed — DB unreachable: %s",
+                _conn_exc.__class__.__name__,
+            )
 
     import asyncio
     import logging
@@ -442,6 +452,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_expire_travel_modes()),
         asyncio.create_task(_enable_bypass_location_for_tester()),
         asyncio.create_task(_expire_subscriptions()),
+        # Migrations run fully in background — zero startup latency
+        asyncio.create_task(_run_migrations_bg()),
     }
     # Keep strong references so GC doesn't discard them before they finish
     for _t in _bg_tasks:

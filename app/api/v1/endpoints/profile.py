@@ -81,7 +81,8 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "notif_promotions", "notif_dating_tips",
     # Halal profile fields
     "sect_id", "prayer_frequency_id", "marriage_timeline_id",
-    "wali_email", "wali_verified", "blur_photos_halal", "halal_mode_enabled", "work_mode_enabled",
+    "wali_email", "wali_name", "wali_age", "wali_relation", "wali_verified",
+    "blur_photos_halal", "halal_mode_enabled", "work_mode_enabled",
     # Halal filters
     "filter_sect", "filter_prayer_frequency", "filter_marriage_timeline",
     "filter_wali_verified_only", "filter_wants_to_work",

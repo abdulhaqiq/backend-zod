@@ -22,6 +22,7 @@ New/empty profiles start at 10 (blank slate = maximum potential).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -266,15 +267,18 @@ Reply ONLY with valid JSON, no markdown:
             f"Profile:\n{json.dumps(snapshot, default=str, ensure_ascii=False, indent=2)}"
         )
 
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user_msg},
-            ],
-            temperature=0.25,
-            max_tokens=700,
-            response_format={"type": "json_object"},
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.25,
+                max_tokens=700,
+                response_format={"type": "json_object"},
+            ),
+            timeout=15.0,
         )
 
         data       = json.loads(resp.choices[0].message.content)

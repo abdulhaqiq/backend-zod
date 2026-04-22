@@ -139,13 +139,18 @@ async def send_push_notification(
 
     is_marketing = channel_id == "marketing"
 
+    # mutable_content in data signals iOS to run the Notification Service
+    # Extension so it can download and attach the sender's photo.
+    _mutable = bool((data or {}).get("mutable_content"))
+
     payload: dict[str, Any] = {
-        "to":       push_token,
-        "title":    title,
-        "body":     body,
-        "sound":    None if is_marketing else "default",
-        "priority": "high" if priority == "high" else "normal",
-        "channelId": channel_id,
+        "to":            push_token,
+        "title":         title,
+        "body":          body,
+        "sound":         None if is_marketing else "default",
+        "priority":      "high" if priority == "high" else "normal",
+        "channelId":     channel_id,
+        "mutableContent": _mutable,
     }
     if data:
         payload["data"] = data

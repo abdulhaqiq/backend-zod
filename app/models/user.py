@@ -220,6 +220,9 @@ class User(Base):
     prayer_frequency_id:  Mapped[int | None]  = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=prayer_frequency)
     marriage_timeline_id: Mapped[int | None]  = mapped_column(Integer, nullable=True)         # FK → lookup_options (category=marriage_timeline)
     wali_email:           Mapped[str | None]  = mapped_column(String(255), nullable=True)     # Guardian's email
+    wali_name:            Mapped[str | None]  = mapped_column(String(128), nullable=True)     # Guardian's full name
+    wali_age:             Mapped[int | None]  = mapped_column(Integer, nullable=True)         # Guardian's age
+    wali_relation:        Mapped[str | None]  = mapped_column(String(64),  nullable=True)     # Relation e.g. Father, Brother
     wali_verified:        Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
     blur_photos_halal:    Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
     halal_mode_enabled:   Mapped[bool]        = mapped_column(Boolean, default=False, nullable=False)
@@ -256,7 +259,10 @@ class User(Base):
     id_scan_required:   Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # ── Status flags ─────────────────────────────────────────────────────────
+    # is_active=False → snooze mode: hidden from discovery feed but can still use the app
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # is_banned=True → admin block: full API access denied (distinct from snooze)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_onboarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

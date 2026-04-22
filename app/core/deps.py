@@ -62,16 +62,19 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Resolve the JWT and enforce that the account is active (not admin-disabled)."""
+    """Resolve the JWT and enforce the account is not banned.
+
+    is_active=False means snooze mode — the user is hidden from the discovery
+    feed but can still use the app normally (log in, chat, change settings, etc.).
+
+    is_banned=True is set by admins to fully block a user's API access.
+    """
     user = await _resolve_user(credentials, db)
 
-    # is_active=False via admin ban — block access.
-    # Note: snooze mode also sets is_active=False, but that endpoint uses
-    # get_current_user_allow_inactive so snoozed users can still toggle themselves back.
-    if not user.is_active:
+    if getattr(user, 'is_banned', False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is inactive",
+            detail="Account has been suspended.",
         )
 
     return user
@@ -81,12 +84,12 @@ async def get_current_user_allow_inactive(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Resolve the JWT without enforcing is_active.
+    """Alias of get_current_user — kept for backwards compatibility.
 
-    Use this for endpoints that snoozed users must still be able to reach
-    (e.g. the snooze toggle itself, so they can turn snooze back off).
+    Snooze (is_active=False) no longer blocks API access; only is_banned does.
+    This dependency remains so existing endpoint signatures don't need changing.
     """
-    return await _resolve_user(credentials, db)
+    return await get_current_user(credentials, db)
 
 
 async def get_pro_user(
