@@ -38,6 +38,7 @@ import app.models.verification  # noqa: F401
 import app.models.lookup  # noqa: F401
 import app.models.card  # noqa: F401
 import app.models.mini_game  # noqa: F401
+import app.models.marketing  # noqa: F401
 
 
 @asynccontextmanager
@@ -234,6 +235,53 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS wali_relation VARCHAR(128)",
         # is_banned — separates admin bans from snooze (is_active=False)
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE",
+        # ── Marketing notification tables ──────────────────────────────────────
+        """CREATE TABLE IF NOT EXISTS marketing_countries (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(128) NOT NULL,
+            code VARCHAR(8) NOT NULL,
+            region VARCHAR(64) NOT NULL,
+            tz_name VARCHAR(64) NOT NULL,
+            peak_hours JSONB NOT NULL DEFAULT '[]',
+            primary_language VARCHAR(8) NOT NULL DEFAULT 'en',
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            CONSTRAINT uq_marketing_country_code_tz UNIQUE (code, tz_name)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_marketing_countries_region ON marketing_countries (region)",
+        "CREATE INDEX IF NOT EXISTS idx_marketing_countries_code ON marketing_countries (code)",
+        """CREATE TABLE IF NOT EXISTS marketing_templates (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(256) NOT NULL,
+            language_code VARCHAR(8) NOT NULL DEFAULT 'en',
+            title VARCHAR(256) NOT NULL,
+            body TEXT NOT NULL,
+            notif_type VARCHAR(32) NOT NULL DEFAULT 'promotions',
+            data JSONB,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_marketing_templates_lang ON marketing_templates (language_code)",
+        """CREATE TABLE IF NOT EXISTS marketing_campaigns (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(256),
+            template_id INTEGER,
+            custom_title VARCHAR(256),
+            custom_body TEXT,
+            target VARCHAR(32) NOT NULL DEFAULT 'all',
+            target_value VARCHAR(128),
+            language_code VARCHAR(8),
+            scheduler_tz VARCHAR(64),
+            scheduler_hour INTEGER,
+            status VARCHAR(32) NOT NULL DEFAULT 'sent',
+            triggered_by VARCHAR(32) NOT NULL DEFAULT 'admin',
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            sent_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_marketing_campaigns_created ON marketing_campaigns (created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_marketing_campaigns_triggered ON marketing_campaigns (triggered_by)",
     ]
     import asyncio as _asyncio
 
@@ -409,6 +457,90 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _log.warning("Subscription expiry loop error (non-critical): %s", exc)
 
+    async def _marketing_scheduler():
+        """
+        Every 30 minutes: send marketing push notifications to users in countries
+        whose current local hour matches one of the configured peak_hours.
+
+        Language is auto-detected per user from their spoken languages list.
+        Scheduler deduplication: skips if a send for the same (code, tz_name, hour)
+        already ran within the last 55 minutes.
+        """
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        from sqlalchemy import select as _sel
+        from app.db.session import AsyncSessionLocal
+        from app.models.marketing import MarketingCountry, MarketingTemplate, MarketingCampaign
+        from app.models.user import User
+        from app.api.v1.endpoints.marketing import _execute_send, _lang_lookup_cache
+        from datetime import datetime, timezone, timedelta
+
+        while True:
+            await asyncio.sleep(1800)  # run every 30 minutes
+            try:
+                now_utc = datetime.now(timezone.utc)
+                async with AsyncSessionLocal() as db:
+                    # Load all active countries
+                    result = await db.execute(
+                        _sel(MarketingCountry).where(MarketingCountry.is_active.is_(True))
+                    )
+                    countries = result.scalars().all()
+
+                    for country in countries:
+                        try:
+                            tz = ZoneInfo(country.tz_name)
+                        except ZoneInfoNotFoundError:
+                            _log.warning("marketing_scheduler | unknown tz: %s", country.tz_name)
+                            continue
+
+                        local_now = now_utc.astimezone(tz)
+                        local_hour = local_now.hour
+
+                        if local_hour not in (country.peak_hours or []):
+                            continue
+
+                        # Dedup: skip if already sent for this country+tz+hour in last 55 min
+                        cutoff = now_utc - timedelta(minutes=55)
+                        existing = await db.execute(
+                            _sel(MarketingCampaign).where(
+                                MarketingCampaign.triggered_by == "scheduler",
+                                MarketingCampaign.target_value == country.code,
+                                MarketingCampaign.scheduler_tz == country.tz_name,
+                                MarketingCampaign.scheduler_hour == local_hour,
+                                MarketingCampaign.created_at >= cutoff,
+                            ).limit(1)
+                        )
+                        if existing.scalar_one_or_none() is not None:
+                            continue  # already sent this hour for this country/tz
+
+                        # Send — language auto-detected per user, country is the targeting key
+                        try:
+                            res = await _execute_send(
+                                db,
+                                target="country",
+                                target_value=country.code,
+                                template_id=None,      # will auto-pick template per user language
+                                custom_title=None,
+                                custom_body=None,
+                                language_override=None,
+                                triggered_by="scheduler",
+                                campaign_name=f"Scheduler · {country.name} · {local_hour:02d}:00",
+                                scheduler_tz=country.tz_name,
+                                scheduler_hour=local_hour,
+                            )
+                            _log.info(
+                                "marketing_scheduler | %s (%s) %02d:00 → sent=%d failed=%d",
+                                country.name, country.tz_name, local_hour,
+                                res.get("sent", 0), res.get("failed", 0),
+                            )
+                        except Exception as send_exc:
+                            _log.warning(
+                                "marketing_scheduler | send error for %s (%s): %s",
+                                country.name, country.tz_name, send_exc,
+                            )
+
+            except Exception as outer_exc:
+                _log.warning("marketing_scheduler | loop error (non-critical): %s", outer_exc)
+
     async def _enable_bypass_location_for_tester():
         """
         On every startup: ensure the owner account has full admin access and
@@ -452,6 +584,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_expire_travel_modes()),
         asyncio.create_task(_enable_bypass_location_for_tester()),
         asyncio.create_task(_expire_subscriptions()),
+        asyncio.create_task(_marketing_scheduler()),
         # Migrations run fully in background — zero startup latency
         asyncio.create_task(_run_migrations_bg()),
     }

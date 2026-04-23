@@ -48,7 +48,7 @@ _ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "education_level_id", "looking_for_id", "family_plans_id",
     "have_kids_id", "star_sign_id", "religion_id", "ethnicity_id",
     "is_onboarded", "dark_mode", "best_photo_enabled",
-    "city", "hometown", "address", "country",
+    "city", "hometown", "living_in", "address", "country",
     # NOTE: latitude/longitude are intentionally excluded — coordinates must be
     # set only through POST /location/update (GPS) or POST /location/change-city
     # (travel mode). Direct coordinate injection via PATCH is not permitted.
@@ -114,7 +114,7 @@ def _build_me(user: User) -> MeResponse:
     """Build a MeResponse, injecting computed fields that can't live in the schema."""
     r = MeResponse.model_validate(user)
     raw = user.push_token or ""
-    r.has_push_token = bool(raw) and not raw.startswith("ExponentPushToken")
+    r.has_push_token = bool(raw)
     return r
 
 
@@ -370,10 +370,10 @@ async def get_push_token_status(
 ):
     """Returns whether the user has a valid FCM token registered."""
     raw = current_user.push_token or ""
-    is_fcm = bool(raw) and not raw.startswith("ExponentPushToken")
+    is_expo = raw.startswith("ExponentPushToken")
     return {
-        "has_push_token": is_fcm,
-        "token_type": "fcm" if is_fcm else ("expo" if raw else None),
+        "has_push_token": bool(raw),
+        "token_type": "expo" if is_expo else ("fcm" if raw else None),
     }
 
 

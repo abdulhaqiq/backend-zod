@@ -972,97 +972,219 @@ async def websocket_chat(
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
 
-@router.get("/chat/conversations", summary="List conversations with latest message per match")
-async def get_conversations(
+@router.get("/chat/matches/new", summary="Paginated list of new matches (no messages yet)")
+async def get_new_matches(
+    page:  int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=50),
     current_user: User = Depends(get_current_user),
     db: AsyncSession    = Depends(get_db),
 ):
     """
-    Returns a list of conversations (one per matched user) with the latest
-    message preview, unread count, and basic partner profile info.
+    Returns matches that have no messages exchanged yet — these appear as
+    circles in the New Matches horizontal strip.  Paginated: page=0 offset=0,
+    page=1 offset=10, etc.  Only non-expired matches are returned.
     """
     from sqlalchemy import text
 
     uid = str(current_user.id)
 
-    # Get all non-expired matches for this user.
-    # A match is kept alive once either party sends a message (expires_at pushed to NULL sentinel).
-    # Expired matches (expires_at < NOW()) are hidden from conversations.
-    matches_rows = await db.execute(
+    # Total count (for has_more)
+    count_row = (await db.execute(
+        text("""
+            SELECT COUNT(*) FROM matches m
+            WHERE (m.user1_id = CAST(:uid AS uuid) OR m.user2_id = CAST(:uid AS uuid))
+              AND m.expires_at > NOW()
+              AND NOT EXISTS (
+                SELECT 1 FROM messages msg
+                WHERE msg.room_id = CONCAT(
+                    LEAST(m.user1_id::text, m.user2_id::text), ':',
+                    GREATEST(m.user1_id::text, m.user2_id::text)
+                )
+              )
+        """).bindparams(uid=uid)
+    )).scalar()
+    total: int = count_row or 0
+
+    rows = (await db.execute(
         text("""
             SELECT
-                CASE WHEN user1_id = CAST(:uid AS uuid) THEN user2_id ELSE user1_id END AS partner_id,
-                matched_at,
-                is_super,
-                expires_at
-            FROM matches
-            WHERE (user1_id = CAST(:uid AS uuid) OR user2_id = CAST(:uid AS uuid))
-              AND expires_at > NOW()
-            ORDER BY matched_at DESC
-        """).bindparams(uid=uid)
-    )
-    match_rows = matches_rows.fetchall()
+                CASE WHEN m.user1_id = CAST(:uid AS uuid) THEN m.user2_id ELSE m.user1_id END AS partner_id,
+                m.matched_at,
+                m.is_super,
+                m.expires_at
+            FROM matches m
+            WHERE (m.user1_id = CAST(:uid AS uuid) OR m.user2_id = CAST(:uid AS uuid))
+              AND m.expires_at > NOW()
+              AND NOT EXISTS (
+                SELECT 1 FROM messages msg
+                WHERE msg.room_id = CONCAT(
+                    LEAST(m.user1_id::text, m.user2_id::text), ':',
+                    GREATEST(m.user1_id::text, m.user2_id::text)
+                )
+              )
+            ORDER BY m.matched_at DESC
+            LIMIT :lim OFFSET :off
+        """).bindparams(uid=uid, lim=limit, off=page * limit)
+    )).fetchall()
 
-    if not match_rows:
-        return {"conversations": [], "total": 0}
+    if not rows:
+        return {"matches": [], "total": total, "has_more": False}
 
-    partner_ids = [str(r[0]) for r in match_rows]
-    # Keyed match metadata: partner_id → {matched_at, is_super, expires_at}
-    match_meta: dict[str, dict] = {
-        str(r[0]): {"matched_at": r[1], "is_super": r[2], "expires_at": r[3]}
-        for r in match_rows
-    }
-
-    # Fetch partner profiles
-    partners_result = await db.execute(
-        select(User).where(User.id.in_(partner_ids))
-    )
+    partner_ids = [str(r[0]) for r in rows]
+    partners_result = await db.execute(select(User).where(User.id.in_(partner_ids)))
     partners: dict[str, User] = {str(u.id): u for u in partners_result.scalars().all()}
 
+    matches = []
+    for r in rows:
+        partner_id = str(r[0])
+        partner    = partners.get(partner_id)
+        if not partner:
+            continue
+        expires_at = r[3]
+        matches.append({
+            "partner_id":    partner_id,
+            "partner_name":  partner.full_name or "Unknown",
+            "partner_image": (partner.photos or [None])[0],
+            "is_super":      bool(r[2]),
+            "matched_at":    r[1].isoformat(),
+            "expires_at":    expires_at.isoformat() if expires_at else None,
+            "is_online":     notify_manager.is_online(partner_id),
+        })
+
+    return {"matches": matches, "total": total, "has_more": (page + 1) * limit < total}
+
+
+@router.get("/chat/conversations", summary="Paginated all matches sorted by latest activity")
+async def get_conversations(
+    page:  int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession    = Depends(get_db),
+):
+    """
+    Returns ALL non-expired matches paginated, sorted by latest activity
+    (last message time if any messages, otherwise match time).
+    The frontend splits them: no last_message → new match circles,
+    has last_message → conversation row.
+    """
+    from sqlalchemy import text
+
+    uid = str(current_user.id)
+
+    # Total count
+    total: int = (await db.execute(
+        text("""
+            SELECT COUNT(*) FROM matches m
+            WHERE (m.user1_id = CAST(:uid AS uuid) OR m.user2_id = CAST(:uid AS uuid))
+              AND m.expires_at > NOW()
+        """).bindparams(uid=uid)
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        text("""
+            SELECT
+                CASE WHEN m.user1_id = CAST(:uid AS uuid)
+                     THEN m.user2_id ELSE m.user1_id END   AS partner_id,
+                m.matched_at,
+                m.is_super,
+                m.expires_at,
+                CONCAT(
+                    LEAST(m.user1_id::text, m.user2_id::text), ':',
+                    GREATEST(m.user1_id::text, m.user2_id::text)
+                )                                           AS room_id,
+                COALESCE(
+                    (SELECT msg.created_at FROM messages msg
+                     WHERE msg.room_id = CONCAT(
+                         LEAST(m.user1_id::text, m.user2_id::text), ':',
+                         GREATEST(m.user1_id::text, m.user2_id::text))
+                     ORDER BY msg.created_at DESC LIMIT 1),
+                    m.matched_at
+                )                                           AS sort_at
+            FROM matches m
+            WHERE (m.user1_id = CAST(:uid AS uuid) OR m.user2_id = CAST(:uid AS uuid))
+              AND m.expires_at > NOW()
+            ORDER BY sort_at DESC
+            LIMIT :lim OFFSET :off
+        """).bindparams(uid=uid, lim=limit, off=page * limit)
+    )).fetchall()
+
+    if not rows:
+        return {"conversations": [], "total": total, "has_more": False}
+
+    partner_ids = [str(r[0]) for r in rows]
+    partners_result = await db.execute(select(User).where(User.id.in_(partner_ids)))
+    partners: dict[str, User] = {str(u.id): u for u in partners_result.scalars().all()}
+
+    room_ids = [r[4] for r in rows]
+
+    # Batch latest message per room
+    latest_msgs_raw = (await db.execute(
+        text("""
+            SELECT DISTINCT ON (room_id)
+                room_id, id, sender_id, receiver_id, content, msg_type,
+                extra, is_read, read_at, edited_at, created_at
+            FROM messages
+            WHERE room_id = ANY(:rooms)
+            ORDER BY room_id, created_at DESC
+        """).bindparams(rooms=room_ids)
+    )).fetchall()
+    latest_by_room: dict[str, Any] = {r[0]: r for r in latest_msgs_raw}
+
+    # Batch unread counts
+    unread_raw = (await db.execute(
+        text("""
+            SELECT room_id, COUNT(*) AS cnt
+            FROM messages
+            WHERE room_id = ANY(:rooms)
+              AND receiver_id = CAST(:uid AS uuid)
+              AND is_read = FALSE
+            GROUP BY room_id
+        """).bindparams(rooms=room_ids, uid=uid)
+    )).fetchall()
+    unread_by_room: dict[str, int] = {r[0]: int(r[1]) for r in unread_raw}
+
     conversations = []
-    for partner_id in partner_ids:
-        partner = partners.get(partner_id)
+    for r in rows:
+        partner_id = str(r[0])
+        partner    = partners.get(partner_id)
         if not partner:
             continue
 
-        room_id = Message.make_room_id(current_user.id, partner.id)
-        meta    = match_meta.get(partner_id, {})
+        room_id    = r[4]
+        expires_at = r[3]
+        lm         = latest_by_room.get(room_id)
 
-        # Latest message in this room
-        latest_result = await db.execute(
-            select(Message)
-            .where(Message.room_id == room_id)
-            .order_by(Message.created_at.desc())
-            .limit(1)
-        )
-        latest_msg = latest_result.scalar_one_or_none()
-
-        # Unread count (messages FROM partner that I haven't read)
-        unread_result = await db.execute(
-            select(Message)
-            .where(
-                Message.room_id == room_id,
-                Message.sender_id == partner.id,
-                Message.is_read == False,  # noqa: E712
-            )
-        )
-        unread_count = len(unread_result.scalars().all())
-
-        expires_at = meta.get("expires_at")
+        last_message = None
+        if lm:
+            last_message = {
+                "id":          str(lm[1]),
+                "room_id":     lm[0],
+                "sender_id":   str(lm[2]),
+                "receiver_id": str(lm[3]),
+                "content":     lm[4],
+                "msg_type":    lm[5],
+                "metadata":    lm[6],
+                "is_read":     lm[7],
+                "read_at":     lm[8].isoformat() if lm[8] else None,
+                "edited_at":   lm[9].isoformat() if lm[9] else None,
+                "created_at":  lm[10].isoformat(),
+                "reactions":   [],
+            }
 
         conversations.append({
-            "partner_id":     str(partner.id),
+            "partner_id":     partner_id,
             "partner_name":   partner.full_name or "Unknown",
             "partner_image":  (partner.photos or [None])[0],
             "room_id":        room_id,
-            "last_message":   _msg_to_dict(latest_msg) if latest_msg else None,
-            "unread_count":   unread_count,
-            "is_online":      notify_manager.is_online(str(partner.id)),
-            "is_super_match": bool(meta.get("is_super")),
+            "last_message":   last_message,
+            "unread_count":   unread_by_room.get(room_id, 0),
+            "is_online":      notify_manager.is_online(partner_id),
+            "is_super_match": bool(r[2]),
+            "matched_at":     r[1].isoformat(),
             "expires_at":     expires_at.isoformat() if expires_at else None,
         })
 
-    return {"conversations": conversations, "total": len(conversations)}
+    return {"conversations": conversations, "total": total, "has_more": (page + 1) * limit < total}
 
 
 @router.delete("/chat/messages/{message_id}", summary="Unsend (delete) a message you sent")
@@ -1204,8 +1326,10 @@ async def send_message(
     )
     db.add(msg)
 
-    # First message ever in this match → extend expiry far into the future so
-    # the conversation is never auto-deleted once both parties have engaged.
+    # Extend match to permanent only once BOTH parties have chatted.
+    # We check if the OTHER user already has at least one message in this room.
+    # - First message (no reply yet): timer stays visible in conversations.
+    # - First reply from the other side: timer disappears, match becomes permanent.
     u1, u2 = sorted([str(current_user.id), other_user_id])
     await db.execute(
         text("""
@@ -1214,7 +1338,13 @@ async def send_message(
             WHERE user1_id = CAST(:u1 AS uuid)
               AND user2_id = CAST(:u2 AS uuid)
               AND expires_at < NOW() + INTERVAL '3649 days'
-        """).bindparams(u1=u1, u2=u2)
+              AND EXISTS (
+                SELECT 1 FROM messages
+                WHERE room_id   = :room_id
+                  AND sender_id = CAST(:other_id AS uuid)
+                LIMIT 1
+              )
+        """).bindparams(u1=u1, u2=u2, room_id=room_id, other_id=other_user_id)
     )
 
     await db.commit()

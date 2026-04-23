@@ -146,7 +146,8 @@ class SendNotificationRequest(BaseModel):
     title: str
     body: str
     target: Literal["all", "user"] = "all"
-    phone: str | None = None        # required when target="user"
+    phone: str | None = None        # look up by phone when target="user"
+    email: str | None = None        # look up by email when target="user"
     channel: Literal["activity", "marketing"] = "marketing"
     data: dict | None = None
 
@@ -161,20 +162,26 @@ async def send_notification(
     Send a push notification via Expo Push Service.
 
     - target="all"  → broadcast to every user with a push token
-    - target="user" → send to the single user identified by phone
+    - target="user" → send to the single user identified by phone OR email
     """
     if req.target == "user":
-        if not req.phone:
+        if not req.phone and not req.email:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="phone is required when target='user'",
+                detail="phone or email is required when target='user'",
             )
-        result = await db.execute(select(User).where(User.phone == req.phone))
-        target_user: User | None = result.scalar_one_or_none()
+        target_user: User | None = None
+        if req.phone:
+            result = await db.execute(select(User).where(User.phone == req.phone))
+            target_user = result.scalar_one_or_none()
+        if not target_user and req.email:
+            result = await db.execute(select(User).where(User.email == req.email.strip()))
+            target_user = result.scalar_one_or_none()
         if not target_user:
+            identifier = req.email or req.phone
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No user found with phone {req.phone}",
+                detail=f"No user found with identifier {identifier}",
             )
         recipients = [target_user]
     else:

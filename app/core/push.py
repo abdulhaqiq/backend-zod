@@ -159,7 +159,10 @@ async def send_push_notification(
 
     encoded = json.dumps(payload).encode("utf-8")
 
+    _stale_token: bool = False
+
     def _send() -> None:
+        nonlocal _stale_token
         req = urllib.request.Request(
             "https://exp.host/--/api/v2/push/send",
             data=encoded,
@@ -176,10 +179,15 @@ async def send_push_notification(
         item = result.get("data", {})
         status = item.get("status")
         if status == "error":
+            details = item.get("details", {})
+            error_type = (details or {}).get("error", "") if isinstance(details, dict) else ""
             _log.warning(
-                "push | Expo error token=%s… details=%s",
-                push_token[:30], item.get("details", {}),
+                "push | Expo error token=%s… error=%s details=%s",
+                push_token[:30], error_type, details,
             )
+            # Mark token as stale so caller can clear it from the DB
+            if error_type in ("DeviceNotRegistered", "InvalidCredentials"):
+                _stale_token = True
         else:
             _log.debug("push | sent token=%s… type=%s", push_token[:30], notif_type)
 
@@ -187,3 +195,19 @@ async def send_push_notification(
         await asyncio.to_thread(_send)
     except Exception as exc:
         _log.warning("push | Expo push error: %s", exc)
+        return
+
+    # Clear the stale push token from the DB so future sends don't keep failing
+    if _stale_token:
+        try:
+            from app.db.session import AsyncSessionLocal
+            from sqlalchemy import text as _text
+            async with AsyncSessionLocal() as _db:
+                await _db.execute(
+                    _text("UPDATE users SET push_token = NULL WHERE push_token = :tok")
+                    .bindparams(tok=push_token)
+                )
+                await _db.commit()
+            _log.info("push | cleared stale token from DB: %s…", push_token[:30])
+        except Exception as exc:
+            _log.warning("push | failed to clear stale token: %s", exc)

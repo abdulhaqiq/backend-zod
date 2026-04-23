@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import admin, auth, cards, chat, discover, explore, face_scan_ws, gift_cards, linkedin, location, lookup, mini_games, moderation, pickup_lines, profile, score, subscription, university, upload, users, verification_ws
+from app.api.v1.endpoints import admin, auth, cards, chat, discover, explore, face_scan_ws, gift_cards, linkedin, location, lookup, marketing, mini_games, moderation, pickup_lines, profile, score, subscription, university, upload, users, verification_ws
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
@@ -12,6 +12,7 @@ api_router.include_router(subscription.router)
 api_router.include_router(gift_cards.router)
 api_router.include_router(location.router)
 api_router.include_router(admin.router)
+api_router.include_router(marketing.router)
 api_router.include_router(verification_ws.router)
 api_router.include_router(face_scan_ws.router)
 api_router.include_router(linkedin.router)

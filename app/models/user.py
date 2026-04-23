@@ -86,6 +86,7 @@ class User(Base):
     education: Mapped[list | None] = mapped_column(JSONB, nullable=True)      # [{institution, course, degree, grad_year}]
     city: Mapped[str | None] = mapped_column(String(128), nullable=True)
     hometown: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    living_in: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # ── Auto-detected location (updated on each app open) ─────────────────────
     latitude: Mapped[float | None] = mapped_column(Float, nullable=True)

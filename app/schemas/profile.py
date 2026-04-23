@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -73,7 +73,9 @@ class ProfileUpdateRequest(BaseModel):
     # Location (free-text only — coordinates are set exclusively via
     # POST /location/update and POST /location/change-city, never via profile PATCH)
     city: str | None = Field(None, max_length=128)
-    hometown: str | None = Field(None, max_length=128)
+    hometown: str | None
+    living_in: str | None = Field(None, max_length=128)
+    living_in: str | None = Field(None, max_length=128)
     address: str | None = Field(None, max_length=512)
     country: str | None = Field(None, max_length=128)
 
@@ -242,6 +244,7 @@ class MeResponse(BaseModel):
     education: list[dict[str, Any]] | None
     city: str | None
     hometown: str | None
+    living_in: str | None
     address: str | None
     country: str | None
     dark_mode: bool
@@ -337,6 +340,7 @@ class MeResponse(BaseModel):
     super_likes_remaining: int
     daily_revert_used: int = 0
     is_active: bool
+    is_admin: bool
     is_verified: bool
     is_onboarded: bool
     created_at: datetime
@@ -360,6 +364,39 @@ class MeResponse(BaseModel):
     has_push_token: bool = False
 
     model_config = {"from_attributes": True}
+
+    @field_validator(
+        "interests", "languages", "purpose", "values_list", "causes",
+        "work_matching_goals", "work_skills", "work_industries",
+        "filter_star_signs", "filter_interests", "filter_languages",
+        "filter_religions", "filter_purpose", "filter_looking_for",
+        "filter_education_level", "filter_family_plans", "filter_have_kids",
+        "filter_ethnicities", "filter_exercise", "filter_drinking",
+        "filter_smoking", "filter_sect", "filter_prayer_frequency",
+        "filter_marriage_timeline",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_id_list(cls, v):
+        """
+        The DB stores multi-value lookup arrays in two formats depending on how
+        they were written:
+          - Old onboarding / seed code: [{"id": 21}, {"id": 43}, ...]
+          - Current PATCH endpoint:     [21, 43, ...]
+
+        Normalise both to plain integers so MeResponse validates cleanly.
+        """
+        if not isinstance(v, list):
+            return v
+        result = []
+        for item in v:
+            if isinstance(item, dict):
+                id_val = item.get("id")
+                if id_val is not None:
+                    result.append(int(id_val))
+            elif item is not None:
+                result.append(int(item))
+        return result or None
 
     @model_validator(mode="after")
     def _apply_filter_defaults(self):

@@ -172,7 +172,7 @@ def _build_profile(u: User, distance_km: float | None, compat: dict | None = Non
         "age":        None if u.hide_age else age,
         "verified":   u.verification_status == "verified",
         "premium":    u.subscription_tier in ("pro", "premium_plus"),
-        "location":   u.city,
+        "location":   u.living_in or u.city,
         "distance":   None if u.hide_distance else dist_str,
         "university": u.university,
         "about":      u.bio,
