@@ -21,7 +21,7 @@ jobs:
             set -e
 
             # ── Pull latest code ──────────────────────────────────────────
-            cd /opt/backend
+            cd /root/backend
             git pull origin main
 
             # ── Install any new dependencies ─────────────────────────────
@@ -29,7 +29,7 @@ jobs:
             pip install -r requirements.txt --quiet
 
             # ── Restart the service ───────────────────────────────────────
-            systemctl restart mil-backend
+            systemctl restart backend-api
 
             # ── Confirm it is running ─────────────────────────────────────
-            systemctl is-active --quiet mil-backend && echo "✅ mil-backend is running" || (echo "❌ mil-backend failed to start" && journalctl -u mil-backend -n 30 && exit 1)
+            systemctl is-active --quiet backend-api && echo "✅ backend-api is running" || (echo "❌ backend-api failed to start" && journalctl -u backend-api -n 30 && exit 1)
