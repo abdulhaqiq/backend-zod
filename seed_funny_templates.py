@@ -172,15 +172,16 @@ async def seed_templates():
         
         # Update India timezone config (6 times a day: 9am, 12pm, 3pm, 6pm, 8pm, 10pm IST)
         print("\n📍 Configuring India timezone (6 notifications/day)...")
+        import json
         await db.execute(
             text("""
                 INSERT INTO marketing_countries (name, code, region, tz_name, peak_hours, primary_language, is_active)
-                VALUES ('India', 'IN', 'Asia', 'Asia/Kolkata', :hours, 'en', true)
+                VALUES ('India', 'IN', 'Asia', 'Asia/Kolkata', :hours::jsonb, 'en', true)
                 ON CONFLICT (code, tz_name) DO UPDATE SET
                     peak_hours = EXCLUDED.peak_hours,
                     is_active = true
             """),
-            {"hours": [9, 12, 15, 18, 20, 22]}  # 9am, 12pm, 3pm, 6pm, 8pm, 10pm IST
+            {"hours": json.dumps([9, 12, 15, 18, 20, 22])}  # 9am, 12pm, 3pm, 6pm, 8pm, 10pm IST
         )
         
         # Update Dubai/UAE timezone (4-5 times a day: 10am, 1pm, 6pm, 9pm GST)
