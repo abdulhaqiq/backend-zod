@@ -247,6 +247,14 @@ async def lifespan(app: FastAPI):
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             CONSTRAINT uq_marketing_country_code_tz UNIQUE (code, tz_name)
         )""",
+        # User-level marketing notification tracking (prevents duplicate sends)
+        """CREATE TABLE IF NOT EXISTS user_marketing_sends (
+            user_id UUID NOT NULL,
+            sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            campaign_id INTEGER,
+            PRIMARY KEY (user_id, sent_at)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_user_marketing_sends_user ON user_marketing_sends (user_id, sent_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_marketing_countries_region ON marketing_countries (region)",
         "CREATE INDEX IF NOT EXISTS idx_marketing_countries_code ON marketing_countries (code)",
         """CREATE TABLE IF NOT EXISTS marketing_templates (

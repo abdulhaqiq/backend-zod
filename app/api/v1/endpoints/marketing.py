@@ -241,9 +241,21 @@ async def _execute_send(
     # ── Send ──────────────────────────────────────────────────────────────────
     sent = 0
     failed = 0
+    
+    # Track which users we've sent to in last 3 hours (prevent duplicates)
+    cutoff = now_utc - timedelta(hours=3)
+    recent_sends = await db.execute(
+        text("SELECT DISTINCT user_id FROM user_marketing_sends WHERE sent_at >= :cutoff"),
+        {"cutoff": cutoff}
+    )
+    recently_sent_users = {row[0] for row in recent_sends.fetchall()}
 
     for user in recipients:
         if not user.push_token:
+            continue
+        
+        # Skip if user received a marketing notification in last 3 hours
+        if user.id in recently_sent_users:
             continue
 
         # Determine language for this user
@@ -291,6 +303,11 @@ async def _execute_send(
                 notif_type=use_notif_type,
             )
             sent += 1
+            # Mark this user as having received a marketing notification
+            await db.execute(
+                text("INSERT INTO user_marketing_sends (user_id, sent_at) VALUES (:uid, :now) ON CONFLICT DO NOTHING"),
+                {"uid": str(user.id), "now": now_utc}
+            )
         except Exception as exc:
             _log.warning("marketing | send failed user=%s: %s", user.id, exc)
             failed += 1
