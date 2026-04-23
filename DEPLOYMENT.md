@@ -2,7 +2,7 @@
 
 ## Server Details
 - **Droplet IP**: `134.209.126.56`
-- **Production URL**: `http://dev.zod.pro.ailoo.co`
+- **Production URL**: `https://dev.zod.pro.ailoo.co` (SSL enabled ✅)
 - **Backend Port**: `8000`
 - **Service Name**: `backend-api`
 
@@ -41,12 +41,12 @@ ssh root@134.209.126.56 "systemctl status nginx"
 
 ### Health check
 ```bash
-curl http://dev.zod.pro.ailoo.co/health
+curl https://dev.zod.pro.ailoo.co/health
 # Expected: {"status":"healthy"}
 ```
 
 ### API docs
-Visit: http://dev.zod.pro.ailoo.co/docs
+Visit: https://dev.zod.pro.ailoo.co/docs
 
 ## GitHub Secrets (Already Configured)
 - `DROPLET_HOST`: 134.209.126.56
