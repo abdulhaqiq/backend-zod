@@ -189,12 +189,12 @@ async def seed_templates():
         await db.execute(
             text("""
                 INSERT INTO marketing_countries (name, code, region, tz_name, peak_hours, primary_language, is_active)
-                VALUES ('United Arab Emirates', 'AE', 'Middle East', 'Asia/Dubai', :hours, 'en', true)
+                VALUES ('United Arab Emirates', 'AE', 'Middle East', 'Asia/Dubai', :hours::jsonb, 'en', true)
                 ON CONFLICT (code, tz_name) DO UPDATE SET
                     peak_hours = EXCLUDED.peak_hours,
                     is_active = true
             """),
-            {"hours": [10, 13, 18, 21]}  # 10am, 1pm, 6pm, 9pm GST
+            {"hours": json.dumps([10, 13, 18, 21])}  # 10am, 1pm, 6pm, 9pm GST
         )
         
         # Update Saudi Arabia timezone (4 times a day: 10am, 2pm, 6pm, 9pm AST)
@@ -202,12 +202,12 @@ async def seed_templates():
         await db.execute(
             text("""
                 INSERT INTO marketing_countries (name, code, region, tz_name, peak_hours, primary_language, is_active)
-                VALUES ('Saudi Arabia', 'SA', 'Middle East', 'Asia/Riyadh', :hours, 'ar', true)
+                VALUES ('Saudi Arabia', 'SA', 'Middle East', 'Asia/Riyadh', :hours::jsonb, 'ar', true)
                 ON CONFLICT (code, tz_name) DO UPDATE SET
                     peak_hours = EXCLUDED.peak_hours,
                     is_active = true
             """),
-            {"hours": [10, 14, 18, 21]}  # 10am, 2pm, 6pm, 9pm AST
+            {"hours": json.dumps([10, 14, 18, 21])}  # 10am, 2pm, 6pm, 9pm AST
         )
         
         await db.commit()

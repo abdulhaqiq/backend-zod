@@ -1,15 +1,17 @@
 """
 Content restriction filter for chat messages.
 Blocks/censors phone numbers, email addresses, URLs, social handles,
-explicit contact-sharing phrases, and 18+ adult content so users cannot
-exchange personal contact details or share explicit material inside the
-platform chat.
+explicit contact-sharing phrases, profanity, and 18+ adult content so 
+users cannot exchange personal contact details or share explicit material 
+inside the platform chat.
 
 Violations are replaced with *** by sanitize_content() rather than
 being rejected outright — both layers (frontend + backend) apply this.
 """
 import re
 from typing import Optional
+
+from app.utils.profanity_filter import contains_profanity, BAD_WORDS
 
 # ── Contact-info patterns ──────────────────────────────────────────────────────
 
@@ -95,6 +97,11 @@ def check_content(text: str) -> Optional[str]:
     for pattern, message in _BLOCK_CHECKS:
         if pattern.search(text):
             return message
+    
+    # Check for profanity
+    if contains_profanity(text):
+        return "Inappropriate language is not allowed in chat."
+    
     return None
 
 
@@ -102,12 +109,24 @@ def sanitize_content(text: str) -> str:
     """
     Returns the text with all restricted content replaced by ***.
     Applies every pattern in sequence so overlapping matches are all censored.
+    Also filters profanity/bad words.
     """
     for pattern in _REDACT_PATTERNS:
         text = pattern.sub("***", text)
+    
+    # Filter profanity
+    text_lower = text.lower()
+    for word in BAD_WORDS:
+        pattern = r'\b' + re.escape(word) + r'\b'
+        matches = list(re.finditer(pattern, text_lower, re.IGNORECASE))
+        for match in reversed(matches):  # Reverse to maintain indices
+            start, end = match.span()
+            text = text[:start] + "***" + text[end:]
+            text_lower = text_lower[:start] + "***" + text_lower[end:]
+    
     return text
 
 
 def has_violation(text: str) -> bool:
-    """Quick boolean check — True if any pattern matches."""
-    return any(p.search(text) for p in _REDACT_PATTERNS)
+    """Quick boolean check — True if any pattern matches or contains profanity."""
+    return any(p.search(text) for p in _REDACT_PATTERNS) or contains_profanity(text)

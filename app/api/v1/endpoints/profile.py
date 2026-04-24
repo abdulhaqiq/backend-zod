@@ -21,6 +21,7 @@ from app.db.session import get_db
 from app.models.user import User
 from app.schemas.profile import FilterUpdateRequest, MeResponse, ProfileUpdateRequest
 from app.services.scoring import compute_and_save_score
+from app.utils.profanity_filter import contains_profanity
 
 _log = logging.getLogger(__name__)
 
@@ -242,6 +243,25 @@ async def update_me(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="This email address is already in use.",
                 )
+        
+        # Profanity filter for text content
+        if field in ("mood_text", "bio", "full_name") and value and isinstance(value, str):
+            if contains_profanity(value):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"The {field.replace('_', ' ')} contains inappropriate language. Please remove profanity and try again.",
+                )
+        
+        # Check prompts array for profanity
+        if field == "prompts" and value and isinstance(value, list):
+            for prompt in value:
+                if isinstance(prompt, dict) and prompt.get("answer"):
+                    if contains_profanity(prompt["answer"]):
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="One of your prompt answers contains inappropriate language. Please remove profanity and try again.",
+                        )
+        
         setattr(current_user, field, value)
 
         # When onboarding completes, validate required fields then gate on face verification.

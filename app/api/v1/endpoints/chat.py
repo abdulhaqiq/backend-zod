@@ -31,6 +31,7 @@ from app.models.message import Message
 from app.models.message_reaction import MessageReaction
 from app.models.user import User
 from app.models.user_report import UserReport
+from app.utils.profanity_filter import contains_profanity
 
 _log = logging.getLogger(__name__)
 
@@ -878,6 +879,8 @@ async def websocket_chat(
                 from app.utils.content_filter import sanitize_content
                 content = sanitize_content(content)
 
+            from sqlalchemy import text
+            
             async with AsyncSessionLocal() as db:
                 msg = Message(
                     room_id=room_id,
@@ -890,6 +893,28 @@ async def websocket_chat(
                     created_at=datetime.now(timezone.utc),
                 )
                 db.add(msg)
+                
+                # Extend match to permanent only once BOTH parties have chatted.
+                # We check if the OTHER user already has at least one message in this room.
+                # - First message (no reply yet): timer stays visible in conversations.
+                # - First reply from the other side: timer disappears, match becomes permanent.
+                u1, u2 = sorted([str(current_user.id), str(other_user.id)])
+                await db.execute(
+                    text("""
+                        UPDATE matches
+                        SET expires_at = NOW() + INTERVAL '3650 days'
+                        WHERE user1_id = CAST(:u1 AS uuid)
+                          AND user2_id = CAST(:u2 AS uuid)
+                          AND expires_at < NOW() + INTERVAL '3649 days'
+                          AND EXISTS (
+                            SELECT 1 FROM messages
+                            WHERE room_id   = :room_id
+                              AND sender_id = CAST(:other_id AS uuid)
+                            LIMIT 1
+                          )
+                    """).bindparams(u1=u1, u2=u2, room_id=room_id, other_id=str(other_user.id))
+                )
+                
                 await db.commit()
                 await db.refresh(msg)
                 msg_dict = _msg_to_dict(msg)
@@ -1312,6 +1337,13 @@ async def send_message(
 
     if not content:
         raise HTTPException(status_code=422, detail="content is required")
+    
+    # Profanity filter for chat messages
+    if msg_type == "text" and contains_profanity(content):
+        raise HTTPException(
+            status_code=422,
+            detail="Your message contains inappropriate language. Please remove profanity and try again."
+        )
 
     room_id = Message.make_room_id(current_user.id, other_uuid)
     msg = Message(
