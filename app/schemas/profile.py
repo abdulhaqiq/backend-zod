@@ -73,8 +73,7 @@ class ProfileUpdateRequest(BaseModel):
     # Location (free-text only — coordinates are set exclusively via
     # POST /location/update and POST /location/change-city, never via profile PATCH)
     city: str | None = Field(None, max_length=128)
-    hometown: str | None
-    living_in: str | None = Field(None, max_length=128)
+    hometown: str | None = Field(None, max_length=128)
     living_in: str | None = Field(None, max_length=128)
     address: str | None = Field(None, max_length=512)
     country: str | None = Field(None, max_length=128)
