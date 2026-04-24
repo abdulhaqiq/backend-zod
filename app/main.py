@@ -520,6 +520,27 @@ async def lifespan(app: FastAPI):
                         if existing.scalar_one_or_none() is not None:
                             continue  # already sent this hour for this country/tz
 
+                        # Use PostgreSQL advisory lock to prevent race conditions
+                        # Lock key = hash(country_code + tz + hour) to ensure only 1 scheduler sends per hour
+                        lock_key = hash(f"{country.code}:{country.tz_name}:{local_hour}") % (2**31)
+                        from sqlalchemy import text as _text
+                        lock_acquired = await db.execute(_text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": lock_key})
+                        if not lock_acquired.scalar():
+                            continue  # another scheduler instance is handling this country/hour
+                        
+                        # Double-check after acquiring lock (another instance might have sent while we waited)
+                        existing = await db.execute(
+                            _sel(MarketingCampaign).where(
+                                MarketingCampaign.triggered_by == "scheduler",
+                                MarketingCampaign.target_value == country.code,
+                                MarketingCampaign.scheduler_tz == country.tz_name,
+                                MarketingCampaign.scheduler_hour == local_hour,
+                                MarketingCampaign.created_at >= cutoff,
+                            ).limit(1)
+                        )
+                        if existing.scalar_one_or_none() is not None:
+                            continue
+
                         # Send — language auto-detected per user, country is the targeting key
                         try:
                             res = await _execute_send(

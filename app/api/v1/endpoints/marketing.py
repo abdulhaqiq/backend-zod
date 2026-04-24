@@ -250,13 +250,19 @@ async def _execute_send(
     )
     recently_sent_users = {row[0] for row in recent_sends.fetchall()}
 
+    # Deduplicate recipients by push_token (same device = one notification)
+    # Group users by push_token to send only once per device
+    token_to_users: dict[str, list[User]] = {}
     for user in recipients:
-        if not user.push_token:
+        if not user.push_token or user.id in recently_sent_users:
             continue
-        
-        # Skip if user received a marketing notification in last 3 hours
-        if user.id in recently_sent_users:
-            continue
+        if user.push_token not in token_to_users:
+            token_to_users[user.push_token] = []
+        token_to_users[user.push_token].append(user)
+
+    for push_token, users_on_device in token_to_users.items():
+        # Pick the first user as representative (for language detection)
+        user = users_on_device[0]
 
         # Determine language for this user
         # Use country's primary_language as fallback (country field may be full name like "India")
@@ -294,7 +300,7 @@ async def _execute_send(
 
         try:
             await send_push_notification(
-                user.push_token,
+                push_token,
                 title=use_title,
                 body=use_body,
                 data={**(use_data or {}), "type": use_notif_type},
@@ -303,13 +309,14 @@ async def _execute_send(
                 notif_type=use_notif_type,
             )
             sent += 1
-            # Mark this user as having received a marketing notification
-            await db.execute(
-                text("INSERT INTO user_marketing_sends (user_id, sent_at) VALUES (:uid, :now) ON CONFLICT DO NOTHING"),
-                {"uid": str(user.id), "now": now_utc}
-            )
+            # Mark ALL users on this device as having received the notification
+            for u in users_on_device:
+                await db.execute(
+                    text("INSERT INTO user_marketing_sends (user_id, sent_at) VALUES (:uid, :now) ON CONFLICT DO NOTHING"),
+                    {"uid": str(u.id), "now": now_utc}
+                )
         except Exception as exc:
-            _log.warning("marketing | send failed user=%s: %s", user.id, exc)
+            _log.warning("marketing | send failed token=%s users=%s: %s", push_token[:16], [str(u.id)[:8] for u in users_on_device], exc)
             failed += 1
 
     # ── Persist campaign log ──────────────────────────────────────────────────
