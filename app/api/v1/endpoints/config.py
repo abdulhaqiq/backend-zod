@@ -21,6 +21,6 @@ async def get_public_config():
     - **test_mode_enabled**: Whether phone number login is enabled (test mode)
     """
     # Check environment variable for test mode (defaults to False for production)
-    test_mode = os.getenv("TEST_MODE_ENABLED", "true").lower() in ("true", "1", "yes")
+    test_mode = os.getenv("TEST_MODE_ENABLED", "false").lower() in ("true", "1", "yes")
     
     return ConfigResponse(test_mode_enabled=test_mode)
