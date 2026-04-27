@@ -256,27 +256,40 @@ async def _process_verification(
     """
     Runs after the HTTP response is returned.
     Performs liveness + face-match, then updates the attempt record and user row.
-    Hard timeout: 40 s total.
+    Hard timeout: 120 s (2 minutes) total.
     """
     _log.info("bg-verify | attempt=%s STARTED", attempt_id)
     try:
         await asyncio.wait_for(
             _run_face_verification(attempt_id, selfie_bytes, photo_urls),
-            timeout=40,
+            timeout=120,
         )
     except asyncio.TimeoutError:
-        _log.error("bg-verify | attempt=%s TIMED OUT after 40s", attempt_id)
+        _log.error("bg-verify | attempt=%s TIMED OUT after 120s (2 min)", attempt_id)
         try:
             async with AsyncSessionLocal() as db:
                 attempt = await db.get(VerificationAttempt, attempt_id)
                 if attempt and attempt.status == "pending":
                     attempt.status = "rejected"
-                    attempt.rejection_reason = "Face scan timed out. Please try again."
+                    attempt.rejection_reason = "Verification took too long. Please try again with better lighting."
                     attempt.processed_at = datetime.now(timezone.utc)
                     user = await db.get(User, attempt.user_id)
                     if user:
                         user.verification_status = "rejected"
                     await db.commit()
+                    
+                    # Notify WebSocket clients to show "try again"
+                    try:
+                        from app.api.v1.endpoints.verification_ws import watcher as _watcher
+                        await _watcher.notify(user.id, {
+                            "status": "rejected",
+                            "rejection_reason": "Verification took too long. Please try again with better lighting.",
+                            "face_match_score": None,
+                            "navigate_to": "retry",
+                            "flow": "onboarding",
+                        })
+                    except Exception:
+                        pass
         except Exception as e:
             _log.error("bg-verify | timeout cleanup failed: %s", e)
 
@@ -286,6 +299,8 @@ async def _run_face_verification(
     selfie_bytes: bytes,
     photo_urls: list[str],
 ) -> None:
+    # Step 1: Fetch attempt and user data (quick DB query)
+    user_id: _uuid.UUID | None = None
     async with AsyncSessionLocal() as db:
         attempt: VerificationAttempt | None = await db.get(VerificationAttempt, attempt_id)
         if not attempt:
@@ -295,60 +310,85 @@ async def _run_face_verification(
         if not user:
             _log.warning("bg-verify | user not found for attempt=%s", attempt_id)
             return
+        user_id = user.id
+    
+    # Step 2: Perform all long-running Rekognition operations WITHOUT holding DB connection
+    try:
+        _log.info("bg-verify | attempt=%s running face detection...", attempt_id)
+        # Layer 1 — face detection + quality check
+        success, reason, age_estimate, selfie_array, face_region = await asyncio.to_thread(
+            _detect_face_fast, selfie_bytes
+        )
+        
+        if not success:
+            # Update DB with rejection
+            async with AsyncSessionLocal() as db:
+                attempt = await db.get(VerificationAttempt, attempt_id)
+                user = await db.get(User, user_id)
+                if attempt and user:
+                    attempt.is_live = success
+                    attempt.age_estimate = age_estimate
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = reason
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user.verification_status = "rejected"
+                    await db.commit()
+            _log.info("bg-verify | attempt=%s FACE DETECTION FAIL: %s", attempt_id, reason)
+            return
 
-        try:
-            _log.info("bg-verify | attempt=%s running face detection...", attempt_id)
-            # Layer 1 — face detection + quality check
-            success, reason, age_estimate, selfie_array, face_region = await asyncio.to_thread(
-                _detect_face_fast, selfie_bytes
-            )
+        # Layer 2 — face match
+        if not photo_urls:
+            async with AsyncSessionLocal() as db:
+                attempt = await db.get(VerificationAttempt, attempt_id)
+                user = await db.get(User, user_id)
+                if attempt and user:
+                    attempt.is_live = success
+                    attempt.age_estimate = age_estimate
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = "No profile photos found. Please upload photos first."
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user.verification_status = "rejected"
+                    await db.commit()
+            _log.info("bg-verify | attempt=%s NO PHOTOS", attempt_id)
+            return
+
+        _log.info("bg-verify | attempt=%s running face match vs %d photos...", attempt_id, len(photo_urls))
+        selfie_jpeg_for_match = selfie_array if selfie_array else selfie_bytes
+        best_pct, compared = await asyncio.to_thread(
+            _match_against_photos, selfie_jpeg_for_match, photo_urls
+        )
+        
+        passed = best_pct >= FACE_MATCH_THRESHOLD
+        _log.info("bg-verify | attempt=%s face match result: %.1f%% (compared=%d, passed=%s)", attempt_id, best_pct, compared, passed)
+
+        # Step 3: Open a NEW DB session to save results
+        async with AsyncSessionLocal() as db:
+            attempt = await db.get(VerificationAttempt, attempt_id)
+            user = await db.get(User, user_id)
+            if not attempt or not user:
+                _log.error("bg-verify | attempt or user disappeared during processing")
+                return
+            
             attempt.is_live = success
             attempt.age_estimate = age_estimate
-
-            if not success:
-                attempt.status = "rejected"
-                attempt.rejection_reason = reason
-                attempt.processed_at = datetime.now(timezone.utc)
-                user.verification_status = "rejected"
-                await db.commit()
-                _log.info("bg-verify | attempt=%s FACE DETECTION FAIL: %s", attempt_id, reason)
-                return
-
-            # Layer 2 — face match
-            if not photo_urls:
-                attempt.status = "rejected"
-                attempt.rejection_reason = "No profile photos found. Please upload photos first."
-                attempt.processed_at = datetime.now(timezone.utc)
-                user.verification_status = "rejected"
-                await db.commit()
-                _log.info("bg-verify | attempt=%s NO PHOTOS", attempt_id)
-                return
-
-            _log.info("bg-verify | attempt=%s running face match vs %d photos...", attempt_id, len(photo_urls))
-            # Use the already-converted JPEG bytes from Layer 1 to avoid a second
-            # conversion that may fail if the original file is HEIC/non-standard.
-            selfie_jpeg_for_match = selfie_array if selfie_array else selfie_bytes
-            best_pct, compared = await asyncio.to_thread(
-                _match_against_photos, selfie_jpeg_for_match, photo_urls
-            )
             attempt.face_match_score = best_pct
-            passed = best_pct >= FACE_MATCH_THRESHOLD
-            _log.info("bg-verify | attempt=%s face match result: %.1f%% (compared=%d, passed=%s)", attempt_id, best_pct, compared, passed)
+            attempt.processed_at = datetime.now(timezone.utc)
 
             if passed:
                 attempt.status = "verified"
                 user.is_verified = True
                 user.verification_status = "verified"
                 user.face_match_score = best_pct
-                # Clear the gate — user can now access the full app
                 user.face_scan_required = False
-                # Bust the in-memory 423 cache so the next request passes immediately
+                
+                # Bust the in-memory 423 cache
                 try:
                     from app.main import _scan_cache
                     _scan_cache.pop(str(user.id), None)
                 except Exception:
                     pass
-                # Store selfie (cropped 1024×1024) so ID verification can use it for face matching
+                
+                # Store selfie (cropped 1024×1024)
                 try:
                     from app.core.storage import upload_file as _upload_file
                     selfie_cropped = await asyncio.to_thread(_crop_square_1024, selfie_bytes)
@@ -371,47 +411,52 @@ async def _run_face_verification(
                 )
                 user.verification_status = "rejected"
 
-            attempt.processed_at = datetime.now(timezone.utc)
             await db.commit()
 
-            _log.info(
-                "bg-verify | attempt=%s passed=%s match=%.1f%% compared=%d",
-                attempt_id, passed, best_pct, compared,
-            )
+        _log.info(
+            "bg-verify | attempt=%s passed=%s match=%.1f%% compared=%d",
+            attempt_id, passed, best_pct, compared,
+        )
 
-            # Push result immediately to any connected WS clients — no polling needed
+        # Push result to WebSocket clients
+        from app.api.v1.endpoints.verification_ws import watcher as _watcher
+        await _watcher.notify(user_id, {
+            "status":           "verified" if passed else "rejected",
+            "face_match_score": best_pct,
+            "rejection_reason": attempt.rejection_reason if not passed else None,
+            "is_live":          success,
+            "navigate_to":      "feed" if passed else "retry",
+            "flow":             "onboarding",
+        })
+
+    except Exception as exc:
+        _log.error("bg-verify | attempt=%s CRASHED: %s", attempt_id, exc, exc_info=True)
+        # Update with error status in a fresh DB session
+        try:
+            async with AsyncSessionLocal() as db:
+                attempt = await db.get(VerificationAttempt, attempt_id)
+                user = await db.get(User, user_id)
+                if attempt and user:
+                    attempt.status = "rejected"
+                    attempt.rejection_reason = "Internal analysis error. Please try again."
+                    attempt.processed_at = datetime.now(timezone.utc)
+                    user.verification_status = "rejected"
+                    await db.commit()
+        except Exception as db_exc:
+            _log.error("bg-verify | failed to save error state: %s", db_exc)
+        
+        # Notify WS clients of the failure
+        try:
             from app.api.v1.endpoints.verification_ws import watcher as _watcher
-            await _watcher.notify(user.id, {
-                "status":           attempt.status,
-                "face_match_score": attempt.face_match_score,
-                "rejection_reason": attempt.rejection_reason,
-                "is_live":          attempt.is_live,
-                # FE uses navigate_to to know where to go next without extra logic:
-                #   "feed"   → verification passed, open main app
-                #   "retry"  → show rejection reason + "Try Again" button
-                "navigate_to":      "feed" if attempt.status == "verified" else "retry",
+            await _watcher.notify(user_id, {
+                "status":           "rejected",
+                "rejection_reason": "Internal analysis error. Please try again.",
+                "face_match_score": None,
+                "navigate_to":      "retry",
                 "flow":             "onboarding",
             })
-
-        except Exception as exc:
-            _log.error("bg-verify | attempt=%s CRASHED: %s", attempt_id, exc, exc_info=True)
-            attempt.status = "rejected"
-            attempt.rejection_reason = "Internal analysis error. Please try again."
-            attempt.processed_at = datetime.now(timezone.utc)
-            user.verification_status = "rejected"
-            await db.commit()
-            # Notify WS clients of the failure too
-            try:
-                from app.api.v1.endpoints.verification_ws import watcher as _watcher
-                await _watcher.notify(user.id, {
-                    "status":           "rejected",
-                    "rejection_reason": attempt.rejection_reason,
-                    "face_match_score": None,
-                    "navigate_to":      "retry",
-                    "flow":             "onboarding",
-                })
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 # ─── Submit endpoint (returns immediately with pending status) ─────────────────

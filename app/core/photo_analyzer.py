@@ -50,7 +50,7 @@ def _client():
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY or None,
         region_name=getattr(settings, "AWS_REGION", None) or "us-east-1",
-        config=Config(connect_timeout=8, read_timeout=15, retries={"max_attempts": 1}),
+        config=Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1}),
     )
 
 
@@ -206,7 +206,7 @@ def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
         resp = httpx.get(anchor_url, timeout=8, follow_redirects=True)
         if resp.status_code != 200:
             logger.warning("CompareFaces: could not fetch anchor (%d)", resp.status_code)
-            return False, 0.0, False, 0.0, True, 50.0, 0.0
+            return False, 0.0, False, 0.0, True, 50.0, 0.0, False
 
         anchor_jpeg = _to_jpeg(resp.content)
 
@@ -251,7 +251,7 @@ def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
 
     except Exception as exc:
         logger.warning("CompareFaces failed: %s", exc)
-        return False, 0.0, False, 0.0, True, 50.0, 0.0
+        return False, 0.0, False, 0.0, True, 50.0, 0.0, False
 
 
 # ── Call 2: DetectModerationLabels (always, runs in parallel) ────────────────
