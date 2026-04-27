@@ -199,6 +199,22 @@ async def verify_linkedin(
             if vanity:
                 linkedin_url = f"https://www.linkedin.com/in/{vanity}"
 
+    # Check for duplicate LinkedIn URL (other users already using this profile)
+    if linkedin_url:
+        from sqlalchemy import select
+        stmt = select(User).where(
+            User.linkedin_url == linkedin_url,
+            User.id != current_user.id
+        )
+        result = await db.execute(stmt)
+        existing_user = result.scalar_one_or_none()
+        
+        if existing_user:
+            raise HTTPException(
+                status_code=409,
+                detail="This LinkedIn profile is already connected to another account.",
+            )
+
     # Persist to DB
     current_user.linkedin_id = linkedin_id
     current_user.linkedin_url = linkedin_url
@@ -506,7 +522,13 @@ async def enrich_profile_from_linkedin(
             current_user.city = city_val
             updated_fields.append("city")
 
-    # ── Increment import counter and persist ───────────────────────────────
+    # ── Only increment counter if we actually updated something ────────────
+    if not updated_fields:
+        raise HTTPException(
+            status_code=422,
+            detail="No new data found on LinkedIn profile. Your import was not counted.",
+        )
+    
     current_user.linkedin_import_count = import_count + 1
     db.add(current_user)
     await db.commit()

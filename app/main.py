@@ -651,14 +651,39 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
+# Debug middleware to log PATCH requests to /profile/me
+@app.middleware("http")
+async def log_profile_requests(request: Request, call_next):
+    if request.method == "PATCH" and "/profile/me" in str(request.url):
+        body = await request.body()
+        print(f"\n🔍 DEBUG: PATCH /profile/me")
+        print(f"   Raw body: {body[:500]}")  # First 500 bytes
+        try:
+            import json
+            parsed = json.loads(body) if body else {}
+            print(f"   Parsed JSON: {parsed}")
+        except:
+            print(f"   Could not parse as JSON")
+        # Important: We need to reconstruct the request with the body we just read
+        # because request.body() can only be called once
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request._receive = receive
+    response = await call_next(request)
+    return response
+
 # Log Pydantic request validation errors so we can debug 422s
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
     _main_log.warning(
         "422 RequestValidationError on %s %s — errors: %s",
-        request.method, request.url.path, exc.errors(),
+        request.method, request.url.path, errors,
     )
-    return _JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # Also print to console for debugging
+    print(f"\n⚠️  422 VALIDATION ERROR on {request.method} {request.url.path}")
+    print(f"Errors: {errors}")
+    return _JSONResponse(status_code=422, content={"detail": errors})
 
 
 # Return a clean 503 for any DB connection errors that slip past the retry in

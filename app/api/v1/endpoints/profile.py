@@ -9,7 +9,7 @@ import asyncio
 import logging
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_current_user_allow_inactive, get_pro_user
 from app.core.photo_analyzer import get_photo_quality_score
+from app.core.redis_cache import cache_delete_pattern
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.profile import FilterUpdateRequest, MeResponse, ProfileUpdateRequest
@@ -126,13 +127,14 @@ async def get_me(current_user: User = Depends(get_current_user)) -> MeResponse:
 
 @router.patch("/me", response_model=MeResponse, summary="Update profile (onboarding or edit)")
 async def update_me(
+    request: Request,
     payload: ProfileUpdateRequest,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
     update_data = payload.model_dump(exclude_unset=True)
-    _log.info("PATCH /profile/me — fields: %s", list(update_data.keys()))
+    _log.info("PATCH /profile/me — fields: %s, values: %s", list(update_data.keys()), update_data)
 
     # Hard-strip immutable identity fields — phone, apple_id, id can never be
     # changed via this endpoint, regardless of what the request body contains.
@@ -222,15 +224,15 @@ async def update_me(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="gender_id must be 223 (Male) or 224 (Female).",
             )
-        # Photo minimum enforcement — only block *removals* that drop below 2.
+        # Photo minimum enforcement — only block *removals* that drop below 3.
         # Allow adding photos freely (including going from 0→1 during re-setup).
         if field == "photos" and value is not None:
             filled = [u for u in value if u]
             existing_count = len(current_user.photos or [])
-            if current_user.is_onboarded and len(filled) < 4 and len(filled) < existing_count:
+            if current_user.is_onboarded and len(filled) < 3 and len(filled) < existing_count:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Your profile must have at least 4 photos.",
+                    detail="Your profile must have at least 3 photos.",
                 )
 
         # Email uniqueness check — skip if same as current
@@ -266,14 +268,14 @@ async def update_me(
 
         # When onboarding completes, validate required fields then gate on face verification.
         if field == "is_onboarded" and value is True:
-            # ── Minimum 4 photos required ─────────────────────────────────────
+            # ── Minimum 3 photos required ─────────────────────────────────────
             # Count photos from the update payload (if being set now) or existing
             photos_after = update_data.get("photos", current_user.photos) or []
             filled_photos = [p for p in photos_after if p]
-            if len(filled_photos) < 4:
+            if len(filled_photos) < 3:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="You need at least 4 photos to complete your profile.",
+                    detail="You need at least 3 photos to complete your profile.",
                 )
 
             # ── Religion required ─────────────────────────────────────────────
@@ -315,6 +317,8 @@ async def update_me(
             detail="One or more provided IDs do not exist. Please use valid lookup option IDs.",
         )
     await db.refresh(current_user)
+    # Invalidate cache after profile update
+    await cache_delete_pattern(f"*:{current_user.id}*")
     # Recompute compatibility score in background after every profile update
     background_tasks.add_task(_recompute_score_bg, current_user.id)
     return _build_me(current_user)

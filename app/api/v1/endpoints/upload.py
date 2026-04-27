@@ -8,6 +8,7 @@ Upload endpoints:
   GET  /upload/verify-face/history — all past attempts for the current user
 """
 import asyncio
+import hashlib
 import logging
 import uuid as _uuid
 from dataclasses import asdict
@@ -45,6 +46,33 @@ MAX_AUDIO_SECONDS = 35  # a little over 30 to allow for encoding overhead
 
 FACE_MATCH_THRESHOLD = 60.0   # AWS Rekognition CompareFaces similarity threshold (selfie vs profile photos)
 
+
+async def _check_duplicate_photo(contents: bytes, existing_urls: list[str]) -> str | None:
+    """
+    Check if the uploaded photo is a duplicate of any existing photos.
+    Returns the duplicate URL if found, None otherwise.
+    Uses MD5 hash for fast comparison.
+    """
+    if not existing_urls:
+        return None
+    
+    # Calculate hash of uploaded photo
+    upload_hash = hashlib.md5(contents).hexdigest()
+    
+    # Download and compare each existing photo
+    async with httpx.AsyncClient(timeout=10) as client:
+        for url in existing_urls:
+            try:
+                response = await client.get(url)
+                if response.status_code == 200:
+                    existing_hash = hashlib.md5(response.content).hexdigest()
+                    if upload_hash == existing_hash:
+                        return url
+            except Exception as exc:
+                _log.warning("Failed to download photo for duplicate check: %s", exc)
+                continue
+    
+    return None
 
 
 _REKOGNITION_MAX_BYTES = 5 * 1024 * 1024   # 5 MB hard limit
@@ -1261,8 +1289,25 @@ async def upload_photo_endpoint(
         existing_urls: list[str] = list(current_user.photos or [])
         anchor_url: str | None = existing_urls[0] if existing_urls else None
 
+        # ── Crop to 1024×1024 square before duplicate check ───────────────────
+        # We need to crop first so the hash matches what's already stored
         try:
-            analysis = await asyncio.to_thread(analyze_photo, contents, anchor_url)
+            cropped_contents = await asyncio.to_thread(_crop_square_1024, contents)
+        except Exception as exc:
+            _log.warning("Square crop failed (using original): %s", exc)
+            cropped_contents = contents
+
+        # ── Check for duplicate photo (exact content match) ───────────────────
+        duplicate_url = await _check_duplicate_photo(cropped_contents, existing_urls)
+        if duplicate_url:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This photo is already in your profile. Please upload a different photo.",
+            )
+
+        # Use cropped version for analysis
+        try:
+            analysis = await asyncio.to_thread(analyze_photo, cropped_contents, anchor_url)
         except Exception as exc:
             _log.error("Photo analysis pipeline crashed: %s", exc, exc_info=True)
             raise HTTPException(
@@ -1327,14 +1372,8 @@ async def upload_photo_endpoint(
                 _log.warning("Gender check failed (skipping): %s", exc)
 
         folder = f"users/{current_user.id}/photos"
-
-    # ── Crop to 1024×1024 square before storage (profile photos only) ─────────
-    # Chat photos are stored as-is; profile photos are always square-cropped.
-    if not is_chat:
-        try:
-            contents = await asyncio.to_thread(_crop_square_1024, contents)
-        except Exception as exc:
-            _log.warning("Square crop failed (using original): %s", exc)
+        # Use the already-cropped contents for upload
+        contents = cropped_contents
 
     # ── Upload to DO Spaces ───────────────────────────────────────────────────
     try:

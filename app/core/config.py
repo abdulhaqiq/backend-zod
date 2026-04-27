@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     DB_NAME: str
     DB_SSLMODE: str = "require"
 
+    # Redis (optional - for caching)
+    # Example: redis://localhost:6379/0 or redis://user:password@host:6379/0
+    REDIS_URL: str = ""
+
     # Twilio
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""

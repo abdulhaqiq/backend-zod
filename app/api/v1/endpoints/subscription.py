@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.core.config import settings
+from app.core.redis_cache import cache_get, cache_set, cache_delete
 from app.db.session import get_db
 from app.models.ai_credits_transaction import AiCreditsTransaction
 from app.models.subscription_plan import SubscriptionPlan
@@ -274,7 +275,15 @@ async def get_my_features(
     """
     Returns the active plan's structured features for the current user,
     combined with live quota state (super_likes_remaining, reset date).
+    Cached for 2 minutes.
     """
+    CACHE_KEY = f"subscription:features:{current_user.id}"
+    
+    # Try cache first
+    cached = await cache_get(CACHE_KEY)
+    if cached:
+        return cached
+    
     tier = current_user.subscription_tier  # "free" | "pro" | "premium_plus"
     now  = datetime.now(timezone.utc)
 
@@ -291,7 +300,7 @@ async def get_my_features(
             await db.commit()
         daily_used      = current_user.daily_likes_used
         daily_remaining = max(0, FREE_DAILY_LIKE_LIMIT - daily_used)
-        return {
+        result = {
             "tier":                       "free",
             "super_likes_limit":          0,
             "super_likes_remaining":      0,
@@ -305,6 +314,9 @@ async def get_my_features(
             "ai_credits_balance":         current_user.ai_credits_balance,
             "ai_credits_monthly":         0,
         }
+        # Cache for 2 minutes
+        await cache_set(CACHE_KEY, result, ttl=120)
+        return result
 
     # ── Paid tiers: hardcoded safety defaults ─────────────────────────────────
     DEFAULTS = {
@@ -421,7 +433,7 @@ async def get_my_features(
         ))
         await db.commit()
 
-    return {
+    result = {
         "tier":                       tier,
         "super_likes_limit":          sl_limit,
         "super_likes_remaining":      current_user.super_likes_remaining,
@@ -435,6 +447,9 @@ async def get_my_features(
         "ai_credits_balance":         current_user.ai_credits_balance,
         "ai_credits_monthly":         monthly_grant,
     }
+    # Cache for 2 minutes
+    await cache_set(CACHE_KEY, result, ttl=120)
+    return result
 
 
 @router.get("/status", response_model=StatusResponse, summary="Get current subscription status")
@@ -505,6 +520,9 @@ async def verify_purchase(
     )
 
     await db.commit()
+
+    # Invalidate my-features cache after subscription change
+    await cache_delete(f"subscription:features:{current_user.id}")
 
     return {
         "tier": current_user.subscription_tier,
@@ -631,6 +649,10 @@ async def revenuecat_webhook(
         )
 
     await db.commit()
+    
+    # Invalidate my-features cache after subscription change
+    await cache_delete(f"subscription:features:{user.id}")
+    
     logger.info("User %s subscription → %s", user.id, user.subscription_tier)
     return {"ok": True}
 
@@ -645,14 +667,23 @@ async def list_plans(
     """
     Returns all active plans ordered by sort_order.
     The frontend uses apple_product_id to initiate the purchase via RevenueCat.
+    Cached for 1 hour since plans rarely change.
     """
+    CACHE_KEY = "subscription:plans"
+    
+    # Try cache first
+    cached = await cache_get(CACHE_KEY)
+    if cached:
+        return cached
+    
+    # Cache miss - query database
     result = await db.execute(
         select(SubscriptionPlan)
         .where(SubscriptionPlan.is_active.is_(True))
         .order_by(SubscriptionPlan.sort_order)
     )
     plans = result.scalars().all()
-    return [
+    plans_data = [
         {
             "id": str(p.id),
             "name": p.name,
@@ -668,6 +699,11 @@ async def list_plans(
         }
         for p in plans
     ]
+    
+    # Cache for 1 hour
+    await cache_set(CACHE_KEY, plans_data, ttl=3600)
+    
+    return plans_data
 
 
 @router.post("/plans", summary="[Admin] Create a new subscription plan")
@@ -691,6 +727,10 @@ async def create_plan(
     db.add(plan)
     await db.commit()
     await db.refresh(plan)
+    
+    # Invalidate plans cache
+    await cache_delete("subscription:plans")
+    
     logger.info("Admin created subscription plan: %s (%s)", plan.name, plan.apple_product_id)
     return {"id": str(plan.id), "name": plan.name, "apple_product_id": plan.apple_product_id}
 
@@ -715,6 +755,10 @@ async def update_plan(
 
     await db.commit()
     await db.refresh(plan)
+    
+    # Invalidate plans cache
+    await cache_delete("subscription:plans")
+    
     logger.info("Admin updated plan %s: %s", plan_id, list(update_data.keys()))
     return {"id": str(plan.id), "name": plan.name, "is_active": plan.is_active}
 

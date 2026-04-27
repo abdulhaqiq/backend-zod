@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.redis_cache import cache_get, cache_set
 from app.db.session import get_db
 from app.models.lookup import LookupOption, RelationshipType
 
@@ -18,13 +19,25 @@ router = APIRouter(prefix="/lookup", tags=["lookup"])
 
 @router.get("/relationship-types", summary="List relationship type options")
 async def get_relationship_types(db: AsyncSession = Depends(get_db)):
+    CACHE_KEY = "lookup:relationship_types"
+    
+    # Try cache first
+    cached = await cache_get(CACHE_KEY)
+    if cached:
+        return cached
+    
     result = await db.execute(
         select(RelationshipType)
         .where(RelationshipType.is_active.is_(True))
         .order_by(RelationshipType.sort_order)
     )
     types = result.scalars().all()
-    return [{"value": t.value, "label": t.label} for t in types]
+    data = [{"value": t.value, "label": t.label} for t in types]
+    
+    # Cache for 1 hour
+    await cache_set(CACHE_KEY, data, ttl=3600)
+    
+    return data
 
 
 @router.get("/options", summary="All lookup options (optionally filtered by category)")
@@ -32,6 +45,13 @@ async def get_options(
     category: Optional[str] = Query(None, description="Filter by category"),
     db: AsyncSession = Depends(get_db),
 ):
+    CACHE_KEY = f"lookup:options:{category or 'all'}"
+    
+    # Try cache first
+    cached = await cache_get(CACHE_KEY)
+    if cached:
+        return cached
+    
     q = select(LookupOption).where(LookupOption.is_active.is_(True))
     if category:
         q = q.where(LookupOption.category == category)
@@ -48,17 +68,33 @@ async def get_options(
             "label": row.label,
             "subcategory": row.subcategory,
         })
-    if category:
-        return grouped.get(category, [])
-    return grouped
+    
+    data = grouped.get(category, []) if category else grouped
+    
+    # Cache for 1 hour
+    await cache_set(CACHE_KEY, data, ttl=3600)
+    
+    return data
 
 
 @router.get("/options/{category}", summary="Options for a single category")
 async def get_options_by_category(category: str, db: AsyncSession = Depends(get_db)):
+    CACHE_KEY = f"lookup:category:{category}"
+    
+    # Try cache first
+    cached = await cache_get(CACHE_KEY)
+    if cached:
+        return cached
+    
     result = await db.execute(
         select(LookupOption)
         .where(LookupOption.category == category, LookupOption.is_active.is_(True))
         .order_by(LookupOption.sort_order)
     )
     rows = result.scalars().all()
-    return [{"id": r.id, "category": r.category, "emoji": r.emoji, "label": r.label, "subcategory": r.subcategory} for r in rows]
+    data = [{"id": r.id, "category": r.category, "emoji": r.emoji, "label": r.label, "subcategory": r.subcategory} for r in rows]
+    
+    # Cache for 1 hour
+    await cache_set(CACHE_KEY, data, ttl=3600)
+    
+    return data

@@ -148,6 +148,46 @@ def _check_ban_status(user: "User", incoming_device_id: "str | None" = None) -> 
         )
 
 
+async def _check_device_already_registered(db: AsyncSession, device: "DeviceInfo | None", current_user_id: "str | None" = None) -> None:
+    """
+    Check if this device is already registered with another active account.
+    Raises 403 if the device is already in use by a different account.
+    This prevents users from creating multiple accounts on the same device.
+    
+    Args:
+        db: Database session
+        device: Device information from the request
+        current_user_id: Optional - ID of the user being created/updated (to exclude from check)
+    """
+    if not device or not device.device_id:
+        return  # No device ID provided, skip check
+    
+    # Check if another active (non-deleted, non-banned) user already has this device_id
+    query = select(User.id, User.phone, User.email).where(
+        User.device_id == device.device_id,
+        User.is_deleted.is_(False),
+        User.is_banned.is_(False),
+    )
+    
+    # If updating an existing user, exclude them from the check
+    if current_user_id:
+        query = query.where(User.id != current_user_id)
+    
+    result = await db.execute(query.limit(1))
+    existing_user = result.first()
+    
+    if existing_user:
+        # Device is already registered with another account
+        # Mask the phone/email for privacy
+        identifier = existing_user.phone or existing_user.email
+        masked = f"{identifier[:3]}***{identifier[-3:]}" if identifier and len(identifier) > 6 else "****"
+        
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This device is already registered with another account ({masked}). Please use your existing account or contact support.",
+        )
+
+
 async def _issue_token_pair(
     user_id: str,
     db: AsyncSession,
@@ -242,11 +282,14 @@ async def _issue_token_pair(
     )
 
 
-async def _get_or_create_user_by_phone(phone: str, db: AsyncSession) -> tuple["User", bool]:
+async def _get_or_create_user_by_phone(phone: str, db: AsyncSession, device: "DeviceInfo | None" = None) -> tuple["User", bool]:
     """Returns (user, is_new_user) — is_new_user is True when the row was just created."""
     result = await db.execute(select(User).where(User.phone == phone))
     user = result.scalar_one_or_none()
     if not user:
+        # Check if device is already registered with another account
+        await _check_device_already_registered(db, device)
+        
         user = User(phone=phone, is_verified=False, face_scan_required=True, filter_max_distance_km=20)
         db.add(user)
         await db.flush()
@@ -256,10 +299,21 @@ async def _get_or_create_user_by_phone(phone: str, db: AsyncSession) -> tuple["U
         # user goes through onboarding fresh without a duplicate phone row.
         _reset_deleted_user(user)
         return user, True
-    elif not user.is_verified and not user.face_scan_required:
-        # Existing user who never completed face verification — send them through it now
-        user.face_scan_required = True
-    return user, False
+    else:
+        # Existing user - check if device_id needs to be populated
+        if device and device.device_id:
+            # If user doesn't have a device_id yet, add it
+            if not user.device_id:
+                user.device_id = device.device_id
+            # If user has a different device_id, check for conflicts
+            elif user.device_id != device.device_id:
+                # Check if the new device is already registered with another account
+                await _check_device_already_registered(db, device, current_user_id=str(user.id))
+        
+        if not user.is_verified and not user.face_scan_required:
+            # Existing user who never completed face verification — send them through it now
+            user.face_scan_required = True
+        return user, False
 
 
 def _reset_deleted_user(user: "User") -> None:
@@ -501,7 +555,7 @@ async def verify_otp_endpoint(
 
     # Upsert user — do this BEFORE consuming the OTP so a recoverable error
     # (e.g. snoozed account) doesn't permanently burn the code.
-    user, is_new_user = await _get_or_create_user_by_phone(phone=payload.phone, db=db)
+    user, is_new_user = await _get_or_create_user_by_phone(phone=payload.phone, db=db, device=payload.device)
 
     # Reject banned accounts / blacklisted devices before doing anything else.
     _check_ban_status(user, incoming_device_id=payload.device.device_id if payload.device else None)
@@ -637,6 +691,9 @@ async def apple_sign_in(request: Request, payload: AppleAuthRequest, db: AsyncSe
             user.apple_id = apple_id
 
     if user is None:
+        # Check if device is already registered with another account
+        await _check_device_already_registered(db, payload.device)
+        
         user = User(
             apple_id=apple_id,
             email=email,
@@ -654,7 +711,16 @@ async def apple_sign_in(request: Request, payload: AppleAuthRequest, db: AsyncSe
             user.email = email
         is_new_user = True
     else:
+        # Existing user - check if device_id needs to be populated
         is_new_user = False
+        if payload.device and payload.device.device_id:
+            # If user doesn't have a device_id yet, add it
+            if not user.device_id:
+                user.device_id = payload.device.device_id
+            # If user has a different device_id, check for conflicts
+            elif user.device_id != payload.device.device_id:
+                # Check if the new device is already registered with another account
+                await _check_device_already_registered(db, payload.device, current_user_id=str(user.id))
 
     _check_ban_status(user)
     if not user.is_active:
@@ -693,6 +759,9 @@ async def facebook_sign_in(request: Request, payload: FacebookAuthRequest, db: A
             user.facebook_id = facebook_id
 
     if user is None:
+        # Check if device is already registered with another account
+        await _check_device_already_registered(db, payload.device)
+        
         user = User(
             facebook_id=facebook_id,
             email=email,
@@ -710,7 +779,16 @@ async def facebook_sign_in(request: Request, payload: FacebookAuthRequest, db: A
             user.email = email
         is_new_user = True
     else:
+        # Existing user - check if device_id needs to be populated
         is_new_user = False
+        if payload.device and payload.device.device_id:
+            # If user doesn't have a device_id yet, add it
+            if not user.device_id:
+                user.device_id = payload.device.device_id
+            # If user has a different device_id, check for conflicts
+            elif user.device_id != payload.device.device_id:
+                # Check if the new device is already registered with another account
+                await _check_device_already_registered(db, payload.device, current_user_id=str(user.id))
 
     _check_ban_status(user)
     if not user.is_active:
@@ -749,6 +827,9 @@ async def google_sign_in(request: Request, payload: GoogleAuthRequest, db: Async
             user.google_id = google_id
 
     if user is None:
+        # Check if device is already registered with another account
+        await _check_device_already_registered(db, payload.device)
+        
         user = User(
             google_id=google_id,
             email=email,
@@ -766,7 +847,16 @@ async def google_sign_in(request: Request, payload: GoogleAuthRequest, db: Async
             user.email = email
         is_new_user = True
     else:
+        # Existing user - check if device_id needs to be populated
         is_new_user = False
+        if payload.device and payload.device.device_id:
+            # If user doesn't have a device_id yet, add it
+            if not user.device_id:
+                user.device_id = payload.device.device_id
+            # If user has a different device_id, check for conflicts
+            elif user.device_id != payload.device.device_id:
+                # Check if the new device is already registered with another account
+                await _check_device_already_registered(db, payload.device, current_user_id=str(user.id))
 
     _check_ban_status(user)
     if not user.is_active:
