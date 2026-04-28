@@ -1337,7 +1337,8 @@ async def upload_photo_endpoint(
             )
 
         # ── Gender consistency check (first photo only — gender available from DetectFaces) ──
-        GENDER_CONFIDENCE_MIN = 70.0
+        # Threshold set to 99% to avoid Rekognition false positives on female faces.
+        GENDER_CONFIDENCE_MIN = 99.0
         if not anchor_url and current_user.gender_id and analysis.detected_gender:
             try:
                 row = await db.execute(
