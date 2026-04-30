@@ -1337,8 +1337,9 @@ async def upload_photo_endpoint(
             )
 
         # ── Gender consistency check (first photo only — gender available from DetectFaces) ──
-        # Threshold set to 99% to avoid Rekognition false positives on female faces.
-        GENDER_CONFIDENCE_MIN = 99.0
+        # Threshold: 95% for hard reject, 90-95% for warning (soft fail - still allows upload)
+        GENDER_CONFIDENCE_HARD = 95.0   # Hard reject above this
+        GENDER_CONFIDENCE_SOFT = 90.0   # Warning below this, allow upload
         if not anchor_url and current_user.gender_id and analysis.detected_gender:
             try:
                 row = await db.execute(
@@ -1351,21 +1352,36 @@ async def upload_photo_endpoint(
                     is_profile_female = any(w in label_lower for w in ("female", "woman", "girl"))
                     detected = analysis.detected_gender
                     conf     = analysis.gender_confidence
-                    mismatch = (
-                        (is_profile_male   and detected == "Female" and conf >= GENDER_CONFIDENCE_MIN) or
-                        (is_profile_female and detected == "Male"   and conf >= GENDER_CONFIDENCE_MIN)
+
+                    # Check for mismatch
+                    is_mismatch = (
+                        (is_profile_male   and detected == "Female") or
+                        (is_profile_female and detected == "Male")
                     )
+
                     _log.info(
-                        "Gender check | profile=%s detected=%s(%.0f%%) mismatch=%s",
-                        gender_label, detected, conf, mismatch,
+                        "Gender check | profile=%s detected=%s(%.0f%%) is_mismatch=%s",
+                        gender_label, detected, conf, is_mismatch,
                     )
-                    if mismatch:
+
+                    # Only reject if high confidence mismatch
+                    if is_mismatch and conf >= GENDER_CONFIDENCE_HARD:
+                        _log.warning(
+                            "Gender mismatch REJECTED | profile=%s detected=%s(%.0f%%)",
+                            gender_label, detected, conf,
+                        )
                         raise HTTPException(
                             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail=(
                                 "This photo doesn't match your profile gender. "
                                 "Only photos that match your declared gender are allowed."
                             ),
+                        )
+                    elif is_mismatch and conf >= GENDER_CONFIDENCE_SOFT:
+                        # Soft mismatch - log warning but allow upload
+                        _log.warning(
+                            "Gender mismatch ALLOWED (soft) | profile=%s detected=%s(%.0f%%)",
+                            gender_label, detected, conf,
                         )
             except HTTPException:
                 raise
