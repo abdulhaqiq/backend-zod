@@ -242,10 +242,9 @@ async def _execute_send(
     sent = 0
     failed = 0
     
-    # Track which users AND push tokens we've sent to in last 3 hours (prevent duplicates)
-    # This prevents race conditions when multiple countries trigger at the same time
-    # 3-hour window allows 4-6 notifications per day during peak hours
-    cutoff = now_utc - timedelta(hours=3)
+    # Track which users AND push tokens we've sent to in last 24 hours (prevent duplicates)
+    # 24-hour window ensures only 1 marketing notification per user per day max
+    cutoff = now_utc - timedelta(hours=24)
     recent_sends = await db.execute(
         text("SELECT DISTINCT user_id FROM user_marketing_sends WHERE sent_at >= :cutoff"),
         {"cutoff": cutoff}
@@ -268,10 +267,12 @@ async def _execute_send(
     # Group users by push_token to send only once per device
     token_to_users: dict[str, list[User]] = {}
     for user in recipients:
-        if not user.push_token or user.id in recently_sent_users:
+        if not user.push_token or str(user.id) in recently_sent_users:
+            _log.debug("Skipping user %s - already sent in last 24h", user.id)
             continue
-        # CRITICAL: Skip if this push token received ANY notification in last 3 hours
+        # CRITICAL: Skip if this push token received ANY notification in last 24 hours
         if user.push_token in recently_sent_tokens:
+            _log.debug("Skipping user %s - push token already used in last 24h", user.id)
             continue
         if user.push_token not in token_to_users:
             token_to_users[user.push_token] = []
