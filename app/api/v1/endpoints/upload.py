@@ -532,6 +532,24 @@ async def _run_face_verification(
         })
 
         # Send push notification
+        # ── Send WebSocket notification for real-time UI update ──────────────────
+        try:
+            from app.api.v1.endpoints.chat import notify_manager
+            ws_payload = {
+                "type": "verification_approved" if passed else "verification_rejected",
+                "verification_status": "verified" if passed else "rejected",
+                "is_verified": passed,
+                "face_scan_required": False,
+                "match_score": best_pct if passed else None,
+                "rejection_reason": attempt.rejection_reason if not passed else None,
+                "navigate_to": "feed" if passed else "retry",
+            }
+            ws_sent = await notify_manager.send_to(str(user_id), ws_payload)
+            _log.info("bg-verify | WebSocket notify user=%s sent=%s", user_id[:8], ws_sent)
+        except Exception as ws_exc:
+            _log.warning("bg-verify | WebSocket notify failed (non-critical): %s", ws_exc)
+
+        # ── Send push notification (backup) ────────────────────────────────────
         try:
             from app.core.push import notify_user
             async with AsyncSessionLocal() as db:
