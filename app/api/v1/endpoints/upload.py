@@ -1348,8 +1348,9 @@ async def upload_photo_endpoint(
                 gender_label: str | None = row.scalar_one_or_none()
                 if gender_label:
                     label_lower = gender_label.lower()
-                    is_profile_male   = any(w in label_lower for w in ("male", "man", "boy"))
-                    is_profile_female = any(w in label_lower for w in ("female", "woman", "girl"))
+                    words = set(label_lower.split())
+                    is_profile_male   = bool(words & {"male", "man", "boy"})
+                    is_profile_female = bool(words & {"female", "woman", "girl"})
                     detected = analysis.detected_gender
                     conf     = analysis.gender_confidence
 
