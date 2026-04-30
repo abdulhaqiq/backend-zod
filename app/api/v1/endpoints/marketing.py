@@ -242,10 +242,10 @@ async def _execute_send(
     sent = 0
     failed = 0
     
-    # Track which users AND push tokens we've sent to in last 12 hours (prevent duplicates)
+    # Track which users AND push tokens we've sent to in last 3 hours (prevent duplicates)
     # This prevents race conditions when multiple countries trigger at the same time
-    # Extended to 12 hours to prevent notification fatigue
-    cutoff = now_utc - timedelta(hours=12)
+    # 3-hour window allows 4-6 notifications per day during peak hours
+    cutoff = now_utc - timedelta(hours=3)
     recent_sends = await db.execute(
         text("SELECT DISTINCT user_id FROM user_marketing_sends WHERE sent_at >= :cutoff"),
         {"cutoff": cutoff}
