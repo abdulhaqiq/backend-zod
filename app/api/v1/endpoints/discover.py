@@ -1623,6 +1623,14 @@ async def get_discover_feed(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    # ── Face verification required to view feed ───────────────────────────────
+    # Users must be face-verified to see other profiles (for authenticity)
+    if not current_user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Face verification required to view the feed. Please verify your identity first.",
+        )
+
     FREE_DAILY_LIKE_LIMIT = 20
 
     # ── Check daily like limit before fetching profiles ───────────────────────
