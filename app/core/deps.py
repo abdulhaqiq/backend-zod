@@ -62,14 +62,21 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Resolve the JWT and enforce the account is not banned.
+    """Resolve the JWT and enforce the account is not banned or deleted.
 
     is_active=False means snooze mode — the user is hidden from the discovery
     feed but can still use the app normally (log in, chat, change settings, etc.).
 
     is_banned=True is set by admins to fully block a user's API access.
+    is_deleted=True means the account was deleted and should be logged out.
     """
     user = await _resolve_user(credentials, db)
+
+    if getattr(user, 'is_deleted', False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ACCOUNT_DELETED",
+        )
 
     if getattr(user, 'is_banned', False):
         raise HTTPException(
