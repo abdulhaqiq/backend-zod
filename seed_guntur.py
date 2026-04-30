@@ -17,6 +17,11 @@ import asyncpg
 
 # ── DB config ──────────────────────────────────────────────────────────────────
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 DB_HOST     = os.environ.get("DB_HOST", "db-postgresql-nyc3-22944-do-user-23814271-0.g.db.ondigitalocean.com")
 DB_PORT     = int(os.environ.get("DB_PORT", "25060"))
 DB_NAME     = os.environ.get("DB_NAME", "defaultdb")
@@ -112,6 +117,14 @@ def random_dob(min_age=22, max_age=32):
     return today - timedelta(days=days)
 
 
+def random_phone_number():
+    """Generate a random Indian phone number"""
+    # Indian phone numbers: +91 followed by 10 digits (starting with 6-9)
+    first_digit = random.choice(['6', '7', '8', '9'])
+    remaining_digits = ''.join([str(random.randint(0, 9)) for _ in range(9)])
+    return f"+91{first_digit}{remaining_digits}"
+
+
 def make_guntur_female(idx: int):
     first_name = random.choice(GUNTUR_FEMALE_NAMES)
     last_name  = random.choice(GUNTUR_LAST_NAMES)
@@ -127,9 +140,11 @@ def make_guntur_female(idx: int):
         "smoking":  random.choice(SMOKING_IDS),
         "diet":     random.choice(DIET_IDS),
     }
+    phone = random_phone_number()
     return {
         "id":                  str(uuid.uuid4()),
         "full_name":           f"{first_name} {last_name}",
+        "phone":               phone,
         "bio":                 random.choice(GUNTUR_BIOS),
         "is_active":           True,
         "is_verified":         random.random() < 0.7,
@@ -203,7 +218,7 @@ async def seed():
     )
 
     random.seed(None)
-    profiles = [make_guntur_female(i) for i in range(10)]
+    profiles = [make_guntur_female(i) for i in range(20)]
 
     # ── Check tables ──────────────────────────────────────────────────────────
     has_likes = await conn.fetchval(
@@ -212,7 +227,7 @@ async def seed():
 
     insert_sql = """
     INSERT INTO users (
-        id, full_name, bio, is_active, is_verified, is_onboarded,
+        id, full_name, phone, bio, is_active, is_verified, is_onboarded,
         created_at, updated_at, date_of_birth,
         latitude, longitude, city, country, address,
         height_cm, gender_id, education_level_id, looking_for_id,
@@ -225,10 +240,10 @@ async def seed():
         work_mode_enabled,
         filter_max_distance_km, filter_age_min, filter_age_max, filter_verified_only
     ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,
-        $10,$11,$12,$13,$14,$15,$16,$17,$18,
-        $19,$20,$21,$22,$23,$24,
-        $25::jsonb,$26::jsonb,$27::jsonb,$28::jsonb,$29::jsonb,$30::jsonb,
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,
+        $20,$21,$22,$23,$24,$25,
+        $26::jsonb,$27::jsonb,$28::jsonb,$29::jsonb,$30::jsonb,$31::jsonb,
         NULL,NULL,NULL,NULL,NULL,NULL,NULL,false,NULL,false,
         NULL,NULL,NULL,false
     )
@@ -241,7 +256,7 @@ async def seed():
         try:
             await conn.execute(
                 insert_sql,
-                p["id"], p["full_name"], p["bio"], p["is_active"], p["is_verified"],
+                p["id"], p["full_name"], p["phone"], p["bio"], p["is_active"], p["is_verified"],
                 p["is_onboarded"], p["created_at"], p["updated_at"], p["date_of_birth"],
                 p["latitude"], p["longitude"], p["city"], p["country"], p["address"],
                 p["height_cm"], p["gender_id"], p["education_level_id"], p["looking_for_id"],
@@ -251,7 +266,7 @@ async def seed():
                 p["prompts"], p["purpose"],
             )
             inserted_ids.append(p["id"])
-            print(f"  ✅ {p['full_name']} ({p['city']})")
+            print(f"  ✅ {p['full_name']} ({p['city']}) - {p['phone']}")
         except Exception as e:
             print(f"  ⚠  Failed {p['full_name']}: {e}")
 
