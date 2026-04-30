@@ -260,23 +260,24 @@ def _list_overlap_score(mine: list | None, theirs: list | None) -> float:
 
 def _preference_score(me: User, candidate: User, dist_km: float | None) -> float:
     """
-    Composite soft-preference score (0.0–1.0) across seven dimensions.
+    Composite soft-preference score (0.0–1.0) across nine dimensions.
     When a dimension has no data it defaults to 0.5 (neutral) so it doesn't
     penalise incomplete profiles.
 
-    Dimension weights
-    -----------------
-    35 % – distance proximity
-    15 % – height match
-    15 % – age proximity
-    10 % – shared interests
+    Dimension weights (prioritizing compatibility over proximity)
+    -------------------------------------------------------------
+    25 % – distance proximity
+    15 % – shared interests
+    12 % – looking for match (relationship intent)
+    10 % – values/goals overlap
     10 % – lifestyle alignment (exercise / drinking / smoking)
+    10 % – age proximity
+    10 % – height match
      5 % – family plans match
-     5 % – values overlap
-     5 % – education level match
+     3 % – education level match
     """
 
-    # ── 1. Distance (35 %) ────────────────────────────────────────────────────
+    # ── 1. Distance (25 %) ────────────────────────────────────────────────────
     # Use the viewer's saved max distance as the reference ceiling.
     # If not set, fall back to _DEFAULT_SOFT_MAX_KM (50 km) so closer
     # profiles still rank above far-away ones by default.
@@ -298,7 +299,7 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
         else:
             d_score = 0.15
 
-    # ── 2. Height (15 %) ──────────────────────────────────────────────────────
+    # ── 2. Height (10 %) ──────────────────────────────────────────────────────
     h_score = 0.5  # neutral default
     if candidate.height_cm is not None and (me.filter_height_min or me.filter_height_max):
         h  = candidate.height_cm
@@ -310,7 +311,7 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
             gap = max(lo - h, h - hi, 0)
             h_score = 0.80 if gap <= 5 else (0.55 if gap <= 10 else 0.25)
 
-    # ── 3. Age proximity (15 %) ───────────────────────────────────────────────
+    # ── 3. Age proximity (10 %) ───────────────────────────────────────────────
     a_score     = 0.5
     cand_age    = _age_from_dob(candidate.date_of_birth)
     has_age_pref = me.filter_age_min is not None or me.filter_age_max is not None
@@ -323,12 +324,26 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
             gap_a = max(lo_a - cand_age, cand_age - hi_a, 0)
             a_score = 0.75 if gap_a <= 2 else (0.50 if gap_a <= 5 else 0.20)
 
-    # ── 4. Interests overlap (10 %) ───────────────────────────────────────────
+    # ── 4. Interests overlap (15 %) ───────────────────────────────────────────
     # Use viewer's filter if set; otherwise compare own interests vs candidate's
     interests_mine = me.filter_interests or me.interests
     i_score = _list_overlap_score(interests_mine, candidate.interests)
 
-    # ── 5. Lifestyle alignment (10 %) ─────────────────────────────────────────
+    # ── 5. Looking For match (12 %) ───────────────────────────────────────────
+    # Relationship intent alignment — do both users want the same thing?
+    lf_score = 0.5  # neutral default
+    if me.looking_for_id and candidate.looking_for_id:
+        if me.looking_for_id == candidate.looking_for_id:
+            lf_score = 1.0  # perfect match - big boost
+        else:
+            lf_score = 0.6  # mismatch but both have stated their intent - mild penalty
+    elif me.looking_for_id or candidate.looking_for_id:
+        lf_score = 0.5  # one person hasn't set it - neutral (don't penalize)
+
+    # ── 6. Values/Goals overlap (10 %) ────────────────────────────────────────
+    v_score = _list_overlap_score(me.values_list, candidate.values_list)
+
+    # ── 7. Lifestyle alignment (10 %) ─────────────────────────────────────────
     # Each sub-dimension (exercise, drinking, smoking) contributes equally.
     def _lifestyle_val(u: User, key: str) -> int | None:
         d = u.lifestyle or {}
@@ -352,7 +367,7 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
             ls_parts.append(0.1)   # mismatch
     ls_score = sum(ls_parts) / len(ls_parts)
 
-    # ── 6. Family plans (5 %) ─────────────────────────────────────────────────
+    # ── 8. Family plans (5 %) ─────────────────────────────────────────────────
     fp_score = 0.5
     if me.filter_family_plans:
         if candidate.family_plans_id is None:
@@ -364,10 +379,7 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
     elif me.family_plans_id and candidate.family_plans_id:
         fp_score = 1.0 if me.family_plans_id == candidate.family_plans_id else 0.3
 
-    # ── 7. Values overlap (5 %) ───────────────────────────────────────────────
-    v_score = _list_overlap_score(me.values_list, candidate.values_list)
-
-    # ── 8. Education level (5 %) ──────────────────────────────────────────────
+    # ── 9. Education level (3 %) ──────────────────────────────────────────────
     ed_score = 0.5
     if me.filter_education_level:
         if candidate.education_level_id is None:
@@ -380,15 +392,17 @@ def _preference_score(me: User, candidate: User, dist_km: float | None) -> float
         ed_score = 1.0 if me.education_level_id == candidate.education_level_id else 0.4
 
     # ── Weighted composite ────────────────────────────────────────────────────
+    # Prioritizes compatibility (interests, looking for, values, lifestyle) over proximity
     return (
-        0.35 * d_score   +
-        0.15 * h_score   +
-        0.15 * a_score   +
-        0.10 * i_score   +
-        0.10 * ls_score  +
-        0.05 * fp_score  +
-        0.05 * v_score   +
-        0.05 * ed_score
+        0.25 * d_score   +  # distance
+        0.15 * i_score   +  # interests
+        0.12 * lf_score  +  # looking for
+        0.10 * v_score   +  # values/goals
+        0.10 * ls_score  +  # lifestyle
+        0.10 * a_score   +  # age
+        0.10 * h_score   +  # height
+        0.05 * fp_score  +  # family plans
+        0.03 * ed_score     # education
     )
 
 
@@ -787,8 +801,9 @@ async def _fetch_discover_profiles(
                     f")"
                 )
             )
-        if me.filter_looking_for:
-            stmt = stmt.where(User.looking_for_id.in_(me.filter_looking_for))
+        # Note: looking_for is handled via soft scoring (not hard filter) so users
+        # with different relationship intents can still discover each other.
+        # Perfect matches rank higher, but mismatches aren't completely excluded.
         if me.filter_education_level:
             stmt = stmt.where(User.education_level_id.in_(me.filter_education_level))
         if me.filter_family_plans:
