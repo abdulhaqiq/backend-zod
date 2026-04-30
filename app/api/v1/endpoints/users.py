@@ -50,6 +50,18 @@ async def delete_my_account(
         delete(RefreshToken).where(RefreshToken.user_id == str(current_user.id))
     )
     await db.commit()
+    
+    # Send WebSocket notification to force immediate logout on all devices
+    try:
+        from app.api.v1.endpoints.chat import notify_manager
+        nm = notify_manager
+        await nm.send_to(str(current_user.id), {
+            "type": "account_deleted",
+            "message": "Your account has been deleted. You will be logged out.",
+            "force_logout": True,
+        })
+    except Exception:
+        pass
 
 
 @router.get("/", response_model=list[UserResponse])
@@ -107,4 +119,25 @@ async def delete_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    
+    # Revoke all refresh tokens
+    from app.models.refresh_token import RefreshToken
+    await db.execute(
+        delete(RefreshToken).where(RefreshToken.user_id == str(user_id))
+    )
+    
+    # Delete the user
     await db.delete(user)
+    await db.commit()
+    
+    # Send WebSocket notification to force immediate logout on all devices
+    try:
+        from app.api.v1.endpoints.chat import notify_manager
+        nm = notify_manager
+        await nm.send_to(str(user_id), {
+            "type": "account_deleted",
+            "message": "Your account has been deleted by an administrator.",
+            "force_logout": True,
+        })
+    except Exception:
+        pass

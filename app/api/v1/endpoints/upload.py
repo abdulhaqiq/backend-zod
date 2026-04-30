@@ -318,6 +318,22 @@ async def _process_verification(
                         })
                     except Exception:
                         pass
+                    
+                    # Send push notification
+                    try:
+                        from app.core.push import notify_user
+                        await notify_user(
+                            user, "verification",
+                            title="Face Verification Timeout",
+                            body="Verification took too long. Please try again with better lighting.",
+                            data={
+                                "type": "verification_rejected",
+                                "rejection_reason": "Verification took too long",
+                                "navigate_to": "retry",
+                            },
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             _log.error("bg-verify | timeout cleanup failed: %s", e)
 
@@ -361,6 +377,35 @@ async def _run_face_verification(
                     attempt.processed_at = datetime.now(timezone.utc)
                     user.verification_status = "rejected"
                     await db.commit()
+                    
+                    # Send push notification
+                    try:
+                        from app.core.push import notify_user
+                        await notify_user(
+                            user, "verification",
+                            title="Face Verification Failed",
+                            body=reason or "Please try again with better lighting.",
+                            data={
+                                "type": "verification_rejected",
+                                "rejection_reason": reason,
+                                "navigate_to": "retry",
+                            },
+                        )
+                    except Exception as push_exc:
+                        _log.warning("bg-verify | push notification failed: %s", push_exc)
+                    
+                    # Notify WebSocket
+                    try:
+                        from app.api.v1.endpoints.verification_ws import watcher as _watcher
+                        await _watcher.notify(user_id, {
+                            "status": "rejected",
+                            "rejection_reason": reason,
+                            "face_match_score": None,
+                            "navigate_to": "retry",
+                            "flow": "onboarding",
+                        })
+                    except Exception:
+                        pass
             _log.info("bg-verify | attempt=%s FACE DETECTION FAIL: %s", attempt_id, reason)
             return
 
@@ -377,6 +422,35 @@ async def _run_face_verification(
                     attempt.processed_at = datetime.now(timezone.utc)
                     user.verification_status = "rejected"
                     await db.commit()
+                    
+                    # Send push notification
+                    try:
+                        from app.core.push import notify_user
+                        await notify_user(
+                            user, "verification",
+                            title="Face Verification Failed",
+                            body="No profile photos found. Please upload photos first.",
+                            data={
+                                "type": "verification_rejected",
+                                "rejection_reason": "No profile photos found",
+                                "navigate_to": "photos",
+                            },
+                        )
+                    except Exception as push_exc:
+                        _log.warning("bg-verify | push notification failed: %s", push_exc)
+                    
+                    # Notify WebSocket
+                    try:
+                        from app.api.v1.endpoints.verification_ws import watcher as _watcher
+                        await _watcher.notify(user_id, {
+                            "status": "rejected",
+                            "rejection_reason": "No profile photos found. Please upload photos first.",
+                            "face_match_score": None,
+                            "navigate_to": "photos",
+                            "flow": "onboarding",
+                        })
+                    except Exception:
+                        pass
             _log.info("bg-verify | attempt=%s NO PHOTOS", attempt_id)
             return
 
@@ -457,6 +531,37 @@ async def _run_face_verification(
             "flow":             "onboarding",
         })
 
+        # Send push notification
+        try:
+            from app.core.push import notify_user
+            async with AsyncSessionLocal() as db:
+                user = await db.get(User, user_id)
+                if user:
+                    if passed:
+                        await notify_user(
+                            user, "verification",
+                            title="Face Verification Approved ✓",
+                            body=f"Your face scan passed with {best_pct:.0f}% match. You're verified!",
+                            data={
+                                "type": "verification_approved",
+                                "match_score": best_pct,
+                                "navigate_to": "feed",
+                            },
+                        )
+                    else:
+                        await notify_user(
+                            user, "verification",
+                            title="Face Verification Failed",
+                            body=attempt.rejection_reason or "Please try again with better lighting.",
+                            data={
+                                "type": "verification_rejected",
+                                "rejection_reason": attempt.rejection_reason,
+                                "navigate_to": "retry",
+                            },
+                        )
+        except Exception as push_exc:
+            _log.warning("bg-verify | push notification failed (non-critical): %s", push_exc)
+
     except Exception as exc:
         _log.error("bg-verify | attempt=%s CRASHED: %s", attempt_id, exc, exc_info=True)
         # Update with error status in a fresh DB session
@@ -483,6 +588,25 @@ async def _run_face_verification(
                 "navigate_to":      "retry",
                 "flow":             "onboarding",
             })
+        except Exception:
+            pass
+        
+        # Send push notification
+        try:
+            from app.core.push import notify_user
+            async with AsyncSessionLocal() as db:
+                user = await db.get(User, user_id)
+                if user:
+                    await notify_user(
+                        user, "verification",
+                        title="Face Verification Error",
+                        body="Something went wrong. Please try again.",
+                        data={
+                            "type": "verification_rejected",
+                            "rejection_reason": "Internal error",
+                            "navigate_to": "retry",
+                        },
+                    )
         except Exception:
             pass
 

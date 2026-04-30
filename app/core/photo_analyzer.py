@@ -50,7 +50,7 @@ def _client():
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY or None,
         region_name=getattr(settings, "AWS_REGION", None) or "us-east-1",
-        config=Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1}),
+        config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}),
     )
 
 
@@ -59,13 +59,17 @@ def _client():
 _REKOGNITION_MAX_BYTES = 5 * 1024 * 1024   # 5 MB hard limit
 _JPEG_MAX_DIMENSION   = 1920               # resize long-edge to this before quality reduction
 
+# In-memory cache for anchor photos (avoids re-downloading on every upload)
+_ANCHOR_CACHE: dict[str, bytes] = {}
+_ANCHOR_CACHE_MAX_SIZE = 100  # Keep last 100 anchor photos in memory
+
 
 def _to_jpeg(img_bytes: bytes) -> bytes:
     """
     Convert any supported format (JPEG/PNG/WebP/HEIC) to JPEG for Rekognition.
     Ensures output is under Rekognition's 5 MB limit by:
       1. Resizing the long edge to 1920 px (enough detail, drastically reduces file size)
-      2. Iteratively lowering quality (85 → 75 → 65 → 50) until under 5 MB
+      2. Iteratively lowering quality (80 → 60 → 40) until under 5 MB
     """
     from PIL import Image
     try:
@@ -82,8 +86,8 @@ def _to_jpeg(img_bytes: bytes) -> bytes:
         scale = _JPEG_MAX_DIMENSION / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # Try progressively lower quality until under 5 MB
-    for quality in (85, 75, 65, 50, 40):
+    # Try progressively lower quality until under 5 MB (reduced iterations for speed)
+    for quality in (80, 60, 40):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         if buf.tell() <= _REKOGNITION_MAX_BYTES:
@@ -203,12 +207,25 @@ def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
     Returns (has_face, similarity_pct, is_blurry, sharpness, brightness_ok, brightness, quality_score)
     """
     try:
-        resp = httpx.get(anchor_url, timeout=8, follow_redirects=True)
-        if resp.status_code != 200:
-            logger.warning("CompareFaces: could not fetch anchor (%d)", resp.status_code)
-            return False, 0.0, False, 0.0, True, 50.0, 0.0, False
+        # Check cache first to avoid re-downloading the same anchor
+        if anchor_url in _ANCHOR_CACHE:
+            anchor_jpeg = _ANCHOR_CACHE[anchor_url]
+            logger.debug("CompareFaces: using cached anchor")
+        else:
+            # Download anchor with reduced timeout
+            resp = httpx.get(anchor_url, timeout=4, follow_redirects=True)
+            if resp.status_code != 200:
+                logger.warning("CompareFaces: could not fetch anchor (%d)", resp.status_code)
+                return False, 0.0, False, 0.0, True, 50.0, 0.0, False
 
-        anchor_jpeg = _to_jpeg(resp.content)
+            anchor_jpeg = _to_jpeg(resp.content)
+            
+            # Cache it (LRU: remove oldest if cache is full)
+            if len(_ANCHOR_CACHE) >= _ANCHOR_CACHE_MAX_SIZE:
+                # Remove the first (oldest) entry
+                _ANCHOR_CACHE.pop(next(iter(_ANCHOR_CACHE)))
+            _ANCHOR_CACHE[anchor_url] = anchor_jpeg
+            logger.debug("CompareFaces: cached new anchor")
 
         rek = _client().compare_faces(
             SourceImage={"Bytes": anchor_jpeg},
@@ -224,7 +241,23 @@ def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
                 total_faces = len(unmatched)
                 logger.info("CompareFaces: face found but doesn't match anchor (0%%) faces=%d", total_faces)
             else:
-                logger.info("CompareFaces: no face found in new photo")
+                # No faces detected — try DetectLabels fallback for standing/full-body shots
+                logger.info("CompareFaces: no face found in new photo, trying person detection fallback...")
+                try:
+                    lresp = _client().detect_labels(
+                        Image={"Bytes": new_jpeg}, MaxLabels=10, MinConfidence=80.0
+                    )
+                    if any(
+                        l["Name"] in ("Person", "Human", "People") and l["Confidence"] >= 80.0
+                        for l in lresp.get("Labels", [])
+                    ):
+                        logger.info("CompareFaces: no close face but person detected (standing/full-body) — accepting")
+                        # Accept as valid but with low similarity (triggers warning but doesn't reject)
+                        return True, 45.0, False, 50.0, True, 50.0, 0.6, False
+                except Exception as e:
+                    logger.warning("CompareFaces: person label fallback failed: %s", e)
+                
+                logger.info("CompareFaces: no face or person found in new photo")
             # Return multiple_faces flag as last element
             return bool(unmatched), 0.0, False, 50.0, True, 50.0, 0.5, len(unmatched) > 1
 
