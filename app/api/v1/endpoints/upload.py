@@ -1359,9 +1359,9 @@ async def upload_photo_endpoint(
                         (is_profile_female and detected == "Male")
                     )
 
-                    _log.info(
-                        "Gender check | profile=%s detected=%s(%.0f%%) is_mismatch=%s",
-                        gender_label, detected, conf, is_mismatch,
+                    _log.warning(
+                        "DEBUG GENDER | profile=%s label_lower=%s is_male=%s is_female=%s detected=%s is_mismatch=%s",
+                        gender_label, label_lower, is_profile_male, is_profile_female, detected, is_mismatch,
                     )
 
                     # Only reject if high confidence mismatch
