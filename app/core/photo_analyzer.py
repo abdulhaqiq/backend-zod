@@ -237,26 +237,27 @@ def _compare_with_anchor(new_jpeg: bytes, anchor_url: str):
         unmatched = rek.get("UnmatchedFaces", [])
 
         if not matches:
+            # No matching faces — try DetectLabels fallback for standing/full-body shots
+            # This handles both: (1) no faces detected, and (2) face detected but too distant/small to match
+            logger.info("CompareFaces: no face match, trying person detection fallback...")
+            try:
+                lresp = _client().detect_labels(
+                    Image={"Bytes": new_jpeg}, MaxLabels=10, MinConfidence=70.0
+                )
+                if any(
+                    l["Name"] in ("Person", "Human", "People", "Man", "Woman") and l["Confidence"] >= 70.0
+                    for l in lresp.get("Labels", [])
+                ):
+                    logger.info("CompareFaces: person detected in standing/full-body photo — accepting with warning")
+                    # Accept as valid but with low similarity (triggers warning but doesn't reject)
+                    return True, 45.0, False, 50.0, True, 50.0, 0.6, False
+            except Exception as e:
+                logger.warning("CompareFaces: person label fallback failed: %s", e)
+            
             if unmatched:
                 total_faces = len(unmatched)
                 logger.info("CompareFaces: face found but doesn't match anchor (0%%) faces=%d", total_faces)
             else:
-                # No faces detected — try DetectLabels fallback for standing/full-body shots
-                logger.info("CompareFaces: no face found in new photo, trying person detection fallback...")
-                try:
-                    lresp = _client().detect_labels(
-                        Image={"Bytes": new_jpeg}, MaxLabels=10, MinConfidence=80.0
-                    )
-                    if any(
-                        l["Name"] in ("Person", "Human", "People") and l["Confidence"] >= 80.0
-                        for l in lresp.get("Labels", [])
-                    ):
-                        logger.info("CompareFaces: no close face but person detected (standing/full-body) — accepting")
-                        # Accept as valid but with low similarity (triggers warning but doesn't reject)
-                        return True, 45.0, False, 50.0, True, 50.0, 0.6, False
-                except Exception as e:
-                    logger.warning("CompareFaces: person label fallback failed: %s", e)
-                
                 logger.info("CompareFaces: no face or person found in new photo")
             # Return multiple_faces flag as last element
             return bool(unmatched), 0.0, False, 50.0, True, 50.0, 0.5, len(unmatched) > 1
