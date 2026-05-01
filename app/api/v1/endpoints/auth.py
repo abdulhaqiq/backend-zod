@@ -361,7 +361,8 @@ def _reset_deleted_user(user: "User") -> None:
     # Verification
     user.verification_status = "unverified"
     user.face_match_score    = None
-    user.face_scan_required  = False
+    # Note: face_scan_required is already set to True above (line 327)
+    # DO NOT reset it to False here - re-registered users must complete verification
     user.id_scan_required    = False
     # Subscription — downgrade to free
     user.subscription_tier       = "free"
