@@ -49,6 +49,7 @@ _NOTIF_TYPE_CONFIG: dict[str, tuple[str, str, str]] = {
     "audio_message":   ("activity",      "active",         "high"),
     "profile_view":    ("activity",      "active",         "normal"),
     "call":            ("incoming_call", "time-sensitive", "high"),
+    "verification":    ("activity",      "time-sensitive", "high"),  # Face/ID verification results
     "ai_picks":        ("marketing",     "passive",        "normal"),
     "promotions":      ("marketing",     "passive",        "normal"),
     "dating_tips":     ("marketing",     "passive",        "normal"),

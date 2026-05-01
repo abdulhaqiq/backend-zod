@@ -549,34 +549,33 @@ async def _run_face_verification(
         except Exception as ws_exc:
             _log.warning("bg-verify | WebSocket notify failed (non-critical): %s", ws_exc)
 
-        # ── Send push notification (backup) ────────────────────────────────────
+        # ── Send push notification ────────────────────────────────────────────
         try:
             from app.core.push import notify_user
-            async with AsyncSessionLocal() as db:
-                user = await db.get(User, user_id)
-                if user:
-                    if passed:
-                        await notify_user(
-                            user, "verification",
-                            title="Face Verification Approved ✓",
-                            body=f"Your face scan passed with {best_pct:.0f}% match. You're verified!",
-                            data={
-                                "type": "verification_approved",
-                                "match_score": best_pct,
-                                "navigate_to": "feed",
-                            },
-                        )
-                    else:
-                        await notify_user(
-                            user, "verification",
-                            title="Face Verification Failed",
-                            body=attempt.rejection_reason or "Please try again with better lighting.",
-                            data={
-                                "type": "verification_rejected",
-                                "rejection_reason": attempt.rejection_reason,
-                                "navigate_to": "retry",
-                            },
-                        )
+            if passed:
+                await notify_user(
+                    user, "verification",
+                    title="Face Verification Approved ✓",
+                    body=f"Your face scan passed with {best_pct:.0f}% match. You're verified!",
+                    data={
+                        "type": "verification_approved",
+                        "match_score": best_pct,
+                        "navigate_to": "feed",
+                    },
+                )
+                _log.info("bg-verify | push notification sent (verified) to user=%s", str(user_id)[:8])
+            else:
+                await notify_user(
+                    user, "verification",
+                    title="Face Verification Failed",
+                    body=attempt.rejection_reason or "Please try again with better lighting.",
+                    data={
+                        "type": "verification_rejected",
+                        "rejection_reason": attempt.rejection_reason,
+                        "navigate_to": "retry",
+                    },
+                )
+                _log.info("bg-verify | push notification sent (rejected) to user=%s", str(user_id)[:8])
         except Exception as push_exc:
             _log.warning("bg-verify | push notification failed (non-critical): %s", push_exc)
 
