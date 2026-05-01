@@ -545,7 +545,7 @@ async def _run_face_verification(
                 "navigate_to": "feed" if passed else "retry",
             }
             ws_sent = await notify_manager.send_to(str(user_id), ws_payload)
-            _log.info("bg-verify | WebSocket notify user=%s sent=%s", user_id[:8], ws_sent)
+            _log.info("bg-verify | WebSocket notify user=%s sent=%s", str(user_id)[:8], ws_sent)
         except Exception as ws_exc:
             _log.warning("bg-verify | WebSocket notify failed (non-critical): %s", ws_exc)
 
